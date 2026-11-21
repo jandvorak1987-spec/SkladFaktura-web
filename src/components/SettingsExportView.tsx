@@ -1,0 +1,1009 @@
+import React, { useEffect, useMemo, useState } from 'react';
+import {
+  Building2,
+  Check,
+  Download,
+  FileCode2,
+  Loader2,
+  Plus,
+  Shield,
+  Smartphone,
+  Trash2,
+  UserPlus,
+  Users,
+  Warehouse as WarehouseIcon,
+} from 'lucide-react';
+import { useApp } from '../context/AppContext';
+import {
+  addColleague,
+  createWarehouse,
+  markInvoicesExportedToPohoda,
+  removeColleague,
+  saveCompany,
+  setColleagueAdminRole,
+} from '../lib/firestoreService';
+import {
+  czechAccountToIban,
+  downloadTextFile,
+  generatePohodaDataPackXml,
+  getCompanyPalette,
+  toIsoDate,
+} from '../lib/format';
+import {
+  COMPANY_BRAND_PALETTES,
+  INVOICE_TEMPLATES,
+  type Company,
+  type InvoiceTemplateId,
+  type PohodaExportScope,
+} from '../types';
+
+type SettingsTab = 'COMPANY' | 'WAREHOUSES' | 'TEAM' | 'POHODA';
+
+export function SettingsExportView() {
+  const {
+    workspace,
+    userEmail,
+    isCurrentUserAdmin,
+    teamMembers,
+    companies,
+    activeCompany,
+    switchCompany,
+    warehouses,
+    accessibleWarehouses,
+    inventory,
+    invoices,
+    lookupAres,
+    notify,
+  } = useApp();
+
+  const [tab, setTab] = useState<SettingsTab>('COMPANY');
+  const [draftCompany, setDraftCompany] = useState<Company | null>(activeCompany);
+  const [aresBusy, setAresBusy] = useState(false);
+  const [savingCompany, setSavingCompany] = useState(false);
+
+  // Warehouse form
+  const [whName, setWhName] = useState('');
+  const [whCode, setWhCode] = useState('');
+  const [whShared, setWhShared] = useState(true);
+  const [whOwnerCompanyId, setWhOwnerCompanyId] = useState(activeCompany?.id || 'company_1');
+  const [whLocation, setWhLocation] = useState('');
+  const [creatingWh, setCreatingWh] = useState(false);
+
+  // Team form
+  const [colleagueName, setColleagueName] = useState('');
+  const [colleagueEmail, setColleagueEmail] = useState('');
+  const [colleagueAdmin, setColleagueAdmin] = useState(false);
+  const [teamBusy, setTeamBusy] = useState(false);
+
+  // Pohoda export
+  const [pohodaScope, setPohodaScope] = useState<PohodaExportScope>('BOTH');
+  const [onlyUnexported, setOnlyUnexported] = useState(false);
+  const [exportingPohoda, setExportingPohoda] = useState(false);
+
+  useEffect(() => {
+    setDraftCompany(activeCompany);
+    if (activeCompany) setWhOwnerCompanyId(activeCompany.id);
+  }, [activeCompany]);
+
+  const palette = getCompanyPalette(draftCompany?.accentIndex ?? activeCompany?.accentIndex);
+
+  const companyInvoices = useMemo(
+    () => invoices.filter((i) => !activeCompany || i.companyId === activeCompany.id),
+    [invoices, activeCompany]
+  );
+
+  const companyInventory = useMemo(() => {
+    const whIds = new Set(accessibleWarehouses.map((w) => w.id));
+    return inventory.filter((i) => whIds.has(i.warehouseId));
+  }, [inventory, accessibleWarehouses]);
+
+  const invoicesForPohoda = useMemo(() => {
+    return companyInvoices.filter(
+      (i) => i.status !== 'CANCELLED' && (!onlyUnexported || !i.exportedToPohoda)
+    );
+  }, [companyInvoices, onlyUnexported]);
+
+  const handleCompanyAres = async () => {
+    if (!draftCompany) return;
+    const ico = draftCompany.ico.replace(/\D/g, '');
+    if (ico.length !== 8) {
+      notify('Zadejte 8místné IČO pro načtení z ARES.', 'error');
+      return;
+    }
+    setAresBusy(true);
+    try {
+      const s = await lookupAres(ico);
+      setDraftCompany({
+        ...draftCompany,
+        ico: s.ico,
+        dic: s.dic || draftCompany.dic,
+        name: s.name || draftCompany.name,
+        street: s.street || draftCompany.street,
+        city: s.city || draftCompany.city,
+        zip: s.zip || draftCompany.zip,
+      });
+      notify(`Načteno z ARES: ${s.name}`);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Dotaz na ARES selhal.', 'error');
+    } finally {
+      setAresBusy(false);
+    }
+  };
+
+  const handleComputeIban = () => {
+    if (!draftCompany) return;
+    const iban = czechAccountToIban(draftCompany.bankAccount);
+    if (!iban) {
+      notify('Zadejte platné české číslo účtu ve tvaru např. 123456789/2010.', 'error');
+      return;
+    }
+    setDraftCompany({ ...draftCompany, iban });
+    notify(`IBAN vypočítán: ${iban}`);
+  };
+
+  const handleSaveCompany = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!workspace || !draftCompany) return;
+    setSavingCompany(true);
+    try {
+      await saveCompany(workspace, draftCompany);
+      notify(`Údaje firmy ${draftCompany.name} byly uloženy a synchronizovány.`);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Uložení firmy selhalo.', 'error');
+    } finally {
+      setSavingCompany(false);
+    }
+  };
+
+  const handleCreateWarehouse = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!workspace) return;
+    setCreatingWh(true);
+    try {
+      await createWarehouse({
+        workspace,
+        name: whName,
+        code: whCode,
+        shared: whShared,
+        ownerCompanyId: whShared ? '' : whOwnerCompanyId,
+        location: whLocation,
+      });
+      notify(`Sklad ${whName} byl založen.`);
+      setWhName('');
+      setWhCode('');
+      setWhLocation('');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Založení skladu selhalo.', 'error');
+    } finally {
+      setCreatingWh(false);
+    }
+  };
+
+  const handleAddColleague = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!workspace) return;
+    setTeamBusy(true);
+    try {
+      await addColleague({
+        workspace,
+        currentMembers: teamMembers,
+        callerEmail: userEmail,
+        displayName: colleagueName,
+        emailInput: colleagueEmail,
+        grantAdmin: colleagueAdmin,
+      });
+      notify(`Kolega ${colleagueEmail.trim().toLowerCase()} byl přidán do sdíleného prostoru.`);
+      setColleagueName('');
+      setColleagueEmail('');
+      setColleagueAdmin(false);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Přidání kolegy selhalo.', 'error');
+    } finally {
+      setTeamBusy(false);
+    }
+  };
+
+  const handleExportPohoda = async () => {
+    if (!workspace || !activeCompany) return;
+    setExportingPohoda(true);
+    try {
+      const xml = generatePohodaDataPackXml({
+        company: activeCompany,
+        invoices: invoicesForPohoda,
+        inventory: companyInventory,
+        warehouses,
+        scope: pohodaScope,
+      });
+      const safeName =
+        activeCompany.name.replace(/[^a-zA-Z0-9_-]+/g, '_').toLowerCase() || 'firma';
+      downloadTextFile(
+        xml,
+        `pohoda_${safeName}_${pohodaScope.toLowerCase()}_${toIsoDate()}.xml`,
+        'application/xml;charset=utf-8'
+      );
+
+      if ((pohodaScope === 'INVOICES' || pohodaScope === 'BOTH') && invoicesForPohoda.length > 0) {
+        const unexportedIds = invoicesForPohoda
+          .filter((i) => !i.exportedToPohoda)
+          .map((i) => i.id);
+        if (unexportedIds.length > 0) {
+          await markInvoicesExportedToPohoda(workspace.id, unexportedIds);
+        }
+      }
+      notify('Soubor POHODA XML DataPack v2.0 byl vygenerován a stažen.');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Export do POHODY selhal.', 'error');
+    } finally {
+      setExportingPohoda(false);
+    }
+  };
+
+  const nonOwnerCount = teamMembers.filter((m) => m.role !== 'OWNER').length;
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <p className="text-xs font-medium uppercase tracking-wider text-slate-500">
+          Správa pracovního prostoru · Synchronizováno s Android
+        </p>
+        <h1 className="text-2xl font-bold text-slate-900 mt-1">Nastavení, tým a export POHODA</h1>
+      </div>
+
+      {/* Tabs */}
+      <div className="inline-flex flex-wrap items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200">
+        {(
+          [
+            ['COMPANY', 'Firemní údaje', Building2],
+            ['WAREHOUSES', `Sklady (${warehouses.length})`, WarehouseIcon],
+            ['TEAM', `Tým (${teamMembers.length}/4)`, Users],
+            ['POHODA', 'Export POHODA XML', FileCode2],
+          ] as [SettingsTab, string, React.ComponentType<{ className?: string }>][]
+        ).map(([id, label, Icon]) => (
+          <button
+            key={id}
+            type="button"
+            onClick={() => setTab(id)}
+            className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+              tab === id
+                ? 'bg-white text-slate-900 shadow-xs'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <Icon className="w-3.5 h-3.5" />
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {/* TAB 1: COMPANY */}
+      {tab === 'COMPANY' && draftCompany && (
+        <form onSubmit={handleSaveCompany} className="space-y-6">
+          {/* Switch between Company A & B */}
+          <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-2">
+              {companies.map((c) => {
+                const pal = getCompanyPalette(c.accentIndex);
+                const active = c.id === draftCompany.id;
+                return (
+                  <button
+                    key={c.id}
+                    type="button"
+                    onClick={() => switchCompany(c.id)}
+                    className={`inline-flex items-center gap-2 px-3.5 py-2 text-sm font-medium rounded-lg border transition-colors ${
+                      active
+                        ? 'bg-slate-900 text-white border-slate-900'
+                        : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+                    }`}
+                  >
+                    <span
+                      className="w-2.5 h-2.5 rounded-full shrink-0"
+                      style={{ backgroundColor: pal.primary }}
+                    />
+                    {c.name}
+                  </button>
+                );
+              })}
+            </div>
+            {!isCurrentUserAdmin && (
+              <p className="text-xs text-amber-700">
+                Úpravy firemních údajů jsou vyhrazeny administrátorům týmu.
+              </p>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+            {/* Identity & Address */}
+            <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-4">
+              <h2 className="text-sm font-semibold text-slate-900">Identifikace a adresa</h2>
+
+              <div className="flex items-end gap-2">
+                <div className="flex-1">
+                  <label className="block text-xs font-medium text-slate-700 mb-1">IČO</label>
+                  <input
+                    type="text"
+                    disabled={!isCurrentUserAdmin}
+                    value={draftCompany.ico}
+                    onChange={(e) => setDraftCompany({ ...draftCompany, ico: e.target.value })}
+                    className="w-full px-3 py-2 text-sm font-mono border border-slate-200 rounded-lg disabled:bg-slate-50"
+                  />
+                </div>
+                <button
+                  type="button"
+                  disabled={!isCurrentUserAdmin || aresBusy}
+                  onClick={handleCompanyAres}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-800 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 rounded-lg whitespace-nowrap"
+                >
+                  {aresBusy ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Building2 className="w-3.5 h-3.5" />
+                  )}
+                  Načíst z ARES
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Název firmy</label>
+                  <input
+                    type="text"
+                    required
+                    disabled={!isCurrentUserAdmin}
+                    value={draftCompany.name}
+                    onChange={(e) => setDraftCompany({ ...draftCompany, name: e.target.value })}
+                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg disabled:bg-slate-50"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">DIČ</label>
+                  <input
+                    type="text"
+                    disabled={!isCurrentUserAdmin}
+                    value={draftCompany.dic}
+                    onChange={(e) => setDraftCompany({ ...draftCompany, dic: e.target.value })}
+                    className="w-full px-3 py-2 text-sm font-mono border border-slate-200 rounded-lg disabled:bg-slate-50"
+                  />
+                </div>
+                <div className="flex items-end pb-2">
+                  <label className="inline-flex items-center gap-2 text-sm text-slate-700 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      disabled={!isCurrentUserAdmin}
+                      checked={draftCompany.vatPayer}
+                      onChange={(e) =>
+                        setDraftCompany({ ...draftCompany, vatPayer: e.target.checked })
+                      }
+                      className="rounded border-slate-300"
+                    />
+                    Plátce DPH
+                  </label>
+                </div>
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Ulice a č.p.</label>
+                  <input
+                    type="text"
+                    disabled={!isCurrentUserAdmin}
+                    value={draftCompany.street}
+                    onChange={(e) => setDraftCompany({ ...draftCompany, street: e.target.value })}
+                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg disabled:bg-slate-50"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Město</label>
+                  <input
+                    type="text"
+                    disabled={!isCurrentUserAdmin}
+                    value={draftCompany.city}
+                    onChange={(e) => setDraftCompany({ ...draftCompany, city: e.target.value })}
+                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg disabled:bg-slate-50"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">PSČ</label>
+                  <input
+                    type="text"
+                    disabled={!isCurrentUserAdmin}
+                    value={draftCompany.zip}
+                    onChange={(e) => setDraftCompany({ ...draftCompany, zip: e.target.value })}
+                    className="w-full px-3 py-2 text-sm font-mono border border-slate-200 rounded-lg disabled:bg-slate-50"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">E-mail</label>
+                  <input
+                    type="email"
+                    disabled={!isCurrentUserAdmin}
+                    value={draftCompany.email}
+                    onChange={(e) => setDraftCompany({ ...draftCompany, email: e.target.value })}
+                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg disabled:bg-slate-50"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Telefon</label>
+                  <input
+                    type="text"
+                    disabled={!isCurrentUserAdmin}
+                    value={draftCompany.phone}
+                    onChange={(e) => setDraftCompany({ ...draftCompany, phone: e.target.value })}
+                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg disabled:bg-slate-50"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Banking, Numbering & Visual Brand */}
+            <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-4">
+              <h2 className="text-sm font-semibold text-slate-900">
+                Banka, Fio API, číslování a vzhled faktur
+              </h2>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Název banky</label>
+                  <input
+                    type="text"
+                    disabled={!isCurrentUserAdmin}
+                    value={draftCompany.bankName}
+                    onChange={(e) => setDraftCompany({ ...draftCompany, bankName: e.target.value })}
+                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg disabled:bg-slate-50"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Číslo účtu</label>
+                  <input
+                    type="text"
+                    disabled={!isCurrentUserAdmin}
+                    value={draftCompany.bankAccount}
+                    onChange={(e) =>
+                      setDraftCompany({ ...draftCompany, bankAccount: e.target.value })
+                    }
+                    placeholder="123456789/2010"
+                    className="w-full px-3 py-2 text-sm font-mono border border-slate-200 rounded-lg disabled:bg-slate-50"
+                  />
+                </div>
+
+                <div className="sm:col-span-2 flex items-end gap-2">
+                  <div className="flex-1">
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      IBAN (pro QR Platbu)
+                    </label>
+                    <input
+                      type="text"
+                      disabled={!isCurrentUserAdmin}
+                      value={draftCompany.iban}
+                      onChange={(e) => setDraftCompany({ ...draftCompany, iban: e.target.value })}
+                      className="w-full px-3 py-2 text-sm font-mono border border-slate-200 rounded-lg disabled:bg-slate-50"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    disabled={!isCurrentUserAdmin}
+                    onClick={handleComputeIban}
+                    className="px-3 py-2 text-xs font-medium text-slate-800 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 rounded-lg whitespace-nowrap"
+                  >
+                    Vypočítat IBAN
+                  </button>
+                </div>
+
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                    Fio banka API token (pouze čtení výpisů)
+                  </label>
+                  <input
+                    type="password"
+                    disabled={!isCurrentUserAdmin}
+                    value={draftCompany.fioApiToken}
+                    onChange={(e) =>
+                      setDraftCompany({ ...draftCompany, fioApiToken: e.target.value })
+                    }
+                    placeholder="Vložte token z Fio Internetbankingu"
+                    className="w-full px-3 py-2 text-sm font-mono border border-slate-200 rounded-lg disabled:bg-slate-50"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                    Prefix číselné řady
+                  </label>
+                  <input
+                    type="text"
+                    disabled={!isCurrentUserAdmin}
+                    value={draftCompany.invoicePrefix}
+                    onChange={(e) =>
+                      setDraftCompany({ ...draftCompany, invoicePrefix: e.target.value })
+                    }
+                    className="w-full px-3 py-2 text-sm font-mono border border-slate-200 rounded-lg disabled:bg-slate-50"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                    Další pořadové číslo
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    disabled={!isCurrentUserAdmin}
+                    value={draftCompany.nextInvoiceNumber}
+                    onChange={(e) =>
+                      setDraftCompany({
+                        ...draftCompany,
+                        nextInvoiceNumber: Math.max(1, Number(e.target.value) || 1),
+                      })
+                    }
+                    className="w-full px-3 py-2 text-sm font-mono border border-slate-200 rounded-lg disabled:bg-slate-50 tabular-nums"
+                  />
+                </div>
+
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                    Firemní barevný akcent
+                  </label>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {COMPANY_BRAND_PALETTES.map((pal) => {
+                      const active = draftCompany.accentIndex === pal.index;
+                      return (
+                        <button
+                          key={pal.index}
+                          type="button"
+                          disabled={!isCurrentUserAdmin}
+                          onClick={() =>
+                            setDraftCompany({ ...draftCompany, accentIndex: pal.index })
+                          }
+                          className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
+                            active
+                              ? 'border-slate-900 bg-slate-50 text-slate-900'
+                              : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                          }`}
+                        >
+                          <span
+                            className="w-3 h-3 rounded-full"
+                            style={{ backgroundColor: pal.primary }}
+                          />
+                          {pal.nameCz}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                    Výchozí šablona faktury
+                  </label>
+                  <select
+                    disabled={!isCurrentUserAdmin}
+                    value={draftCompany.invoiceTemplate || 'CLASSIC'}
+                    onChange={(e) =>
+                      setDraftCompany({
+                        ...draftCompany,
+                        invoiceTemplate: e.target.value as InvoiceTemplateId,
+                      })
+                    }
+                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg bg-white disabled:bg-slate-50"
+                  >
+                    {INVOICE_TEMPLATES.map((t) => (
+                      <option key={t.id} value={t.id}>
+                        {t.labelCz} — {t.subtitleCz}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {isCurrentUserAdmin && (
+            <div className="flex justify-end">
+              <button
+                type="submit"
+                disabled={savingCompany}
+                style={{ backgroundColor: palette.primary }}
+                className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-medium text-white rounded-lg hover:opacity-95 disabled:opacity-60"
+              >
+                {savingCompany ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Check className="w-4 h-4" />
+                )}
+                Uložit firemní údaje
+              </button>
+            </div>
+          )}
+        </form>
+      )}
+
+      {/* TAB 2: WAREHOUSES */}
+      {tab === 'WAREHOUSES' && (
+        <div className="grid grid-cols-1 xl:grid-cols-5 gap-6">
+          <div className="xl:col-span-3 bg-white border border-slate-200 rounded-xl overflow-hidden">
+            <div className="px-5 py-4 border-b border-slate-100">
+              <h2 className="text-sm font-semibold text-slate-900">Existující sklady</h2>
+            </div>
+            <div className="divide-y divide-slate-100">
+              {warehouses.map((wh) => {
+                const ownerComp = companies.find((c) => c.id === wh.ownerCompanyId);
+                const count = inventory.filter((i) => i.warehouseId === wh.id).length;
+                return (
+                  <div key={wh.id} className="px-5 py-4 flex items-center justify-between gap-4">
+                    <div>
+                      <p className="text-sm font-semibold text-slate-900">{wh.name}</p>
+                      <p className="text-xs text-slate-500 mt-0.5 tabular-nums">
+                        <span className="font-mono text-slate-700">{wh.code}</span> ·{' '}
+                        {wh.shared
+                          ? 'Sdílený sklad pro obě firmy'
+                          : `Oddělený sklad (${ownerComp?.name || wh.ownerCompanyId})`}
+                        {wh.location ? ` · ${wh.location}` : ''}
+                      </p>
+                    </div>
+                    <span className="text-xs font-medium text-slate-600 tabular-nums whitespace-nowrap">
+                      {count} položek
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <form
+            onSubmit={handleCreateWarehouse}
+            className="xl:col-span-2 bg-white border border-slate-200 rounded-xl p-5 space-y-4 self-start"
+          >
+            <h2 className="text-sm font-semibold text-slate-900">Založit nový sklad</h2>
+            {!isCurrentUserAdmin && (
+              <p className="text-xs text-amber-700">Nové sklady může zakládat pouze administrátor.</p>
+            )}
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">Název skladu *</label>
+              <input
+                type="text"
+                required
+                disabled={!isCurrentUserAdmin}
+                value={whName}
+                onChange={(e) => setWhName(e.target.value)}
+                placeholder="Např. Výdejna Brno"
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                Kód skladu (pro POHODU)
+              </label>
+              <input
+                type="text"
+                disabled={!isCurrentUserAdmin}
+                value={whCode}
+                onChange={(e) => setWhCode(e.target.value)}
+                placeholder="SKLAD-BRNO"
+                className="w-full px-3 py-2 text-sm font-mono border border-slate-200 rounded-lg"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">Režim skladu</label>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  disabled={!isCurrentUserAdmin}
+                  onClick={() => setWhShared(true)}
+                  className={`py-2 text-xs font-medium rounded-lg border ${
+                    whShared
+                      ? 'bg-slate-900 text-white border-slate-900'
+                      : 'bg-white text-slate-700 border-slate-200'
+                  }`}
+                >
+                  Sdílený
+                </button>
+                <button
+                  type="button"
+                  disabled={!isCurrentUserAdmin}
+                  onClick={() => setWhShared(false)}
+                  className={`py-2 text-xs font-medium rounded-lg border ${
+                    !whShared
+                      ? 'bg-slate-900 text-white border-slate-900'
+                      : 'bg-white text-slate-700 border-slate-200'
+                  }`}
+                >
+                  Oddělený pro firmu
+                </button>
+              </div>
+            </div>
+            {!whShared && (
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  Patří firmě
+                </label>
+                <select
+                  disabled={!isCurrentUserAdmin}
+                  value={whOwnerCompanyId}
+                  onChange={(e) => setWhOwnerCompanyId(e.target.value)}
+                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg bg-white"
+                >
+                  {companies.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">Umístění / popis</label>
+              <input
+                type="text"
+                disabled={!isCurrentUserAdmin}
+                value={whLocation}
+                onChange={(e) => setWhLocation(e.target.value)}
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+              />
+            </div>
+            <button
+              type="submit"
+              disabled={!isCurrentUserAdmin || creatingWh}
+              style={{ backgroundColor: palette.primary }}
+              className="w-full inline-flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white rounded-lg disabled:opacity-50"
+            >
+              <Plus className="w-4 h-4" />
+              Přidat sklad
+            </button>
+          </form>
+        </div>
+      )}
+
+      {/* TAB 3: TEAM & ANDROID SYNC */}
+      {tab === 'TEAM' && (
+        <div className="space-y-6">
+          <div className="bg-emerald-50/70 border border-emerald-200 rounded-xl p-4 flex items-start gap-3">
+            <Smartphone className="w-5 h-5 text-emerald-700 shrink-0 mt-0.5" />
+            <div className="text-sm text-emerald-950">
+              <p className="font-semibold">Okamžité propojení Web ↔ Android aplikace SkladFaktura</p>
+              <p className="text-xs text-emerald-900 mt-1 leading-relaxed">
+                Tato webová aplikace pracuje přímo nad stejnou cloudovou databází jako vaše Android
+                aplikace. Stačí, aby se kolega na mobilu i na webu přihlásil svým Google účtem
+                přidaným níže — veškeré změny ve skladu, fakturách i platbách se projeví okamžitě na
+                obou zařízeních.
+              </p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 xl:grid-cols-5 gap-6">
+            <div className="xl:col-span-3 bg-white border border-slate-200 rounded-xl overflow-hidden">
+              <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+                <h2 className="text-sm font-semibold text-slate-900">
+                  Členové sdíleného prostoru ({teamMembers.length} / 4)
+                </h2>
+                <span className="text-xs text-slate-500">Vlastník + až 3 kolegové</span>
+              </div>
+              <div className="divide-y divide-slate-100">
+                {teamMembers.map((member) => {
+                  const isOwner = member.role === 'OWNER';
+                  const isAdmin = member.role === 'ADMIN';
+                  return (
+                    <div
+                      key={member.id}
+                      className="px-5 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                    >
+                      <div>
+                        <p className="text-sm font-semibold text-slate-900">
+                          {member.displayName}
+                          {member.email.toLowerCase() === userEmail && (
+                            <span className="text-xs font-normal text-slate-500"> (vy)</span>
+                          )}
+                        </p>
+                        <p className="text-xs text-slate-500 mt-0.5">
+                          {member.email} ·{' '}
+                          <span className="font-medium text-slate-700">
+                            {isOwner ? 'Vlastník' : isAdmin ? 'Administrátor' : 'Kolega (člen)'}
+                          </span>
+                        </p>
+                      </div>
+
+                      {!isOwner && isCurrentUserAdmin && workspace && (
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              try {
+                                await setColleagueAdminRole({
+                                  workspace,
+                                  callerEmail: userEmail,
+                                  member,
+                                  makeAdmin: !isAdmin,
+                                });
+                                notify(
+                                  !isAdmin
+                                    ? `${member.displayName} má nyní práva administrátora.`
+                                    : `Práva administrátora pro ${member.displayName} byla odebrána.`
+                                );
+                              } catch (err) {
+                                notify(
+                                  err instanceof Error ? err.message : 'Změna role selhala.',
+                                  'error'
+                                );
+                              }
+                            }}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md"
+                          >
+                            <Shield className="w-3.5 h-3.5" />
+                            {isAdmin ? 'Odebrat admina' : 'Nastavit adminem'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              try {
+                                await removeColleague({
+                                  workspace,
+                                  callerEmail: userEmail,
+                                  member,
+                                });
+                                notify(`${member.displayName} byl odebrán z týmu.`, 'info');
+                              } catch (err) {
+                                notify(
+                                  err instanceof Error ? err.message : 'Odebrání selhalo.',
+                                  'error'
+                                );
+                              }
+                            }}
+                            className="p-1.5 text-slate-400 hover:text-red-600 rounded-md"
+                            title="Odebrat z týmu"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <form
+              onSubmit={handleAddColleague}
+              className="xl:col-span-2 bg-white border border-slate-200 rounded-xl p-5 space-y-4 self-start"
+            >
+              <h2 className="text-sm font-semibold text-slate-900">Pozvat kolegu podle e-mailu</h2>
+              <p className="text-xs text-slate-500">
+                Můžete zadat libovolný e-mail (firemní, Seznam, Gmail…). Na webu se kolega přihlásí
+                tímto e-mailem a heslem (nebo přes Google účet); v Android aplikaci přes Google účet
+                propojený s touto adresou.
+              </p>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">Jméno kolegy</label>
+                <input
+                  type="text"
+                  disabled={!isCurrentUserAdmin || nonOwnerCount >= 3}
+                  value={colleagueName}
+                  onChange={(e) => setColleagueName(e.target.value)}
+                  placeholder="Např. Petr Novák"
+                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  E-mail kolegy *
+                </label>
+                <input
+                  type="email"
+                  required
+                  disabled={!isCurrentUserAdmin || nonOwnerCount >= 3}
+                  value={colleagueEmail}
+                  onChange={(e) => setColleagueEmail(e.target.value)}
+                  placeholder="kolega@firma.cz"
+                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                />
+              </div>
+
+              <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+                <input
+                  type="checkbox"
+                  disabled={!isCurrentUserAdmin || nonOwnerCount >= 3}
+                  checked={colleagueAdmin}
+                  onChange={(e) => setColleagueAdmin(e.target.checked)}
+                  className="rounded border-slate-300"
+                />
+                Udělit práva administrátora (úprava firem, skladů a týmu)
+              </label>
+
+              <button
+                type="submit"
+                disabled={!isCurrentUserAdmin || nonOwnerCount >= 3 || teamBusy}
+                style={{ backgroundColor: palette.primary }}
+                className="w-full inline-flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white rounded-lg disabled:opacity-50"
+              >
+                {teamBusy ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <UserPlus className="w-4 h-4" />
+                )}
+                {nonOwnerCount >= 3 ? 'Dosažen limit 3 kolegů' : 'Přidat kolegu do týmu'}
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* TAB 4: POHODA XML EXPORT */}
+      {tab === 'POHODA' && activeCompany && (
+        <div className="bg-white border border-slate-200 rounded-xl p-6 max-w-2xl space-y-5">
+          <div>
+            <h2 className="text-base font-semibold text-slate-900">
+              Export dat pro Stormware POHODA (XML DataPack v2.0)
+            </h2>
+            <p className="text-xs text-slate-500 mt-1">
+              Vygenerovaný XML balíček pro firmu <strong>{activeCompany.name}</strong> (IČO{' '}
+              {activeCompany.ico || 'nevyplněno'}) můžete přímo naimportovat přes Soubor → Datová
+              komunikace → XML import/export.
+            </p>
+          </div>
+
+          <div className="space-y-2">
+            <label className="block text-xs font-medium text-slate-700">Rozsah exportu</label>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              {(
+                [
+                  ['INVOICES', 'Pouze faktury'],
+                  ['STOCK', 'Pouze skladové karty'],
+                  ['BOTH', 'Faktury i sklad'],
+                ] as [PohodaExportScope, string][]
+              ).map(([id, label]) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => setPohodaScope(id)}
+                  className={`py-2.5 px-3 text-xs font-medium rounded-lg border transition-colors ${
+                    pohodaScope === id
+                      ? 'bg-slate-900 text-white border-slate-900'
+                      : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {(pohodaScope === 'INVOICES' || pohodaScope === 'BOTH') && (
+            <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={onlyUnexported}
+                onChange={(e) => setOnlyUnexported(e.target.checked)}
+                className="rounded border-slate-300"
+              />
+              Exportovat pouze dosud neexportované faktury
+            </label>
+          )}
+
+          <div className="bg-slate-50 border border-slate-200 rounded-lg p-4 text-xs text-slate-700 space-y-1 tabular-nums">
+            {(pohodaScope === 'INVOICES' || pohodaScope === 'BOTH') && (
+              <p>
+                Faktur k exportu: <strong>{invoicesForPohoda.length}</strong> (stornované se
+                vynechávají)
+              </p>
+            )}
+            {(pohodaScope === 'STOCK' || pohodaScope === 'BOTH') && (
+              <p>
+                Skladových karet k exportu: <strong>{companyInventory.length}</strong>
+              </p>
+            )}
+          </div>
+
+          <button
+            type="button"
+            disabled={exportingPohoda}
+            onClick={handleExportPohoda}
+            style={{ backgroundColor: palette.primary }}
+            className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-medium text-white rounded-lg hover:opacity-95 disabled:opacity-60"
+          >
+            {exportingPohoda ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Download className="w-4 h-4" />
+            )}
+            Stáhnout POHODA XML balíček
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}

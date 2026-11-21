@@ -1,0 +1,566 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // Global Primitives & Identity Helpers
+    // =========================================================================
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isAdmin() {
+      return isVerified() && request.auth.token.email == 'jan.dvorak1987@gmail.com';
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidInviteCodeStr(code) {
+      return code is string && code.size() >= 6 && code.size() <= 24 && code.matches('^[A-Z0-9\\-]+$');
+    }
+
+    function isWorkspaceMember(workspaceId) {
+      return isSignedIn() && exists(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid));
+    }
+
+    function getMemberRole(workspaceId) {
+      return get(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)).data.role;
+    }
+
+    function isWorkspaceOwner(workspaceId) {
+      return isWorkspaceMember(workspaceId) && getMemberRole(workspaceId) == 'owner';
+    }
+
+    function isWorkspaceManagerOrOwner(workspaceId) {
+      return isWorkspaceMember(workspaceId) && getMemberRole(workspaceId) in ['owner', 'manager'];
+    }
+
+    // =========================================================================
+    // Validation Blueprints (Anti-Update-Gap Helpers)
+    // =========================================================================
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'displayName', 'email', 'activeWorkspaceId', 'workspaceIds', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'email', 'activeWorkspaceId', 'workspaceIds', 'createdAt', 'updatedAt'])
+        && data.uid == userId
+        && isValidId(data.uid)
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
+        && data.email is string && data.email.size() <= 160
+        && data.activeWorkspaceId is string && data.activeWorkspaceId.size() <= 128
+        && data.workspaceIds is list && data.workspaceIds.size() <= 10
+        && (data.workspaceIds.size() == 0 || (data.workspaceIds[0] is string && data.workspaceIds[0].size() <= 128))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidWorkspace(data) {
+      return data.keys().hasAll([
+          'name', 'ico', 'dic', 'isVatPayer', 'address', 'city', 'zip', 'email', 'phone',
+          'bankAccount', 'iban', 'defaultVatRate', 'invoicePrefix', 'nextInvoiceNumber',
+          'inviteCode', 'ownerId', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'name', 'ico', 'dic', 'isVatPayer', 'address', 'city', 'zip', 'email', 'phone',
+          'bankAccount', 'iban', 'defaultVatRate', 'invoicePrefix', 'nextInvoiceNumber',
+          'inviteCode', 'ownerId', 'createdAt', 'updatedAt'
+        ])
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 140
+        && data.ico is string && data.ico.size() <= 20
+        && data.dic is string && data.dic.size() <= 24
+        && data.isVatPayer is bool
+        && data.address is string && data.address.size() <= 200
+        && data.city is string && data.city.size() <= 100
+        && data.zip is string && data.zip.size() <= 20
+        && data.email is string && data.email.size() <= 160
+        && data.phone is string && data.phone.size() <= 40
+        && data.bankAccount is string && data.bankAccount.size() <= 40
+        && data.iban is string && data.iban.size() <= 40
+        && data.defaultVatRate is number && data.defaultVatRate >= 0 && data.defaultVatRate <= 30
+        && data.invoicePrefix is string && data.invoicePrefix.size() <= 16
+        && data.nextInvoiceNumber is number && data.nextInvoiceNumber >= 1 && data.nextInvoiceNumber <= 9999999
+        && isValidInviteCodeStr(data.inviteCode)
+        && isValidId(data.ownerId)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidInviteCode(data, code) {
+      return data.keys().hasAll(['code', 'workspaceId', 'workspaceName', 'createdBy', 'active', 'createdAt'])
+        && data.keys().hasOnly(['code', 'workspaceId', 'workspaceName', 'createdBy', 'active', 'createdAt'])
+        && data.code == code
+        && isValidInviteCodeStr(data.code)
+        && isValidId(data.workspaceId)
+        && data.workspaceName is string && data.workspaceName.size() >= 1 && data.workspaceName.size() <= 140
+        && isValidId(data.createdBy)
+        && data.active is bool
+        && data.createdAt is timestamp;
+    }
+
+    function isValidMember(data, workspaceId, memberId) {
+      return data.keys().hasAll(['uid', 'workspaceId', 'displayName', 'email', 'role', 'inviteCodeUsed', 'joinedAt'])
+        && data.keys().hasOnly(['uid', 'workspaceId', 'displayName', 'email', 'role', 'inviteCodeUsed', 'joinedAt'])
+        && data.uid == memberId
+        && isValidId(data.uid)
+        && data.workspaceId == workspaceId
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
+        && data.email is string && data.email.size() <= 160
+        && data.role in ['owner', 'manager', 'warehouse']
+        && data.inviteCodeUsed is string && data.inviteCodeUsed.size() <= 24
+        && data.joinedAt is timestamp;
+    }
+
+    function isValidProduct(data, workspaceId) {
+      return data.keys().hasAll([
+          'workspaceId', 'sku', 'ean', 'name', 'category', 'unit', 'quantity', 'minStock',
+          'purchasePrice', 'salePrice', 'vatRate', 'location', 'note',
+          'createdBy', 'updatedBy', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'workspaceId', 'sku', 'ean', 'name', 'category', 'unit', 'quantity', 'minStock',
+          'purchasePrice', 'salePrice', 'vatRate', 'location', 'note',
+          'createdBy', 'updatedBy', 'createdAt', 'updatedAt'
+        ])
+        && data.workspaceId == workspaceId
+        && data.sku is string && data.sku.size() >= 1 && data.sku.size() <= 64
+        && data.ean is string && data.ean.size() <= 32
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 160
+        && data.category is string && data.category.size() <= 80
+        && data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 16
+        && data.quantity is number && data.quantity >= -1000000 && data.quantity <= 100000000
+        && data.minStock is number && data.minStock >= 0 && data.minStock <= 100000000
+        && data.purchasePrice is number && data.purchasePrice >= 0 && data.purchasePrice <= 100000000
+        && data.salePrice is number && data.salePrice >= 0 && data.salePrice <= 100000000
+        && data.vatRate is number && data.vatRate >= 0 && data.vatRate <= 30
+        && data.location is string && data.location.size() <= 64
+        && data.note is string && data.note.size() <= 400
+        && isValidId(data.createdBy)
+        && data.updatedBy == request.auth.uid
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidMovement(data, workspaceId) {
+      return data.keys().hasAll([
+          'workspaceId', 'productId', 'productName', 'productSku', 'type',
+          'quantityDelta', 'quantityAfter', 'unit', 'unitPrice',
+          'reference', 'note', 'source', 'performedByUid', 'performedByName', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'workspaceId', 'productId', 'productName', 'productSku', 'type',
+          'quantityDelta', 'quantityAfter', 'unit', 'unitPrice',
+          'reference', 'note', 'source', 'performedByUid', 'performedByName', 'createdAt'
+        ])
+        && data.workspaceId == workspaceId
+        && isValidId(data.productId)
+        && data.productName is string && data.productName.size() >= 1 && data.productName.size() <= 160
+        && data.productSku is string && data.productSku.size() >= 1 && data.productSku.size() <= 64
+        && data.type in ['in', 'out', 'invoice', 'adjustment']
+        && data.quantityDelta is number && data.quantityDelta >= -1000000 && data.quantityDelta <= 1000000
+        && data.quantityAfter is number && data.quantityAfter >= -1000000 && data.quantityAfter <= 100000000
+        && data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 16
+        && data.unitPrice is number && data.unitPrice >= 0 && data.unitPrice <= 100000000
+        && data.reference is string && data.reference.size() <= 80
+        && data.note is string && data.note.size() <= 300
+        && data.source in ['web', 'android']
+        && data.performedByUid == request.auth.uid
+        && data.performedByName is string && data.performedByName.size() >= 1 && data.performedByName.size() <= 120
+        && data.createdAt is timestamp;
+    }
+
+    function isValidCustomer(data, workspaceId) {
+      return data.keys().hasAll([
+          'workspaceId', 'name', 'type', 'ico', 'dic', 'address', 'city', 'zip',
+          'email', 'phone', 'note', 'createdBy', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'workspaceId', 'name', 'type', 'ico', 'dic', 'address', 'city', 'zip',
+          'email', 'phone', 'note', 'createdBy', 'createdAt', 'updatedAt'
+        ])
+        && data.workspaceId == workspaceId
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 160
+        && data.type in ['customer', 'supplier', 'both']
+        && data.ico is string && data.ico.size() <= 20
+        && data.dic is string && data.dic.size() <= 24
+        && data.address is string && data.address.size() <= 200
+        && data.city is string && data.city.size() <= 100
+        && data.zip is string && data.zip.size() <= 20
+        && data.email is string && data.email.size() <= 160
+        && data.phone is string && data.phone.size() <= 40
+        && data.note is string && data.note.size() <= 400
+        && isValidId(data.createdBy)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidInvoice(data, workspaceId) {
+      return data.keys().hasAll([
+          'workspaceId', 'number', 'variableSymbol', 'customerId', 'customerName',
+          'customerIco', 'customerDic', 'customerAddress', 'issueDate', 'taxableDate',
+          'dueDate', 'paymentMethod', 'status', 'stockDeducted', 'items',
+          'subtotal', 'vatTotal', 'total', 'note', 'source',
+          'createdBy', 'createdByName', 'paidAt', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'workspaceId', 'number', 'variableSymbol', 'customerId', 'customerName',
+          'customerIco', 'customerDic', 'customerAddress', 'issueDate', 'taxableDate',
+          'dueDate', 'paymentMethod', 'status', 'stockDeducted', 'items',
+          'subtotal', 'vatTotal', 'total', 'note', 'source',
+          'createdBy', 'createdByName', 'paidAt', 'createdAt', 'updatedAt'
+        ])
+        && data.workspaceId == workspaceId
+        && data.number is string && data.number.size() >= 1 && data.number.size() <= 40
+        && data.variableSymbol is string && data.variableSymbol.size() >= 1 && data.variableSymbol.size() <= 20
+        && data.customerId is string && data.customerId.size() <= 128
+        && data.customerName is string && data.customerName.size() >= 1 && data.customerName.size() <= 160
+        && data.customerIco is string && data.customerIco.size() <= 20
+        && data.customerDic is string && data.customerDic.size() <= 24
+        && data.customerAddress is string && data.customerAddress.size() <= 280
+        && data.issueDate is string && data.issueDate.size() >= 8 && data.issueDate.size() <= 20
+        && data.taxableDate is string && data.taxableDate.size() >= 8 && data.taxableDate.size() <= 20
+        && data.dueDate is string && data.dueDate.size() >= 8 && data.dueDate.size() <= 20
+        && data.paymentMethod in ['bank', 'cash', 'card', 'cod']
+        && data.status in ['draft', 'issued', 'paid', 'cancelled']
+        && data.stockDeducted is bool
+        && data.items is list && data.items.size() >= 1 && data.items.size() <= 50
+        && data.items[0] is map
+        && data.items[0].name is string && data.items[0].name.size() >= 1 && data.items[0].name.size() <= 160
+        && data.subtotal is number && data.subtotal >= 0 && data.subtotal <= 1000000000
+        && data.vatTotal is number && data.vatTotal >= 0 && data.vatTotal <= 1000000000
+        && data.total is number && data.total >= 0 && data.total <= 1000000000
+        && data.note is string && data.note.size() <= 500
+        && data.source in ['web', 'android']
+        && isValidId(data.createdBy)
+        && data.createdByName is string && data.createdByName.size() >= 1 && data.createdByName.size() <= 120
+        && data.paidAt is string && data.paidAt.size() <= 40
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // =========================================================================
+    // 1. Private User Profiles (/users/{userId}) - Strict PII Isolation
+    // =========================================================================
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if false;
+
+      allow create: if isVerified()
+        && isValidId(userId)
+        && isOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerified()
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          (isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'email', 'activeWorkspaceId', 'workspaceIds', 'updatedAt']))
+        );
+
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // 2. Invite Codes (/inviteCodes/{code}) - Single-Document Lookup Only
+    // =========================================================================
+    match /inviteCodes/{code} {
+      allow get: if isVerified() && isValidInviteCodeStr(code);
+      allow list: if false;
+
+      allow create: if isVerified()
+        && isValidInviteCodeStr(code)
+        && isValidInviteCode(incoming(), code)
+        && incoming().createdBy == request.auth.uid
+        && incoming().createdAt == request.time
+        && (
+          isWorkspaceOwner(incoming().workspaceId) ||
+          getAfter(/databases/$(database)/documents/workspaces/$(incoming().workspaceId)).data.ownerId == request.auth.uid
+        );
+
+      allow update: if isVerified()
+        && isValidInviteCodeStr(code)
+        && isValidInviteCode(incoming(), code)
+        && incoming().code == existing().code
+        && incoming().workspaceId == existing().workspaceId
+        && incoming().createdBy == existing().createdBy
+        && incoming().createdAt == existing().createdAt
+        && (
+          isAdmin() ||
+          (isWorkspaceOwner(existing().workspaceId) && incoming().diff(existing()).affectedKeys().hasOnly(['active', 'workspaceName']))
+        );
+
+      allow delete: if isVerified() && isValidInviteCodeStr(code) && (isWorkspaceOwner(existing().workspaceId) || isAdmin());
+    }
+
+    // =========================================================================
+    // 3. Shared Workspaces (/workspaces/{workspaceId})
+    // =========================================================================
+    match /workspaces/{workspaceId} {
+      allow get: if isValidId(workspaceId) && (isWorkspaceMember(workspaceId) || isAdmin());
+      allow list: if false;
+
+      allow create: if isVerified()
+        && isValidId(workspaceId)
+        && isValidWorkspace(incoming())
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && existsAfter(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid));
+
+      allow update: if isVerified()
+        && isValidId(workspaceId)
+        && isValidWorkspace(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          // Action 1: Owner updates full company settings & invite code
+          (isWorkspaceOwner(workspaceId) && incoming().diff(existing()).affectedKeys().hasOnly([
+            'name', 'ico', 'dic', 'isVatPayer', 'address', 'city', 'zip', 'email', 'phone',
+            'bankAccount', 'iban', 'defaultVatRate', 'invoicePrefix', 'nextInvoiceNumber',
+            'inviteCode', 'updatedAt'
+          ])) ||
+          // Action 2: Any workspace member advances invoice sequence when issuing an invoice
+          (isWorkspaceMember(workspaceId)
+            && incoming().nextInvoiceNumber == existing().nextInvoiceNumber + 1
+            && incoming().diff(existing()).affectedKeys().hasOnly(['nextInvoiceNumber', 'updatedAt']))
+        );
+
+      allow delete: if isVerified() && isValidId(workspaceId) && (isWorkspaceOwner(workspaceId) || isAdmin());
+
+      // -----------------------------------------------------------------------
+      // 3a. Team Members (/workspaces/{workspaceId}/members/{memberId})
+      // -----------------------------------------------------------------------
+      match /members/{memberId} {
+        allow get: if isValidId(workspaceId) && isValidId(memberId) && (isWorkspaceMember(workspaceId) || isAdmin());
+        allow list: if isValidId(workspaceId) && resource.data.workspaceId == workspaceId && (isWorkspaceMember(workspaceId) || isAdmin());
+
+        allow create: if isVerified()
+          && isValidId(workspaceId)
+          && isValidId(memberId)
+          && isValidMember(incoming(), workspaceId, memberId)
+          && incoming().joinedAt == request.time
+          && (
+            // Branch 1: Workspace creator creating initial owner membership atomically
+            (memberId == request.auth.uid
+              && incoming().role == 'owner'
+              && getAfter(/databases/$(database)/documents/workspaces/$(workspaceId)).data.ownerId == request.auth.uid) ||
+            // Branch 2: Colleague self-joining with valid active workspace inviteCode (strictly 'warehouse' role)
+            (memberId == request.auth.uid
+              && incoming().role == 'warehouse'
+              && isValidInviteCodeStr(incoming().inviteCodeUsed)
+              && get(/databases/$(database)/documents/workspaces/$(workspaceId)).data.inviteCode == incoming().inviteCodeUsed) ||
+            // Branch 3: Admin override
+            isAdmin()
+          );
+
+        allow update: if isVerified()
+          && isValidId(workspaceId)
+          && isValidId(memberId)
+          && isValidMember(incoming(), workspaceId, memberId)
+          && incoming().uid == existing().uid
+          && incoming().workspaceId == existing().workspaceId
+          && incoming().joinedAt == existing().joinedAt
+          && incoming().inviteCodeUsed == existing().inviteCodeUsed
+          && (
+            isAdmin() ||
+            // Owner updates a colleague's role (cannot demote self from owner)
+            (isWorkspaceOwner(workspaceId)
+              && memberId != request.auth.uid
+              && incoming().role in ['manager', 'warehouse']
+              && incoming().diff(existing()).affectedKeys().hasOnly(['role'])) ||
+            // Member updates own display name / email
+            (memberId == request.auth.uid
+              && isWorkspaceMember(workspaceId)
+              && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'email']))
+          );
+
+        allow delete: if isVerified()
+          && isValidId(workspaceId)
+          && isValidId(memberId)
+          && (
+            isAdmin() ||
+            (isWorkspaceOwner(workspaceId) && memberId != request.auth.uid) ||
+            (memberId == request.auth.uid && existing().role != 'owner')
+          );
+      }
+
+      // -----------------------------------------------------------------------
+      // 3b. Products (/workspaces/{workspaceId}/products/{productId})
+      // -----------------------------------------------------------------------
+      match /products/{productId} {
+        allow get: if isValidId(workspaceId) && isValidId(productId) && (isWorkspaceMember(workspaceId) || isAdmin());
+        allow list: if isValidId(workspaceId) && resource.data.workspaceId == workspaceId && (isWorkspaceMember(workspaceId) || isAdmin());
+
+        allow create: if isVerified()
+          && isValidId(workspaceId)
+          && isValidId(productId)
+          && isValidProduct(incoming(), workspaceId)
+          && incoming().createdBy == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && (isWorkspaceMember(workspaceId) || isAdmin());
+
+        allow update: if isVerified()
+          && isValidId(workspaceId)
+          && isValidId(productId)
+          && isValidProduct(incoming(), workspaceId)
+          && incoming().workspaceId == existing().workspaceId
+          && incoming().createdBy == existing().createdBy
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            isAdmin() ||
+            // Tier 1: Owner / Manager edits full product catalog fields
+            (isWorkspaceManagerOrOwner(workspaceId) && incoming().diff(existing()).affectedKeys().hasOnly([
+              'sku', 'ean', 'name', 'category', 'unit', 'quantity', 'minStock',
+              'purchasePrice', 'salePrice', 'vatRate', 'location', 'note', 'updatedBy', 'updatedAt'
+            ])) ||
+            // Tier 2: Warehouse staff adjusts stock quantity, location, or note
+            (isWorkspaceMember(workspaceId) && incoming().diff(existing()).affectedKeys().hasOnly([
+              'quantity', 'location', 'note', 'updatedBy', 'updatedAt'
+            ]))
+          );
+
+        allow delete: if isVerified()
+          && isValidId(workspaceId)
+          && isValidId(productId)
+          && (isWorkspaceManagerOrOwner(workspaceId) || isAdmin());
+      }
+
+      // -----------------------------------------------------------------------
+      // 3c. Stock Movements (/workspaces/{workspaceId}/movements/{movementId})
+      // -----------------------------------------------------------------------
+      match /movements/{movementId} {
+        allow get: if isValidId(workspaceId) && isValidId(movementId) && (isWorkspaceMember(workspaceId) || isAdmin());
+        allow list: if isValidId(workspaceId) && resource.data.workspaceId == workspaceId && (isWorkspaceMember(workspaceId) || isAdmin());
+
+        allow create: if isVerified()
+          && isValidId(workspaceId)
+          && isValidId(movementId)
+          && isValidMovement(incoming(), workspaceId)
+          && incoming().createdAt == request.time
+          && existsAfter(/databases/$(database)/documents/workspaces/$(workspaceId)/products/$(incoming().productId))
+          && (isWorkspaceMember(workspaceId) || isAdmin());
+
+        allow update: if false;
+        allow delete: if isAdmin();
+      }
+
+      // -----------------------------------------------------------------------
+      // 3d. Customers (/workspaces/{workspaceId}/customers/{customerId})
+      // -----------------------------------------------------------------------
+      match /customers/{customerId} {
+        allow get: if isValidId(workspaceId) && isValidId(customerId) && (isWorkspaceMember(workspaceId) || isAdmin());
+        allow list: if isValidId(workspaceId) && resource.data.workspaceId == workspaceId && (isWorkspaceMember(workspaceId) || isAdmin());
+
+        allow create: if isVerified()
+          && isValidId(workspaceId)
+          && isValidId(customerId)
+          && isValidCustomer(incoming(), workspaceId)
+          && incoming().createdBy == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && (isWorkspaceMember(workspaceId) || isAdmin());
+
+        allow update: if isVerified()
+          && isValidId(workspaceId)
+          && isValidId(customerId)
+          && isValidCustomer(incoming(), workspaceId)
+          && incoming().workspaceId == existing().workspaceId
+          && incoming().createdBy == existing().createdBy
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            isAdmin() ||
+            (isWorkspaceMember(workspaceId) && incoming().diff(existing()).affectedKeys().hasOnly([
+              'name', 'type', 'ico', 'dic', 'address', 'city', 'zip', 'email', 'phone', 'note', 'updatedAt'
+            ]))
+          );
+
+        allow delete: if isVerified()
+          && isValidId(workspaceId)
+          && isValidId(customerId)
+          && (isWorkspaceManagerOrOwner(workspaceId) || isAdmin());
+      }
+
+      // -----------------------------------------------------------------------
+      // 3e. Invoices (/workspaces/{workspaceId}/invoices/{invoiceId})
+      // -----------------------------------------------------------------------
+      match /invoices/{invoiceId} {
+        allow get: if isValidId(workspaceId) && isValidId(invoiceId) && (isWorkspaceMember(workspaceId) || isAdmin());
+        allow list: if isValidId(workspaceId) && resource.data.workspaceId == workspaceId && (isWorkspaceMember(workspaceId) || isAdmin());
+
+        allow create: if isVerified()
+          && isValidId(workspaceId)
+          && isValidId(invoiceId)
+          && isValidInvoice(incoming(), workspaceId)
+          && incoming().createdBy == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && (isWorkspaceMember(workspaceId) || isAdmin());
+
+        allow update: if isVerified()
+          && isValidId(workspaceId)
+          && isValidId(invoiceId)
+          && isValidInvoice(incoming(), workspaceId)
+          && incoming().workspaceId == existing().workspaceId
+          && incoming().createdBy == existing().createdBy
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            isAdmin() ||
+            // Terminal State Lock: Cancelled invoices cannot be modified by standard members
+            (existing().status != 'cancelled' && (
+              // Action 1: Mark issued invoice as paid or cancel it
+              (isWorkspaceMember(workspaceId)
+                && incoming().status in ['paid', 'cancelled', 'issued']
+                && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'paidAt', 'updatedAt'])) ||
+              // Action 2: Edit draft invoice fields before issuing
+              (isWorkspaceMember(workspaceId)
+                && existing().status == 'draft'
+                && incoming().diff(existing()).affectedKeys().hasOnly([
+                  'number', 'variableSymbol', 'customerId', 'customerName', 'customerIco',
+                  'customerDic', 'customerAddress', 'issueDate', 'taxableDate', 'dueDate',
+                  'paymentMethod', 'status', 'stockDeducted', 'items', 'subtotal',
+                  'vatTotal', 'total', 'note', 'paidAt', 'updatedAt'
+                ]))
+            ))
+          );
+
+        allow delete: if isVerified()
+          && isValidId(workspaceId)
+          && isValidId(invoiceId)
+          && (isAdmin() || (isWorkspaceOwner(workspaceId) && existing().status == 'draft'));
+      }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "SkladFaktura Web",
+  "description": "Sdílený webový sklad a fakturace pro týmy s přímým propojením na Android aplikaci přes Firebase Firestore.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

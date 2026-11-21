@@ -1,0 +1,288 @@
+{
+  "entities": {
+    "Workspace": {
+      "title": "Workspace",
+      "description": "Shared multi-colleague workspace synchronizing 2 accounting entities, warehouses, inventory, invoices, and bank matching in real time.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "description": "Original creator Firebase Auth UID" },
+        "ownerEmail": { "type": "string", "description": "Lowercase verified Google email of workspace owner" },
+        "name": { "type": "string", "description": "Workspace display name" },
+        "memberEmails": { "type": "array", "description": "Bounded list (max 10) of lowercase Google emails with workspace access" },
+        "adminEmails": { "type": "array", "description": "Bounded list (max 10) of lowercase Google emails with administrator privileges" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Server timestamp written with FieldValue.serverTimestamp()" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Server timestamp written with FieldValue.serverTimestamp()" }
+      },
+      "required": ["ownerUid", "ownerEmail", "name", "memberEmails", "adminEmails", "createdAt", "updatedAt"]
+    },
+    "TeamMember": {
+      "title": "TeamMember",
+      "description": "Colleague profile (up to 3 colleagues + owner) with configurable ADMIN or MEMBER role.",
+      "type": "object",
+      "properties": {
+        "workspaceId": { "type": "string" },
+        "email": { "type": "string", "description": "Colleague lowercase Google email" },
+        "displayName": { "type": "string", "description": "Colleague display name" },
+        "role": { "type": "string", "enum": ["OWNER", "ADMIN", "MEMBER"] },
+        "memberEmails": { "type": "array", "description": "Denormalized workspace memberEmails for list query authorization" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["workspaceId", "email", "displayName", "role", "memberEmails", "createdAt", "updatedAt"]
+    },
+    "Company": {
+      "title": "Company",
+      "description": "Accounting entity profile (Company 1 or Company 2) with supplier details, IBAN, invoice numbering, and bank connection settings.",
+      "type": "object",
+      "properties": {
+        "workspaceId": { "type": "string" },
+        "memberEmails": { "type": "array" },
+        "name": { "type": "string" },
+        "ico": { "type": "string" },
+        "dic": { "type": "string" },
+        "street": { "type": "string" },
+        "city": { "type": "string" },
+        "zip": { "type": "string" },
+        "bankName": { "type": "string" },
+        "bankAccount": { "type": "string" },
+        "iban": { "type": "string" },
+        "bic": { "type": "string" },
+        "fioApiToken": { "type": "string", "description": "Optional Fio banka read-only API token for automatic statement sync" },
+        "lastBankSyncAt": { "type": "string" },
+        "email": { "type": "string" },
+        "phone": { "type": "string" },
+        "invoicePrefix": { "type": "string" },
+        "nextInvoiceNumber": { "type": "integer" },
+        "vatPayer": { "type": "boolean" },
+        "accentIndex": { "type": "integer" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "workspaceId", "memberEmails", "name", "ico", "dic", "street", "city", "zip",
+        "bankName", "bankAccount", "iban", "bic", "fioApiToken", "lastBankSyncAt",
+        "email", "phone", "invoicePrefix", "nextInvoiceNumber", "vatPayer", "accentIndex",
+        "createdAt", "updatedAt"
+      ]
+    },
+    "Warehouse": {
+      "title": "Warehouse",
+      "description": "Shared warehouse synchronized across both companies or a separate company-specific warehouse.",
+      "type": "object",
+      "properties": {
+        "workspaceId": { "type": "string" },
+        "memberEmails": { "type": "array" },
+        "name": { "type": "string" },
+        "code": { "type": "string" },
+        "shared": { "type": "boolean" },
+        "ownerCompanyId": { "type": "string" },
+        "location": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["workspaceId", "memberEmails", "name", "code", "shared", "ownerCompanyId", "location", "createdAt", "updatedAt"]
+    },
+    "InventoryItem": {
+      "title": "InventoryItem",
+      "description": "Stock card with configurable minQuantity threshold for out-of-stock alerts.",
+      "type": "object",
+      "properties": {
+        "workspaceId": { "type": "string" },
+        "memberEmails": { "type": "array" },
+        "sku": { "type": "string" },
+        "name": { "type": "string" },
+        "ean": { "type": "string" },
+        "category": { "type": "string" },
+        "unit": { "type": "string" },
+        "quantity": { "type": "number" },
+        "minQuantity": { "type": "number" },
+        "purchasePrice": { "type": "number" },
+        "salePrice": { "type": "number" },
+        "vatRate": { "type": "integer" },
+        "warehouseId": { "type": "string" },
+        "supplierName": { "type": "string" },
+        "notes": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "workspaceId", "memberEmails", "sku", "name", "ean", "category", "unit", "quantity",
+        "minQuantity", "purchasePrice", "salePrice", "vatRate",
+        "warehouseId", "supplierName", "notes", "createdAt", "updatedAt"
+      ]
+    },
+    "StockMovement": {
+      "title": "StockMovement",
+      "description": "Immutable warehouse movement log entry.",
+      "type": "object",
+      "properties": {
+        "workspaceId": { "type": "string" },
+        "memberEmails": { "type": "array" },
+        "itemId": { "type": "string" },
+        "itemName": { "type": "string" },
+        "itemSku": { "type": "string" },
+        "warehouseId": { "type": "string" },
+        "companyId": { "type": "string" },
+        "movementType": { "type": "string", "enum": ["RECEIPT", "ISSUE", "ADJUSTMENT"] },
+        "quantityDelta": { "type": "number" },
+        "unit": { "type": "string" },
+        "unitPrice": { "type": "number" },
+        "documentRef": { "type": "string" },
+        "note": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "workspaceId", "memberEmails", "itemId", "itemName", "itemSku", "warehouseId",
+        "companyId", "movementType", "quantityDelta", "unit",
+        "unitPrice", "documentRef", "note", "createdAt"
+      ]
+    },
+    "Client": {
+      "title": "Client",
+      "description": "Customer record populated manually or automatically from Czech ARES registry by ICO.",
+      "type": "object",
+      "properties": {
+        "workspaceId": { "type": "string" },
+        "memberEmails": { "type": "array" },
+        "name": { "type": "string" },
+        "ico": { "type": "string" },
+        "dic": { "type": "string" },
+        "street": { "type": "string" },
+        "city": { "type": "string" },
+        "zip": { "type": "string" },
+        "country": { "type": "string" },
+        "email": { "type": "string" },
+        "phone": { "type": "string" },
+        "bankAccount": { "type": "string" },
+        "notes": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "workspaceId", "memberEmails", "name", "ico", "dic", "street", "city", "zip",
+        "country", "email", "phone", "bankAccount", "notes", "createdAt", "updatedAt"
+      ]
+    },
+    "Invoice": {
+      "title": "Invoice",
+      "description": "Issued invoice per company with QR SPD data, payment matching fields, and Pohoda export tracking.",
+      "type": "object",
+      "properties": {
+        "workspaceId": { "type": "string" },
+        "memberEmails": { "type": "array" },
+        "companyId": { "type": "string" },
+        "companyName": { "type": "string" },
+        "companyIco": { "type": "string" },
+        "companyDic": { "type": "string" },
+        "companyAddress": { "type": "string" },
+        "companyBankAccount": { "type": "string" },
+        "companyIban": { "type": "string" },
+        "invoiceNumber": { "type": "string" },
+        "variableSymbol": { "type": "string" },
+        "issueDate": { "type": "string" },
+        "taxDate": { "type": "string" },
+        "dueDate": { "type": "string" },
+        "paymentMethod": { "type": "string", "enum": ["BANK_TRANSFER", "CASH", "CARD"] },
+        "status": { "type": "string", "enum": ["ISSUED", "PAID", "CANCELLED"] },
+        "clientId": { "type": "string" },
+        "clientName": { "type": "string" },
+        "clientIco": { "type": "string" },
+        "clientDic": { "type": "string" },
+        "clientStreet": { "type": "string" },
+        "clientCity": { "type": "string" },
+        "clientZip": { "type": "string" },
+        "currency": { "type": "string" },
+        "totalWithoutVat": { "type": "number" },
+        "totalVat": { "type": "number" },
+        "totalWithVat": { "type": "number" },
+        "paidAmount": { "type": "number" },
+        "paidDate": { "type": "string" },
+        "matchedTransactionId": { "type": "string" },
+        "note": { "type": "string" },
+        "deductedFromStock": { "type": "boolean" },
+        "exportedToPohoda": { "type": "boolean" },
+        "items": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "workspaceId", "memberEmails", "companyId", "companyName", "companyIco", "companyDic",
+        "companyAddress", "companyBankAccount", "companyIban", "invoiceNumber",
+        "variableSymbol", "issueDate", "taxDate", "dueDate", "paymentMethod",
+        "status", "clientId", "clientName", "clientIco", "clientDic",
+        "clientStreet", "clientCity", "clientZip", "currency",
+        "totalWithoutVat", "totalVat", "totalWithVat", "paidAmount", "paidDate",
+        "matchedTransactionId", "note", "deductedFromStock", "exportedToPohoda",
+        "items", "createdAt", "updatedAt"
+      ]
+    },
+    "BankTransaction": {
+      "title": "BankTransaction",
+      "description": "Bank statement transaction synced via Fio API or imported from GPC/CSV/PDF for invoice payment matching.",
+      "type": "object",
+      "properties": {
+        "workspaceId": { "type": "string" },
+        "memberEmails": { "type": "array" },
+        "companyId": { "type": "string" },
+        "externalId": { "type": "string" },
+        "date": { "type": "string" },
+        "amount": { "type": "number" },
+        "currency": { "type": "string" },
+        "variableSymbol": { "type": "string" },
+        "counterpartyName": { "type": "string" },
+        "counterpartyAccount": { "type": "string" },
+        "message": { "type": "string" },
+        "matchedInvoiceId": { "type": "string" },
+        "matchedInvoiceNumber": { "type": "string" },
+        "matchStatus": { "type": "string", "enum": ["UNMATCHED", "MATCHED", "IGNORED"] },
+        "source": { "type": "string", "enum": ["FIO_API", "GPC_IMPORT", "CSV_IMPORT", "MANUAL"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "workspaceId", "memberEmails", "companyId", "externalId", "date", "amount",
+        "currency", "variableSymbol", "counterpartyName", "counterpartyAccount",
+        "message", "matchedInvoiceId", "matchedInvoiceNumber", "matchStatus",
+        "source", "createdAt", "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/workspaces/{workspaceId}": {
+      "schema": { "$ref": "#/entities/Workspace" },
+      "description": "Shared multi-colleague workspace root document"
+    },
+    "/workspaces/{workspaceId}/teamMembers/{memberId}": {
+      "schema": { "$ref": "#/entities/TeamMember" },
+      "description": "Up to 3 invited colleagues plus owner with role management (OWNER / ADMIN / MEMBER)"
+    },
+    "/workspaces/{workspaceId}/companies/{companyId}": {
+      "schema": { "$ref": "#/entities/Company" },
+      "description": "2 synchronized accounting entities with bank sync settings"
+    },
+    "/workspaces/{workspaceId}/warehouses/{warehouseId}": {
+      "schema": { "$ref": "#/entities/Warehouse" },
+      "description": "Shared and separate company warehouses"
+    },
+    "/workspaces/{workspaceId}/inventory/{itemId}": {
+      "schema": { "$ref": "#/entities/InventoryItem" },
+      "description": "Stock items with minimum stock threshold monitoring"
+    },
+    "/workspaces/{workspaceId}/stockMovements/{movementId}": {
+      "schema": { "$ref": "#/entities/StockMovement" },
+      "description": "Audit log of stock receipts, invoice deductions, and adjustments"
+    },
+    "/workspaces/{workspaceId}/clients/{clientId}": {
+      "schema": { "$ref": "#/entities/Client" },
+      "description": "Shared customer directory with ARES lookup"
+    },
+    "/workspaces/{workspaceId}/invoices/{invoiceId}": {
+      "schema": { "$ref": "#/entities/Invoice" },
+      "description": "Issued invoices with payment status, QR payment, and bank matching"
+    },
+    "/workspaces/{workspaceId}/bankTransactions/{txId}": {
+      "schema": { "$ref": "#/entities/BankTransaction" },
+      "description": "Bank transactions synced from Fio API or GPC/CSV statements for invoice matching"
+    }
+  }
+}
