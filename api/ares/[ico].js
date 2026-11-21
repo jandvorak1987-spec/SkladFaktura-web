@@ -1,15 +1,4 @@
-interface VercelRequest {
-  method?: string;
-  url?: string;
-  query?: Record<string, string | string[] | undefined>;
-}
-
-interface VercelResponse {
-  status: (code: number) => VercelResponse;
-  json: (body: unknown) => void;
-}
-
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+export default async function handler(req, res) {
   if (req.method && req.method !== 'GET') {
     res.status(405).json({ error: 'Metoda není povolena.' });
     return;
@@ -53,8 +42,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return;
     }
 
-    const json = (await response.json()) as Record<string, unknown>;
-    const sidlo = (json.sidlo || {}) as Record<string, unknown>;
+    const json = await response.json();
+    const sidlo = json?.sidlo || {};
     const streetName = String(sidlo.nazevUlice || '').trim();
     const houseNum = Number(sidlo.cisloDomovni || 0);
     const orientNum = Number(sidlo.cisloOrientacni || 0);
@@ -81,13 +70,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         .trim();
 
     res.status(200).json({
-      ico: String(json.ico || normalizedIco).trim(),
-      dic: String(json.dic || '').trim(),
-      name: String(json.obchodniJmeno || '').trim() || `Neznámý subjekt (${normalizedIco})`,
+      ico: String(json?.ico || normalizedIco).trim(),
+      dic: String(json?.dic || '').trim(),
+      name: String(json?.obchodniJmeno || '').trim() || `Neznámý subjekt (${normalizedIco})`,
       street: formattedStreet,
       city,
       zip,
-      legalForm: String(json.pravniForma || ''),
+      legalForm: String(json?.pravniForma || ''),
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'chyba sítě';

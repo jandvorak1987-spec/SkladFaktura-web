@@ -1,36 +1,26 @@
-interface VercelRequest {
-  method?: string;
-  body?: unknown;
-}
-
-interface VercelResponse {
-  status: (code: number) => VercelResponse;
-  json: (body: unknown) => void;
-}
-
-function round2(n: number): number {
+function round2(n) {
   return Math.round(n * 100) / 100;
 }
 
-function extractVsFromMessage(message: string): string {
+function extractVsFromMessage(message) {
   if (!message) return '';
   const vsMatch = message.match(/(?:VS|VAR\.?\s*SYM\.?|FA(?:KTURA)?)\s*[:#-]?\s*(\d{4,10})/i);
   return vsMatch ? vsMatch[1] : '';
 }
 
-function parseBody(raw: unknown): Record<string, unknown> {
+function parseBody(raw) {
   if (!raw) return {};
   if (typeof raw === 'string') {
     try {
-      return JSON.parse(raw) as Record<string, unknown>;
+      return JSON.parse(raw);
     } catch {
       return {};
     }
   }
-  return typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+  return typeof raw === 'object' ? raw : {};
 }
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Metoda není povolena.' });
     return;
@@ -46,7 +36,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   const now = new Date();
   const from = new Date(now.getTime() - daysBack * 86400000);
-  const fmt = (d: Date) =>
+  const fmt = (d) =>
     `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(
       d.getDate()
     ).padStart(2, '0')}`;
@@ -82,18 +72,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return;
     }
 
-    const root = (await response.json()) as {
-      accountStatement?: {
-        transactionList?: {
-          transaction?: Array<Record<string, { value?: string | number | null } | null>>;
-        };
-      };
-    };
-
-    const txList = root.accountStatement?.transactionList?.transaction || [];
+    const root = await response.json();
+    const txList = root?.accountStatement?.transactionList?.transaction || [];
     const transactions = txList.map((tx, i) => {
-      const strCol = (k: string) => String(tx[k]?.value ?? '').trim();
-      const numCol = (k: string) => Number(tx[k]?.value ?? 0);
+      const strCol = (k) => String(tx?.[k]?.value ?? '').trim();
+      const numCol = (k) => Number(tx?.[k]?.value ?? 0);
 
       const extId = strCol('column22') || `FIO-${i}-${Date.now()}`;
       const rawDate = strCol('column0').slice(0, 10) || toStr;
@@ -115,7 +98,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         counterpartyName: counterName.slice(0, 200),
         counterpartyAccount: fullAcc.slice(0, 60),
         message: message.slice(0, 300),
-        source: 'FIO_API' as const,
+        source: 'FIO_API',
       };
     });
 

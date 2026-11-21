@@ -3,7 +3,7 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "functions": {
-    "api/ai-stock-import.ts": {
+    "api/ai-stock-import.js": {
       "maxDuration": 60
     }
   },

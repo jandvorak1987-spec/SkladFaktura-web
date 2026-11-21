@@ -1,50 +1,91 @@
 import { GoogleGenAI, Type } from '@google/genai';
 
-interface VercelRequest {
-  method?: string;
-  body?: unknown;
-}
-
-interface VercelResponse {
-  status: (code: number) => VercelResponse;
-  json: (body: unknown) => void;
-}
-
-function round2(n: number): number {
+function round2(n) {
   return Math.round(n * 100) / 100;
 }
 
-function parseBody(raw: unknown): Record<string, unknown> {
+function parseBody(raw) {
   if (!raw) return {};
   if (typeof raw === 'string') {
     try {
-      return JSON.parse(raw) as Record<string, unknown>;
+      return JSON.parse(raw);
     } catch {
       return {};
     }
   }
-  return typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+  return typeof raw === 'object' ? raw : {};
 }
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+function findGeminiApiKey() {
+  const exactCandidates = [
+    process.env.GEMINI_API_KEY,
+    process.env.GOOGLE_GENERATIVE_AI_API_KEY,
+    process.env.GOOGLE_API_KEY,
+    process.env.VITE_GEMINI_API_KEY,
+    process.env.GEMINI_KEY,
+    process.env.API_KEY,
+  ];
+  for (const val of exactCandidates) {
+    if (typeof val === 'string' && val.trim()) {
+      return val.trim();
+    }
+  }
+
+  // Case-insensitive & typo-tolerant lookup (Linux env var names are case-sensitive)
+  const acceptedNormalized = new Set([
+    'GEMINIAPIKEY',
+    'GEMINIKEY',
+    'GOOGLEGENERATIVEAIAPIKEY',
+    'GOOGLEAIAPIKEY',
+    'GOOGLEAPIKEY',
+    'VITEGEMINIAPIKEY',
+    'APIKEY',
+  ]);
+  for (const [k, v] of Object.entries(process.env)) {
+    if (typeof v !== 'string' || !v.trim()) continue;
+    const norm = k.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (acceptedNormalized.has(norm) || (norm.includes('GEMINI') && !norm.includes('FIREBASE'))) {
+      return v.trim();
+    }
+  }
+  return '';
+}
+
+export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Metoda není povolena.' });
     return;
   }
 
   try {
-    const apiKey = (
-      process.env.GEMINI_API_KEY ||
-      process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
-      process.env.GOOGLE_API_KEY ||
-      process.env.VITE_GEMINI_API_KEY ||
-      process.env.API_KEY ||
-      ''
-    ).trim();
+    const apiKey = findGeminiApiKey();
     if (!apiKey) {
       const envName = process.env.VERCEL_ENV || process.env.NODE_ENV || 'production';
+      const swappedKeyValue = Object.keys(process.env).some((k) => k.trim().startsWith('AIza'));
+      if (swappedKeyValue) {
+        res.status(500).json({
+          error:
+            'Na Vercelu máš pravděpodobně prohozený Key a Value: do pole Key napiš GEMINI_API_KEY a samotný klíč (AIza...) vlož do pole Value. Poté dej Save a Deployments → Redeploy.',
+        });
+        return;
+      }
+
+      const candidateNames = Object.keys(process.env).filter(
+        (k) =>
+          /gemini|google|api|key/i.test(k) &&
+          !k.startsWith('VERCEL_') &&
+          !k.startsWith('AWS_') &&
+          !k.startsWith('NODE_') &&
+          !k.startsWith('NPM_') &&
+          !k.trim().startsWith('AIza')
+      );
+      const diag =
+        candidateNames.length > 0
+          ? ` (Nalezené podobné názvy proměnných: ${candidateNames.join(', ')})`
+          : ' (Na serveru zatím není uložena žádná proměnná s GEMINI / API_KEY.)';
+
       res.status(500).json({
-        error: `GEMINI_API_KEY není nastaven v prostředí "${envName}" na Vercelu (Settings → Environment Variables → zaškrtnout Production i Preview → poté Deployments → Redeploy).`,
+        error: `GEMINI_API_KEY není nastaven v prostředí "${envName}" na Vercelu.${diag} Přidej jej v projektu SkladFaktura-web → Settings → Environment Variables (zaškrtnout Production i Preview → Save) a poté udělej Deployments → Redeploy.`,
       });
       return;
     }
@@ -75,7 +116,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       'Nákupní cenu uveď jako jednotkovou cenu bez DPH v CZK (pokud je na dokladu jen cena s DPH, přepočítej ji bez DPH). ' +
       'Sazba DPH musí být 0, 12 nebo 21. Odpovídej striktně dle JSON schématu.';
 
-    const parts: Array<{ text: string } | { inlineData: { data: string; mimeType: string } }> = [];
+    const parts = [];
     if (base64Data && mimeType) {
       parts.push({ inlineData: { data: base64Data, mimeType } });
       parts.push({
@@ -122,21 +163,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       },
     });
 
-    const parsed = JSON.parse((response.text || '{}').trim()) as {
-      supplierName?: string;
-      supplierIco?: string;
-      documentNumber?: string;
-      documentType?: string;
-      items?: Array<{
-        sku?: string;
-        name?: string;
-        ean?: string;
-        quantity?: number;
-        unit?: string;
-        unitPurchasePrice?: number;
-        vatRate?: number;
-      }>;
-    };
+    const parsed = JSON.parse((response.text || '{}').trim());
 
     const items = (parsed.items || [])
       .filter((it) => String(it.name || '').trim().length > 0)
