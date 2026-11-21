@@ -5,6 +5,8 @@ import {
   Ban,
   Building2,
   CheckCircle2,
+  Copy,
+  Edit3,
   FilePlus2,
   FileText,
   Loader2,
@@ -17,6 +19,7 @@ import {
 import { useApp } from '../context/AppContext';
 import {
   cancelInvoice,
+  editInvoice,
   issueInvoice,
   markInvoicePaid,
   updateInvoiceTemplate,
@@ -378,6 +381,7 @@ export function InvoicesView({
 }: InvoicesViewProps) {
   const {
     workspace,
+    isCurrentUserAdmin,
     activeCompany,
     accessibleWarehouses,
     inventory,
@@ -389,7 +393,8 @@ export function InvoicesView({
 
   const palette = getCompanyPalette(activeCompany?.accentIndex);
 
-  const [mode, setMode] = useState<'LIST' | 'CREATE' | 'DETAIL'>('LIST');
+  const [mode, setMode] = useState<'LIST' | 'CREATE' | 'EDIT' | 'DETAIL'>('LIST');
+  const [editingInvoice, setEditingInvoice] = useState<Invoice | null>(null);
   const [selectedInvoiceId, setSelectedInvoiceId] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('ALL');
   const [search, setSearch] = useState('');
@@ -476,7 +481,54 @@ export function InvoicesView({
         discountPercent: 0,
       },
     ]);
+    setEditingInvoice(null);
     setMode('CREATE');
+  };
+
+  const startDuplicateInvoice = (source: Invoice) => {
+    const today = toIsoDate();
+    const nextNum = activeCompany ? previewNextInvoiceNumber(activeCompany) : `20260001`;
+    setInvoiceNumber(nextNum);
+    setVariableSymbol(nextNum.replace(/\D/g, ''));
+    setIssueDate(today);
+    setTaxDate(today);
+    setDueDate(addDaysIso(today, 14));
+    setPaymentMethod(source.paymentMethod || 'BANK_TRANSFER');
+    setInvoiceTemplate(source.invoiceTemplate || activeCompany?.invoiceTemplate || 'CLASSIC');
+    setDeductFromStock(source.deductedFromStock);
+    setNote(source.note || '');
+    setClientId(source.clientId || '');
+    setClientName(source.clientName || '');
+    setClientIco(source.clientIco || '');
+    setClientDic(source.clientDic || '');
+    setClientStreet(source.clientStreet || '');
+    setClientCity(source.clientCity || '');
+    setClientZip(source.clientZip || '');
+    setItems(source.items.map((l) => ({ ...l })));
+    setEditingInvoice(null);
+    setMode('CREATE');
+  };
+
+  const startEditInvoice = (source: Invoice) => {
+    setInvoiceNumber(source.invoiceNumber);
+    setVariableSymbol(source.variableSymbol);
+    setIssueDate(source.issueDate);
+    setTaxDate(source.taxDate || source.issueDate);
+    setDueDate(source.dueDate);
+    setPaymentMethod(source.paymentMethod || 'BANK_TRANSFER');
+    setInvoiceTemplate(source.invoiceTemplate || activeCompany?.invoiceTemplate || 'CLASSIC');
+    setDeductFromStock(source.deductedFromStock);
+    setNote(source.note || '');
+    setClientId(source.clientId || '');
+    setClientName(source.clientName || '');
+    setClientIco(source.clientIco || '');
+    setClientDic(source.clientDic || '');
+    setClientStreet(source.clientStreet || '');
+    setClientCity(source.clientCity || '');
+    setClientZip(source.clientZip || '');
+    setItems(source.items.map((l) => ({ ...l })));
+    setEditingInvoice(source);
+    setMode('EDIT');
   };
 
   useEffect(() => {
@@ -583,35 +635,51 @@ export function InvoicesView({
     }
     setSaving(true);
     try {
-      const newId = await issueInvoice({
-        workspace,
-        inventory,
-        payload: {
-          company: activeCompany,
-          invoiceNumber,
-          variableSymbol,
-          issueDate,
-          taxDate,
-          dueDate,
-          paymentMethod,
-          clientId,
-          clientName,
-          clientIco,
-          clientDic,
-          clientStreet,
-          clientCity,
-          clientZip,
-          note,
-          deductFromStock,
-          invoiceTemplate,
-          items,
-        },
-      });
-      notify(`Faktura ${invoiceNumber} byla vystavena.`);
-      setSelectedInvoiceId(newId);
-      setMode('DETAIL');
+      const payload = {
+        company: activeCompany,
+        invoiceNumber,
+        variableSymbol,
+        issueDate,
+        taxDate,
+        dueDate,
+        paymentMethod,
+        clientId,
+        clientName,
+        clientIco,
+        clientDic,
+        clientStreet,
+        clientCity,
+        clientZip,
+        note,
+        deductFromStock,
+        invoiceTemplate,
+        items,
+      };
+
+      if (mode === 'EDIT' && editingInvoice) {
+        const updatedId = await editInvoice({
+          workspace,
+          originalInvoice: editingInvoice,
+          inventory,
+          isAdmin: isCurrentUserAdmin,
+          payload,
+        });
+        notify(`Změny na faktuře ${invoiceNumber} byly uloženy.`);
+        setEditingInvoice(null);
+        setSelectedInvoiceId(updatedId);
+        setMode('DETAIL');
+      } else {
+        const newId = await issueInvoice({
+          workspace,
+          inventory,
+          payload,
+        });
+        notify(`Faktura ${invoiceNumber} byla vystavena.`);
+        setSelectedInvoiceId(newId);
+        setMode('DETAIL');
+      }
     } catch (err) {
-      notify(err instanceof Error ? err.message : 'Vystavení faktury selhalo.', 'error');
+      notify(err instanceof Error ? err.message : 'Uložení faktury selhalo.', 'error');
     } finally {
       setSaving(false);
     }
@@ -676,6 +744,24 @@ export function InvoicesView({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            {selectedInvoice.status !== 'CANCELLED' && (
+              <button
+                type="button"
+                onClick={() => startEditInvoice(selectedInvoice)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg"
+              >
+                <Edit3 className="w-4 h-4" />
+                Upravit
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => startDuplicateInvoice(selectedInvoice)}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg"
+            >
+              <Copy className="w-4 h-4" />
+              Duplikovat
+            </button>
             {selectedInvoice.status === 'ISSUED' && (
               <>
                 <button
@@ -740,24 +826,37 @@ export function InvoicesView({
     );
   }
 
-  // CREATE VIEW
-  if (mode === 'CREATE') {
+  // CREATE / EDIT VIEW
+  if (mode === 'CREATE' || mode === 'EDIT') {
+    const isEditing = mode === 'EDIT' && editingInvoice !== null;
     return (
       <form onSubmit={handleIssueInvoice} className="space-y-6">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div className="flex items-center gap-3">
             <button
               type="button"
-              onClick={() => setMode('LIST')}
+              onClick={() => {
+                if (isEditing && editingInvoice) {
+                  setSelectedInvoiceId(editingInvoice.id);
+                  setEditingInvoice(null);
+                  setMode('DETAIL');
+                } else {
+                  setMode('LIST');
+                }
+              }}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg"
             >
               <ArrowLeft className="w-4 h-4" />
               Zpět
             </button>
             <div>
-              <h1 className="text-xl font-bold text-slate-900">Nová faktura</h1>
+              <h1 className="text-xl font-bold text-slate-900">
+                {isEditing ? `Úprava faktury ${editingInvoice.invoiceNumber}` : 'Nová faktura'}
+              </h1>
               <p className="text-xs text-slate-500">
-                Vystavitel: {activeCompany?.name} ({activeCompany?.vatPayer ? 'Plátce DPH' : 'Neplátce DPH'})
+                {isEditing
+                  ? 'Případná změna množství u skladových položek automaticky dorovná stav skladu.'
+                  : `Vystavitel: ${activeCompany?.name} (${activeCompany?.vatPayer ? 'Plátce DPH' : 'Neplátce DPH'})`}
               </p>
             </div>
           </div>
@@ -769,7 +868,7 @@ export function InvoicesView({
             className="inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-medium text-white rounded-lg hover:opacity-95 disabled:opacity-60"
           >
             {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <FilePlus2 className="w-4 h-4" />}
-            Vystavit fakturu · {formatCzk(draftTotals.totalWithVat)}
+            {isEditing ? 'Uložit změny' : 'Vystavit fakturu'} · {formatCzk(draftTotals.totalWithVat)}
           </button>
         </div>
 
@@ -1254,6 +1353,7 @@ export function InvoicesView({
                   <th className="py-3 px-4">Vystaveno / Splatnost</th>
                   <th className="py-3 px-4 text-right">Částka s DPH</th>
                   <th className="py-3 px-4">Stav</th>
+                  <th className="py-3 px-4 text-right">Akce</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 text-sm">
@@ -1300,6 +1400,31 @@ export function InvoicesView({
                         ) : (
                           <span className="text-amber-700">Vystaveno</span>
                         )}
+                      </td>
+                      <td
+                        className="py-3 px-4 text-right whitespace-nowrap"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <div className="inline-flex items-center gap-1">
+                          {inv.status !== 'CANCELLED' && (
+                            <button
+                              type="button"
+                              onClick={() => startEditInvoice(inv)}
+                              title="Upravit fakturu"
+                              className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md"
+                            >
+                              <Edit3 className="w-4 h-4" />
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => startDuplicateInvoice(inv)}
+                            title="Duplikovat fakturu"
+                            className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md"
+                          >
+                            <Copy className="w-4 h-4" />
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   );

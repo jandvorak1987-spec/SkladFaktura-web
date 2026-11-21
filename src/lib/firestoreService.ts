@@ -977,6 +977,197 @@ export async function issueInvoice(params: {
   }
 }
 
+export async function editInvoice(params: {
+  workspace: Workspace;
+  originalInvoice: Invoice;
+  inventory: InventoryItem[];
+  isAdmin: boolean;
+  payload: CreateInvoicePayload;
+}): Promise<string> {
+  const { workspace, originalInvoice, inventory, isAdmin, payload } = params;
+  if (originalInvoice.status === 'CANCELLED') {
+    throw new Error('Stornovanou fakturu nelze upravovat. Použijte funkci Duplikovat.');
+  }
+
+  const { company } = payload;
+  const cleanItems = payload.items
+    .filter((i) => i.name.trim().length > 0 && i.quantity > 0)
+    .slice(0, 100)
+    .map((i) => ({
+      inventoryItemId: (i.inventoryItemId || '').slice(0, 64),
+      warehouseId: (i.warehouseId || '').slice(0, 64),
+      sku: (i.sku || '').slice(0, 64),
+      name: i.name.trim().slice(0, 200),
+      quantity: round2(i.quantity),
+      unit: (i.unit || 'ks').trim().slice(0, 20),
+      unitPrice: Math.max(0, round2(i.unitPrice)),
+      vatRate: i.vatRate === 0 || i.vatRate === 12 || i.vatRate === 21 ? i.vatRate : 21,
+      discountPercent: Math.min(100, Math.max(0, round2(i.discountPercent || 0))),
+    }));
+
+  if (cleanItems.length === 0) {
+    throw new Error('Faktura musí obsahovat alespoň jednu položku.');
+  }
+
+  const totals = calculateInvoiceTotals(cleanItems, company.vatPayer);
+  const root = wsRoot(workspace.id);
+  const invNum = payload.invoiceNumber.trim().slice(0, 40);
+  const vs = (payload.variableSymbol.trim() || invNum.replace(/\D/g, '')).slice(0, 20);
+
+  // Compute inventory delta (oldDeducted - newDeducted): positive = return to stock, negative = additional issue
+  const invMap = new Map(inventory.map((i) => [i.id, i]));
+  const oldDeducted = new Map<string, number>();
+  if (originalInvoice.deductedFromStock) {
+    for (const line of originalInvoice.items) {
+      if (line.inventoryItemId && invMap.has(line.inventoryItemId)) {
+        oldDeducted.set(
+          line.inventoryItemId,
+          (oldDeducted.get(line.inventoryItemId) || 0) + line.quantity
+        );
+      }
+    }
+  }
+  const newDeducted = new Map<string, number>();
+  if (payload.deductFromStock) {
+    for (const line of cleanItems) {
+      if (line.inventoryItemId && invMap.has(line.inventoryItemId)) {
+        newDeducted.set(
+          line.inventoryItemId,
+          (newDeducted.get(line.inventoryItemId) || 0) + line.quantity
+        );
+      }
+    }
+  }
+
+  const allItemIds = new Set([...oldDeducted.keys(), ...newDeducted.keys()]);
+  const stockAdjustments: Array<{ item: InventoryItem; delta: number }> = [];
+  for (const itemId of allItemIds) {
+    const stockItem = invMap.get(itemId);
+    if (!stockItem) continue;
+    const delta = round2((oldDeducted.get(itemId) || 0) - (newDeducted.get(itemId) || 0));
+    if (delta !== 0) {
+      stockAdjustments.push({ item: stockItem, delta });
+    }
+  }
+
+  const applyStockDeltas = (batch: ReturnType<typeof writeBatch>) => {
+    for (const { item: stockItem, delta } of stockAdjustments) {
+      batch.update(doc(root, 'inventory', stockItem.id), {
+        quantity: round2(stockItem.quantity + delta),
+        updatedAt: serverTimestamp(),
+      });
+      batch.set(doc(collection(root, 'stockMovements')), {
+        workspaceId: workspace.id,
+        memberEmails: workspace.memberEmails,
+        itemId: stockItem.id,
+        itemName: stockItem.name.slice(0, 200),
+        itemSku: stockItem.sku.slice(0, 64),
+        warehouseId: stockItem.warehouseId || 'shared_main',
+        companyId: company.id,
+        movementType: delta > 0 ? 'RECEIPT' : 'ISSUE',
+        quantityDelta: delta,
+        unit: stockItem.unit.slice(0, 20),
+        unitPrice: stockItem.salePrice,
+        documentRef: `Oprava FA ${invNum}`.slice(0, 100),
+        note: `Úprava položek faktury pro ${payload.clientName}`.slice(0, 300),
+        createdAt: serverTimestamp(),
+      });
+    }
+  };
+
+  const editableFields = {
+    invoiceNumber: invNum,
+    variableSymbol: vs,
+    issueDate: payload.issueDate.slice(0, 20),
+    taxDate: payload.taxDate.slice(0, 20),
+    dueDate: payload.dueDate.slice(0, 20),
+    paymentMethod: payload.paymentMethod,
+    clientId: payload.clientId.slice(0, 64),
+    clientName: payload.clientName.trim().slice(0, 200),
+    clientIco: payload.clientIco.trim().slice(0, 20),
+    clientDic: payload.clientDic.trim().slice(0, 25),
+    clientStreet: payload.clientStreet.trim().slice(0, 200),
+    clientCity: payload.clientCity.trim().slice(0, 120),
+    clientZip: payload.clientZip.trim().slice(0, 20),
+    totalWithoutVat: totals.totalWithoutVat,
+    totalVat: totals.totalVat,
+    totalWithVat: totals.totalWithVat,
+    note: payload.note.trim().slice(0, 500),
+    deductedFromStock: Boolean(payload.deductFromStock),
+    invoiceTemplate: payload.invoiceTemplate || company.invoiceTemplate || 'CLASSIC',
+    items: cleanItems,
+    updatedAt: serverTimestamp(),
+  };
+
+  // Attempt 1: Direct update (works for ALL team members once Firestore rules allow direct invoice editing)
+  const oldRef = doc(root, 'invoices', originalInvoice.id);
+  try {
+    const directBatch = writeBatch(db);
+    directBatch.update(oldRef, editableFields);
+    applyStockDeltas(directBatch);
+    await directBatch.commit();
+    return originalInvoice.id;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+    const isPerm = msg.includes('permission') || msg.includes('insufficient');
+    if (!isPerm) {
+      handleFirestoreError(error, OperationType.UPDATE, oldRef.path);
+    }
+
+    if (!isAdmin) {
+      throw new Error(
+        'Přímá editace vystavené faktury vyžaduje aktualizaci pravidel Firestore pro běžné členy, nebo práva administrátora. Můžete použít tlačítko Duplikovat.'
+      );
+    }
+  }
+
+  // Attempt 2: Admin atomic delete + recreate fallback (preserves all newer Android fields)
+  const newRef = doc(collection(root, 'invoices'));
+  const replaceBatch = writeBatch(db);
+  replaceBatch.delete(oldRef);
+  const { id: _ignoredId, ...originalFields } = originalInvoice as Invoice & Record<string, unknown>;
+  replaceBatch.set(newRef, {
+    ...originalFields,
+    workspaceId: workspace.id,
+    memberEmails: workspace.memberEmails,
+    companyId: originalInvoice.companyId || company.id,
+    companyName: (originalInvoice.companyName || company.name || 'Firma').slice(0, 160),
+    companyIco: (originalInvoice.companyIco || company.ico).slice(0, 20),
+    companyDic: (originalInvoice.companyDic || company.dic).slice(0, 25),
+    companyAddress: (originalInvoice.companyAddress || formatCompanyAddress(company)).slice(0, 260),
+    companyBankAccount: (originalInvoice.companyBankAccount || company.bankAccount).slice(0, 40),
+    companyIban: (originalInvoice.companyIban || company.iban).slice(0, 40),
+    ...editableFields,
+    status: originalInvoice.status,
+    currency: originalInvoice.currency || 'CZK',
+    paidAmount: originalInvoice.paidAmount || 0,
+    paidDate: originalInvoice.paidDate || '',
+    matchedTransactionId: originalInvoice.matchedTransactionId || '',
+    exportedToPohoda: Boolean(originalInvoice.exportedToPohoda),
+    createdAt: originalInvoice.createdAt || serverTimestamp(),
+  });
+
+  if (originalInvoice.matchedTransactionId) {
+    replaceBatch.update(doc(root, 'bankTransactions', originalInvoice.matchedTransactionId), {
+      matchedInvoiceId: newRef.id,
+      matchedInvoiceNumber: invNum,
+      matchStatus: 'MATCHED',
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  applyStockDeltas(replaceBatch);
+
+  try {
+    await replaceBatch.commit();
+    return newRef.id;
+  } catch (error) {
+    console.error('editInvoice fallback error:', error);
+    const errText = error instanceof Error ? error.message : String(error);
+    throw new Error(`Nepodařilo se uložit úpravu faktury: ${errText}`);
+  }
+}
+
 export async function markInvoicePaid(workspaceId: string, invoice: Invoice): Promise<void> {
   const path = `workspaces/${workspaceId}/invoices/${invoice.id}`;
   try {
