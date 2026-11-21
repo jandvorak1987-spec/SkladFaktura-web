@@ -222,6 +222,7 @@ export interface ExtractedLineItem {
   ean: string;
   quantity: number;
   unit: string;
+  originalPurchasePrice?: number;
   purchasePrice: number;
   suggestedSalePrice: number;
   vatRate: number;
@@ -235,6 +236,11 @@ export interface ExtractedDeliveryNote {
   supplierIco: string;
   documentNumber: string;
   documentType: string;
+  currency?: string;
+  exchangeRate?: number;
+  exchangeRateSource?: 'CZK' | 'CNB' | 'DOKLAD' | 'MANUAL';
+  exchangeRateDate?: string;
+  cnbRate?: number;
   items: ExtractedLineItem[];
 }
 

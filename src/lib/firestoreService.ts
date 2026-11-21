@@ -474,6 +474,102 @@ export async function saveCompany(workspace: Workspace, company: Company): Promi
   }
 }
 
+export async function createCompany(params: {
+  workspace: Workspace;
+  existingCompanies: Company[];
+  draft: {
+    name: string;
+    ico: string;
+    dic: string;
+    street: string;
+    city: string;
+    zip: string;
+    bankName: string;
+    bankAccount: string;
+    iban: string;
+    bic: string;
+    fioApiToken: string;
+    email: string;
+    phone: string;
+    invoicePrefix: string;
+    nextInvoiceNumber: number;
+    vatPayer: boolean;
+    accentIndex: number;
+    invoiceTemplate: Company['invoiceTemplate'];
+  };
+  createDedicatedWarehouse?: boolean;
+}): Promise<string> {
+  const { workspace, existingCompanies, draft, createDedicatedWarehouse = true } = params;
+  const cleanName = draft.name.trim().slice(0, 160);
+  if (!cleanName) throw new Error('Název firmy je povinný.');
+
+  let maxIdx = existingCompanies.length;
+  for (const c of existingCompanies) {
+    const m = c.id.match(/^company_(\d+)$/);
+    if (m) {
+      const n = Number(m[1]);
+      if (n > maxIdx) maxIdx = n;
+    }
+  }
+  const newCompanyId = `company_${maxIdx + 1}`;
+  const root = wsRoot(workspace.id);
+  const compRef = doc(root, 'companies', newCompanyId);
+
+  const computedIban = (draft.iban.trim() || czechAccountToIban(draft.bankAccount) || '')
+    .replace(/\s+/g, '')
+    .toUpperCase()
+    .slice(0, 40);
+
+  const batch = writeBatch(db);
+  batch.set(compRef, {
+    workspaceId: workspace.id,
+    memberEmails: workspace.memberEmails,
+    name: cleanName,
+    ico: draft.ico.trim().slice(0, 20),
+    dic: draft.dic.trim().slice(0, 25),
+    street: draft.street.trim().slice(0, 160),
+    city: draft.city.trim().slice(0, 120),
+    zip: draft.zip.trim().slice(0, 20),
+    bankName: (draft.bankName.trim() || 'Fio banka').slice(0, 80),
+    bankAccount: draft.bankAccount.trim().slice(0, 40),
+    iban: computedIban,
+    bic: draft.bic.trim().toUpperCase().slice(0, 20),
+    fioApiToken: draft.fioApiToken.trim().slice(0, 160),
+    lastBankSyncAt: '',
+    email: draft.email.trim().slice(0, 160),
+    phone: draft.phone.trim().slice(0, 40),
+    invoicePrefix: (draft.invoicePrefix.trim() || `F${maxIdx + 1}${new Date().getFullYear()}`).slice(0, 20),
+    nextInvoiceNumber: Math.max(1, Math.min(99999999, Math.floor(draft.nextInvoiceNumber || 1))),
+    vatPayer: Boolean(draft.vatPayer),
+    accentIndex: Math.max(0, Math.min(5, Math.floor(draft.accentIndex || 0))),
+    invoiceTemplate: draft.invoiceTemplate || 'CLASSIC',
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  });
+
+  if (createDedicatedWarehouse) {
+    const whRef = doc(root, 'warehouses', `wh_${newCompanyId}`);
+    batch.set(whRef, {
+      workspaceId: workspace.id,
+      memberEmails: workspace.memberEmails,
+      name: `Oddělený sklad – ${cleanName}`.slice(0, 120),
+      code: `SKLAD-F${maxIdx + 1}`.slice(0, 40),
+      shared: false,
+      ownerCompanyId: newCompanyId,
+      location: `Vyhrazeno pro ${cleanName}`.slice(0, 160),
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  try {
+    await batch.commit();
+    return newCompanyId;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, compRef.path);
+  }
+}
+
 export async function createWarehouse(params: {
   workspace: Workspace;
   name: string;
@@ -669,6 +765,283 @@ export async function deleteInventoryItem(workspaceId: string, itemId: string): 
   }
 }
 
+export async function bulkUpdateInventoryPrices(params: {
+  workspace: Workspace;
+  items: InventoryItem[];
+  targetField: 'SALE' | 'PURCHASE' | 'BOTH';
+  mode: 'PERCENT' | 'DELTA' | 'SET' | 'MARGIN_FROM_PURCHASE';
+  value: number;
+}): Promise<number> {
+  const { workspace, items, targetField, mode, value } = params;
+  if (items.length === 0) return 0;
+
+  const root = wsRoot(workspace.id);
+  const calc = (current: number): number => {
+    if (mode === 'PERCENT') return Math.max(0, round2(current * (1 + value / 100)));
+    if (mode === 'DELTA') return Math.max(0, round2(current + value));
+    if (mode === 'SET') return Math.max(0, round2(value));
+    return current;
+  };
+
+  for (let i = 0; i < items.length; i += 350) {
+    const chunk = items.slice(i, i + 350);
+    const batch = writeBatch(db);
+    for (const item of chunk) {
+      const patch: Record<string, unknown> = { updatedAt: serverTimestamp() };
+      if (mode === 'MARGIN_FROM_PURCHASE') {
+        patch.salePrice = Math.max(0, round2(item.purchasePrice * (1 + value / 100)));
+      } else {
+        if (targetField === 'PURCHASE' || targetField === 'BOTH') {
+          patch.purchasePrice = calc(item.purchasePrice);
+        }
+        if (targetField === 'SALE' || targetField === 'BOTH') {
+          patch.salePrice = calc(item.salePrice);
+        }
+      }
+      batch.update(doc(root, 'inventory', item.id), patch);
+    }
+    try {
+      await batch.commit();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `workspaces/${workspace.id}/inventory`);
+    }
+  }
+  return items.length;
+}
+
+export async function bulkAdjustInventoryQuantity(params: {
+  workspace: Workspace;
+  items: InventoryItem[];
+  activeCompanyId: string;
+  mode: 'ADD' | 'SUBTRACT' | 'SET';
+  value: number;
+  documentRef?: string;
+  note?: string;
+}): Promise<number> {
+  const {
+    workspace,
+    items,
+    activeCompanyId,
+    mode,
+    value,
+    documentRef = 'Hromadná úprava',
+    note = '',
+  } = params;
+  if (items.length === 0) return 0;
+
+  const root = wsRoot(workspace.id);
+  let updated = 0;
+
+  for (let i = 0; i < items.length; i += 180) {
+    const chunk = items.slice(i, i + 180);
+    const batch = writeBatch(db);
+    let ops = 0;
+
+    for (const item of chunk) {
+      let newQty = item.quantity;
+      if (mode === 'ADD') newQty = round2(item.quantity + Math.abs(value));
+      else if (mode === 'SUBTRACT') newQty = round2(item.quantity - Math.abs(value));
+      else if (mode === 'SET') newQty = round2(value);
+
+      const delta = round2(newQty - item.quantity);
+      if (delta === 0) continue;
+
+      ops++;
+      updated++;
+      batch.update(doc(root, 'inventory', item.id), {
+        quantity: newQty,
+        updatedAt: serverTimestamp(),
+      });
+      batch.set(doc(collection(root, 'stockMovements')), {
+        workspaceId: workspace.id,
+        memberEmails: workspace.memberEmails,
+        itemId: item.id,
+        itemName: item.name.slice(0, 200),
+        itemSku: item.sku.slice(0, 64),
+        warehouseId: item.warehouseId || 'shared_main',
+        companyId: activeCompanyId || 'company_1',
+        movementType: delta > 0 ? 'RECEIPT' : 'ISSUE',
+        quantityDelta: delta,
+        unit: (item.unit || 'ks').slice(0, 20),
+        unitPrice: Math.max(0, round2(delta > 0 ? item.purchasePrice : item.salePrice)),
+        documentRef: (documentRef.trim() || 'Hromadná úprava').slice(0, 100),
+        note: (
+          note.trim() ||
+          (mode === 'SET'
+            ? `Hromadné nastavení stavu (${item.quantity} → ${newQty})`
+            : delta > 0
+              ? 'Hromadný příjem na sklad'
+              : 'Hromadný výdej ze skladu')
+        ).slice(0, 300),
+        createdAt: serverTimestamp(),
+      });
+    }
+
+    if (ops > 0) {
+      try {
+        await batch.commit();
+      } catch (error) {
+        handleFirestoreError(error, OperationType.UPDATE, `workspaces/${workspace.id}/inventory`);
+      }
+    }
+  }
+  return updated;
+}
+
+export async function bulkEditInventoryFields(params: {
+  workspace: Workspace;
+  items: InventoryItem[];
+  patch: {
+    category?: string;
+    vatRate?: number;
+    supplierName?: string;
+    warehouseId?: string;
+    minQuantity?: number;
+    unit?: string;
+    notes?: string;
+  };
+}): Promise<number> {
+  const { workspace, items, patch } = params;
+  if (items.length === 0) return 0;
+
+  const updatePayload: Record<string, unknown> = { updatedAt: serverTimestamp() };
+  if (patch.category !== undefined) updatePayload.category = patch.category.trim().slice(0, 80);
+  if (patch.vatRate !== undefined) {
+    updatePayload.vatRate =
+      patch.vatRate === 0 || patch.vatRate === 12 || patch.vatRate === 21 ? patch.vatRate : 21;
+  }
+  if (patch.supplierName !== undefined) {
+    updatePayload.supplierName = patch.supplierName.trim().slice(0, 160);
+  }
+  if (patch.warehouseId !== undefined && patch.warehouseId.trim()) {
+    updatePayload.warehouseId = patch.warehouseId.trim().slice(0, 64);
+  }
+  if (patch.minQuantity !== undefined) {
+    updatePayload.minQuantity = Math.max(0, round2(patch.minQuantity));
+  }
+  if (patch.unit !== undefined && patch.unit.trim()) {
+    updatePayload.unit = patch.unit.trim().slice(0, 20);
+  }
+  if (patch.notes !== undefined) {
+    updatePayload.notes = patch.notes.trim().slice(0, 500);
+  }
+
+  if (Object.keys(updatePayload).length <= 1) return 0;
+
+  const root = wsRoot(workspace.id);
+  for (let i = 0; i < items.length; i += 350) {
+    const chunk = items.slice(i, i + 350);
+    const batch = writeBatch(db);
+    for (const item of chunk) {
+      batch.update(doc(root, 'inventory', item.id), updatePayload);
+    }
+    try {
+      await batch.commit();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `workspaces/${workspace.id}/inventory`);
+    }
+  }
+  return items.length;
+}
+
+export async function bulkDuplicateInventoryItems(params: {
+  workspace: Workspace;
+  items: InventoryItem[];
+  activeCompanyId: string;
+  targetWarehouseId: string;
+  resetQuantity: boolean;
+  skuSuffix: string;
+}): Promise<number> {
+  const { workspace, items, activeCompanyId, targetWarehouseId, resetQuantity, skuSuffix } = params;
+  if (items.length === 0) return 0;
+
+  const root = wsRoot(workspace.id);
+  const coll = collection(root, 'inventory');
+  const suffix = skuSuffix.trim().slice(0, 16);
+
+  for (let i = 0; i < items.length; i += 180) {
+    const chunk = items.slice(i, i + 180);
+    const batch = writeBatch(db);
+
+    for (const item of chunk) {
+      const targetWh = targetWarehouseId || item.warehouseId || 'shared_main';
+      const sameWh = targetWh === item.warehouseId;
+      const effSuffix = suffix || (sameWh ? '-KOP' : '');
+      const newSku = `${item.sku}${effSuffix}`.slice(0, 64);
+      const newName = (sameWh ? `${item.name} (kopie)` : item.name).slice(0, 200);
+      const qty = resetQuantity ? 0 : round2(item.quantity);
+      const newRef = doc(coll);
+
+      batch.set(newRef, {
+        workspaceId: workspace.id,
+        memberEmails: workspace.memberEmails,
+        sku: newSku,
+        name: newName,
+        ean: sameWh ? '' : item.ean.slice(0, 40),
+        category: item.category.slice(0, 80),
+        unit: (item.unit || 'ks').slice(0, 20),
+        quantity: qty,
+        minQuantity: Math.max(0, round2(item.minQuantity)),
+        purchasePrice: Math.max(0, round2(item.purchasePrice)),
+        salePrice: Math.max(0, round2(item.salePrice)),
+        vatRate: item.vatRate === 0 || item.vatRate === 12 || item.vatRate === 21 ? item.vatRate : 21,
+        warehouseId: targetWh.slice(0, 64),
+        supplierName: item.supplierName.slice(0, 160),
+        notes: item.notes.slice(0, 500),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      if (qty !== 0) {
+        batch.set(doc(collection(root, 'stockMovements')), {
+          workspaceId: workspace.id,
+          memberEmails: workspace.memberEmails,
+          itemId: newRef.id,
+          itemName: newName,
+          itemSku: newSku,
+          warehouseId: targetWh.slice(0, 64),
+          companyId: activeCompanyId || 'company_1',
+          movementType: 'RECEIPT',
+          quantityDelta: qty,
+          unit: (item.unit || 'ks').slice(0, 20),
+          unitPrice: Math.max(0, round2(item.purchasePrice)),
+          documentRef: 'Hromadná kopie',
+          note: `Zkopírováno z karty ${item.sku}`.slice(0, 300),
+          createdAt: serverTimestamp(),
+        });
+      }
+    }
+
+    try {
+      await batch.commit();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.CREATE, `workspaces/${workspace.id}/inventory`);
+    }
+  }
+  return items.length;
+}
+
+export async function bulkDeleteInventoryItems(
+  workspaceId: string,
+  itemIds: string[]
+): Promise<number> {
+  if (itemIds.length === 0) return 0;
+  const root = wsRoot(workspaceId);
+  for (let i = 0; i < itemIds.length; i += 350) {
+    const chunk = itemIds.slice(i, i + 350);
+    const batch = writeBatch(db);
+    for (const id of chunk) {
+      batch.delete(doc(root, 'inventory', id));
+    }
+    try {
+      await batch.commit();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, `workspaces/${workspaceId}/inventory`);
+    }
+  }
+  return itemIds.length;
+}
+
 /**
  * Bulk stock-in commit for Smart Stock In (AI Příjemka / CSV Import).
  */
@@ -678,11 +1051,22 @@ export async function commitBulkStockIn(params: {
   companyId: string;
   supplierName: string;
   documentNumber: string;
+  currency?: string;
+  exchangeRate?: number;
   items: ExtractedLineItem[];
   existingInventory: InventoryItem[];
 }): Promise<number> {
-  const { workspace, warehouseId, companyId, supplierName, documentNumber, items, existingInventory } =
-    params;
+  const {
+    workspace,
+    warehouseId,
+    companyId,
+    supplierName,
+    documentNumber,
+    currency,
+    exchangeRate,
+    items,
+    existingInventory,
+  } = params;
   const selected = items.filter((i) => i.selected && i.name.trim() && i.quantity > 0);
   if (selected.length === 0) return 0;
 
@@ -691,6 +1075,10 @@ export async function commitBulkStockIn(params: {
   const safeWh = warehouseId || 'shared_main';
   const safeCompany = companyId || 'company_1';
   const docRefLabel = (documentNumber || 'AI Příjemka').slice(0, 100);
+  const fxTag =
+    currency && currency !== 'CZK' && exchangeRate && exchangeRate > 0
+      ? ` (${currency}, kurz ${exchangeRate} Kč)`
+      : '';
 
   for (let i = 0; i < selected.length; i += 180) {
     const chunk = selected.slice(i, i + 180);
@@ -734,7 +1122,7 @@ export async function commitBulkStockIn(params: {
           vatRate,
           warehouseId: safeWh,
           supplierName: supplierName.trim().slice(0, 160),
-          notes: `Naskladněno z dokladu ${docRefLabel}`.slice(0, 500),
+          notes: `Naskladněno z dokladu ${docRefLabel}${fxTag}`.slice(0, 500),
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
@@ -753,7 +1141,7 @@ export async function commitBulkStockIn(params: {
         unit,
         unitPrice: purchasePrice,
         documentRef: docRefLabel,
-        note: `AI Příjemka${supplierName ? ` – ${supplierName}` : ''}`.slice(0, 300),
+        note: `AI Příjemka${supplierName ? ` – ${supplierName}` : ''}${fxTag}`.slice(0, 300),
         createdAt: serverTimestamp(),
       });
     }

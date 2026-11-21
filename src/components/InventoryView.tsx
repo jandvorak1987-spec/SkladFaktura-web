@@ -2,17 +2,22 @@ import React, { useMemo, useState } from 'react';
 import {
   ArrowDownLeft,
   ArrowUpRight,
+  Copy,
   Download,
   Edit3,
   History,
+  Layers,
   Minus,
   Package,
+  Percent,
   Plus,
   Search,
+  SlidersHorizontal,
   Sparkles,
   Trash2,
   X,
 } from 'lucide-react';
+import { InventoryBulkModals, type BulkActionModalType } from './InventoryBulkModals';
 import { useApp } from '../context/AppContext';
 import {
   adjustInventoryStock,
@@ -82,6 +87,10 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
 
   const [editingMinId, setEditingMinId] = useState<string | null>(null);
   const [editingMinVal, setEditingMinVal] = useState('');
+
+  // Bulk selection & actions
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkModal, setBulkModal] = useState<BulkActionModalType>(null);
 
   const whMap = useMemo(
     () => new Map(accessibleWarehouses.map((w) => [w.id, w])),
@@ -158,6 +167,35 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
     });
   };
 
+  const selectedItems = useMemo(
+    () => accessibleItems.filter((i) => selectedIds.has(i.id)),
+    [accessibleItems, selectedIds]
+  );
+
+  const allFilteredSelected =
+    filteredItems.length > 0 && filteredItems.every((item) => selectedIds.has(item.id));
+
+  const toggleSelectItem = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelectAllFiltered = () => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allFilteredSelected) {
+        for (const item of filteredItems) next.delete(item.id);
+      } else {
+        for (const item of filteredItems) next.add(item.id);
+      }
+      return next;
+    });
+  };
+
   const openEditItem = (item: InventoryItem) => {
     setEditingItem({
       id: item.id,
@@ -167,6 +205,24 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
       category: item.category,
       unit: item.unit,
       quantity: String(item.quantity),
+      minQuantity: String(item.minQuantity),
+      purchasePrice: String(item.purchasePrice),
+      salePrice: String(item.salePrice),
+      vatRate: item.vatRate,
+      warehouseId: item.warehouseId,
+      supplierName: item.supplierName,
+      notes: item.notes,
+    });
+  };
+
+  const openDuplicateItem = (item: InventoryItem) => {
+    setEditingItem({
+      sku: `${item.sku}-KOP`.slice(0, 64),
+      name: `${item.name} (kopie)`.slice(0, 200),
+      ean: '',
+      category: item.category,
+      unit: item.unit,
+      quantity: '0',
       minQuantity: String(item.minQuantity),
       purchasePrice: String(item.purchasePrice),
       salePrice: String(item.salePrice),
@@ -406,7 +462,74 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
 
       {/* Main Content */}
       {tab === 'ITEMS' ? (
-        <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+        <div className="space-y-3">
+          {/* Bulk Action Bar */}
+          {selectedItems.length > 0 && (
+            <div className="bg-slate-900 text-white rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <span className="text-xs font-semibold tabular-nums">
+                  Vybráno {selectedItems.length}{' '}
+                  {selectedItems.length === 1
+                    ? 'položka'
+                    : selectedItems.length < 5
+                      ? 'položky'
+                      : 'položek'}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setSelectedIds(new Set())}
+                  className="text-xs text-slate-300 hover:text-white underline underline-offset-2"
+                >
+                  Zrušit výběr
+                </button>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setBulkModal('PRICES')}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-white/10 hover:bg-white/20 rounded-lg transition-colors whitespace-nowrap"
+                >
+                  <Percent className="w-3.5 h-3.5" />
+                  Ceny
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setBulkModal('QUANTITY')}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-white/10 hover:bg-white/20 rounded-lg transition-colors whitespace-nowrap"
+                >
+                  <Layers className="w-3.5 h-3.5" />
+                  Množství
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setBulkModal('FIELDS')}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-white/10 hover:bg-white/20 rounded-lg transition-colors whitespace-nowrap"
+                >
+                  <SlidersHorizontal className="w-3.5 h-3.5" />
+                  Hromadná editace
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setBulkModal('DUPLICATE')}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-white/10 hover:bg-white/20 rounded-lg transition-colors whitespace-nowrap"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  Kopírovat
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setBulkModal('DELETE')}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-red-600/90 hover:bg-red-600 rounded-lg transition-colors whitespace-nowrap"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  Smazat
+                </button>
+              </div>
+            </div>
+          )}
+
+          <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
           {filteredItems.length === 0 ? (
             <div className="p-12 text-center">
               <Package className="w-8 h-8 text-slate-300 mx-auto" />
@@ -420,6 +543,15 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
               <table className="w-full text-left border-collapse">
                 <thead>
                   <tr className="border-b border-slate-200 bg-slate-50/70 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+                    <th className="py-3 pl-4 pr-2 w-10">
+                      <input
+                        type="checkbox"
+                        checked={allFilteredSelected}
+                        onChange={toggleSelectAllFiltered}
+                        title="Vybrat vše zobrazené"
+                        className="rounded border-slate-300 cursor-pointer"
+                      />
+                    </th>
                     <th className="py-3 px-4">Položka / SKU</th>
                     <th className="py-3 px-4">Sklad</th>
                     <th className="py-3 px-4 text-right">Stav</th>
@@ -432,8 +564,22 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                   {filteredItems.map((item) => {
                     const low = needsRestockAlert(item);
                     const wh = whMap.get(item.warehouseId);
+                    const isSelected = selectedIds.has(item.id);
                     return (
-                      <tr key={item.id} className="hover:bg-slate-50/60 transition-colors">
+                      <tr
+                        key={item.id}
+                        className={`transition-colors ${
+                          isSelected ? 'bg-slate-50' : 'hover:bg-slate-50/60'
+                        }`}
+                      >
+                        <td className="py-3 pl-4 pr-2">
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={() => toggleSelectItem(item.id)}
+                            className="rounded border-slate-300 cursor-pointer"
+                          />
+                        </td>
                         <td className="py-3 px-4">
                           <p className="font-medium text-slate-900">{item.name}</p>
                           <p className="text-xs text-slate-500 mt-0.5 tabular-nums">
@@ -551,6 +697,14 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                             </button>
                             <button
                               type="button"
+                              onClick={() => openDuplicateItem(item)}
+                              title="Kopírovat položku"
+                              className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md transition-colors"
+                            >
+                              <Copy className="w-4 h-4" />
+                            </button>
+                            <button
+                              type="button"
                               onClick={() => handleDelete(item)}
                               title="Smazat položku"
                               className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors"
@@ -566,6 +720,7 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
               </table>
             </div>
           )}
+          </div>
         </div>
       ) : (
         <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
@@ -955,6 +1110,25 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
             </div>
           </form>
         </div>
+      )}
+
+      {/* Bulk Action Modals */}
+      {workspace && (
+        <InventoryBulkModals
+          modal={bulkModal}
+          selectedItems={selectedItems}
+          warehouses={accessibleWarehouses}
+          workspace={workspace}
+          activeCompanyId={activeCompany?.id || 'company_1'}
+          accentColor={palette.primary}
+          onClose={() => setBulkModal(null)}
+          onCompleted={(msg, clearSel) => {
+            notify(msg);
+            setBulkModal(null);
+            if (clearSel) setSelectedIds(new Set());
+          }}
+          onError={(msg) => notify(msg, 'error')}
+        />
       )}
     </div>
   );

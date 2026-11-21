@@ -213,6 +213,90 @@ async function startServer() {
   // =========================================================================
   // 3. Server-Side Gemini AI Smart Stock-In (Delivery Note / Invoice Extraction)
   // =========================================================================
+  // 2b. ČNB Daily Exchange Rates Proxy
+  // =========================================================================
+  const FALLBACK_CNB_RATES: Record<string, number> = {
+    CZK: 1,
+    EUR: 25.2,
+    USD: 23.5,
+    PLN: 5.9,
+    GBP: 29.8,
+    CHF: 26.8,
+    HUF: 0.062,
+    SEK: 2.2,
+    DKK: 3.38,
+    NOK: 2.15,
+    CAD: 16.8,
+    JPY: 0.155,
+  };
+  let cachedCnb: { date: string; rates: Record<string, number>; source: 'CNB' | 'FALLBACK' } | null = null;
+  let cachedCnbAt = 0;
+
+  async function fetchCnbRatesServer(): Promise<{
+    date: string;
+    rates: Record<string, number>;
+    source: 'CNB' | 'FALLBACK';
+  }> {
+    const now = Date.now();
+    if (cachedCnb && now - cachedCnbAt < 3600_000) {
+      return cachedCnb;
+    }
+    try {
+      const response = await fetch(
+        'https://www.cnb.cz/cs/financni-trhy/devizovy-trh/kurzy-devizoveho-trhu/kurzy-devizoveho-trhu/denni_kurz.txt',
+        {
+          headers: { 'User-Agent': 'SkladFaktura-Web/1.0' },
+          signal: AbortSignal.timeout(8000),
+        }
+      );
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const text = await response.text();
+      const lines = text
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+      const dateMatch = (lines[0] || '').match(/(\d{2}\.\d{2}\.\d{4})/);
+      const date = dateMatch ? dateMatch[1] : '';
+      const rates: Record<string, number> = { CZK: 1 };
+      for (let i = 2; i < lines.length; i++) {
+        const parts = lines[i].split('|');
+        if (parts.length < 5) continue;
+        const amount = Number(parts[2].replace(',', '.'));
+        const code = parts[3].trim().toUpperCase();
+        const rateVal = Number(parts[4].replace(',', '.'));
+        if (code && amount > 0 && rateVal > 0) {
+          rates[code] = Math.round((rateVal / amount) * 10000) / 10000;
+        }
+      }
+      if (Object.keys(rates).length > 3) {
+        cachedCnb = { date, rates, source: 'CNB' };
+        cachedCnbAt = now;
+        return cachedCnb;
+      }
+      throw new Error('Neplatná odpověď ČNB');
+    } catch {
+      return { date: '', rates: { ...FALLBACK_CNB_RATES }, source: 'FALLBACK' };
+    }
+  }
+
+  function normalizeCurrencyCode(raw: unknown): string {
+    const c = String(raw || 'CZK')
+      .trim()
+      .toUpperCase()
+      .replace(/[^A-Z]/g, '');
+    if (!c || c === 'KC' || c === 'CZ') return 'CZK';
+    if (c === 'EURO' || c === 'E') return 'EUR';
+    return c.slice(0, 3) || 'CZK';
+  }
+
+  app.get('/api/cnb-rates', async (_req, res) => {
+    const data = await fetchCnbRatesServer();
+    res.json(data);
+  });
+
+  // =========================================================================
+  // 3. AI Smart Stock-In (Delivery Note / Invoice OCR & Extraction via Gemini)
+  // =========================================================================
   app.post('/api/ai-stock-import', async (req, res) => {
     try {
       const ai = getGeminiClient();
@@ -228,15 +312,18 @@ async function startServer() {
 
       const systemInstruction =
         'Jsi přesný český účetní a skladový extraktor pro aplikaci SkladFaktura. ' +
-        'Z dodacího listu, nákupní faktury nebo ceníku vyextrahuj hlavičku dodavatele a všechny zbožové položky k naskladnění. ' +
-        'Nákupní cenu uveď jako jednotkovou cenu bez DPH v CZK (pokud je na dokladu jen cena s DPH, přepočítej ji bez DPH). ' +
-        'Sazba DPH musí být 0, 12 nebo 21. Odpovídej striktně dle JSON schématu.';
+        'Z dodacího listu, nákupní faktury nebo ceníku vyextrahuj hlavičku dodavatele, měnu dokladu a všechny zbožové položky k naskladnění. ' +
+        'DŮLEŽITÉ PRO MĚNU: Pole currency uveď jako 3písmenný ISO kód měny z dokladu (např. CZK, EUR, USD, PLN, GBP). ' +
+        'Pole unitPurchasePrice uveď jako jednotkovou cenu bez DPH v PŮVODNÍ MĚNĚ DOKLADU — sám ji nepřepočítávej odhadem na CZK (přepočet proběhne přesným kurzem ČNB na serveru). ' +
+        'Pokud je na faktuře jen cena s DPH, přepočítej ji bez DPH ve stejné měně. ' +
+        'Pokud je na dokladu výslovně vytištěn směnný kurz vůči CZK (např. 1 EUR = 25,20 Kč), uveď ho v documentExchangeRate, jinak 0. ' +
+        'Sazba DPH musí být 0, 12 nebo 21 (u zahraničních faktur s reverse charge / bez DPH uveď 0 nebo 21 dle povahy zboží). Odpovídej striktně dle JSON schématu.';
 
       const parts: Array<{ text: string } | { inlineData: { data: string; mimeType: string } }> = [];
       if (base64Data && mimeType) {
         parts.push({ inlineData: { data: base64Data, mimeType } });
         parts.push({
-          text: `Vyextrahuj všechny skladové položky ze souboru '${fileName}' do strukturovaného JSON.`,
+          text: `Vyextrahuj všechny skladové položky a měnu ze souboru '${fileName}' do strukturovaného JSON.`,
         });
       } else {
         parts.push({
@@ -257,6 +344,8 @@ async function startServer() {
               supplierIco: { type: Type.STRING },
               documentNumber: { type: Type.STRING },
               documentType: { type: Type.STRING },
+              currency: { type: Type.STRING },
+              documentExchangeRate: { type: Type.NUMBER },
               items: {
                 type: Type.ARRAY,
                 items: {
@@ -284,6 +373,8 @@ async function startServer() {
         supplierIco?: string;
         documentNumber?: string;
         documentType?: string;
+        currency?: string;
+        documentExchangeRate?: number;
         items?: Array<{
           sku?: string;
           name?: string;
@@ -295,10 +386,39 @@ async function startServer() {
         }>;
       };
 
+      const currency = normalizeCurrencyCode(parsed.currency);
+      const docRate = Number(parsed.documentExchangeRate || 0);
+      let exchangeRate = 1;
+      let exchangeRateSource: 'CZK' | 'CNB' | 'DOKLAD' | 'MANUAL' = 'CZK';
+      let exchangeRateDate = '';
+      let cnbRate = 1;
+
+      if (currency !== 'CZK') {
+        const cnbData = await fetchCnbRatesServer();
+        const rateFromCnb = Number(cnbData.rates[currency] || 0);
+        cnbRate = rateFromCnb > 0 ? Math.round(rateFromCnb * 10000) / 10000 : 1;
+        exchangeRateDate = cnbData.date || '';
+
+        if (docRate > 0 && docRate < 10000) {
+          exchangeRate = Math.round(docRate * 10000) / 10000;
+          exchangeRateSource = 'DOKLAD';
+        } else if (rateFromCnb > 0) {
+          exchangeRate = Math.round(rateFromCnb * 10000) / 10000;
+          exchangeRateSource = cnbData.source === 'CNB' ? 'CNB' : 'MANUAL';
+        } else {
+          exchangeRate = 1;
+          exchangeRateSource = 'MANUAL';
+        }
+      }
+
       const items = (parsed.items || [])
         .filter((it) => String(it.name || '').trim().length > 0)
         .map((it, idx) => {
-          const purchasePrice = Math.max(0, round2(Number(it.unitPurchasePrice || 0)));
+          const originalPurchasePrice = Math.max(0, round2(Number(it.unitPurchasePrice || 0)));
+          const purchasePrice =
+            currency === 'CZK'
+              ? originalPurchasePrice
+              : Math.max(0, round2(originalPurchasePrice * exchangeRate));
           const vatRaw = Number(it.vatRate ?? 21);
           const vatRate = vatRaw === 0 || vatRaw === 12 || vatRaw === 21 ? vatRaw : 21;
           const quantity = Math.max(0.01, round2(Number(it.quantity || 1)));
@@ -309,6 +429,7 @@ async function startServer() {
             ean: String(it.ean || '').trim().slice(0, 40),
             quantity,
             unit: (String(it.unit || '').trim() || 'ks').slice(0, 20),
+            originalPurchasePrice,
             purchasePrice,
             suggestedSalePrice: purchasePrice > 0 ? round2(purchasePrice * 1.25) : 0,
             vatRate,
@@ -321,6 +442,11 @@ async function startServer() {
         supplierIco: String(parsed.supplierIco || '').replace(/\D/g, ''),
         documentNumber: String(parsed.documentNumber || '').trim(),
         documentType: String(parsed.documentType || 'Dodací list').trim() || 'Dodací list',
+        currency,
+        exchangeRate,
+        exchangeRateSource,
+        exchangeRateDate,
+        cnbRate,
         items,
       });
     } catch (err) {

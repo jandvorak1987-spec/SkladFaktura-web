@@ -6,6 +6,7 @@ import {
   Image as ImageIcon,
   Loader2,
   Plus,
+  RefreshCw,
   Sparkles,
   Trash2,
   Upload,
@@ -17,6 +18,14 @@ import { formatCzk, getCompanyPalette, round2 } from '../lib/format';
 import type { ExtractedDeliveryNote, ExtractedLineItem } from '../types';
 
 type InputMode = 'FILE' | 'TEXT' | 'CSV';
+
+const COMMON_CURRENCIES = ['CZK', 'EUR', 'USD', 'PLN', 'GBP', 'CHF', 'HUF'];
+
+interface CnbRatesResponse {
+  date: string;
+  rates: Record<string, number>;
+  source: 'CNB' | 'FALLBACK';
+}
 
 export function SmartStockInView() {
   const {
@@ -39,6 +48,7 @@ export function SmartStockInView() {
   const [csvText, setCsvText] = useState('');
   const [extracting, setExtracting] = useState(false);
   const [committing, setCommitting] = useState(false);
+  const [loadingRate, setLoadingRate] = useState(false);
 
   const [note, setNote] = useState<ExtractedDeliveryNote | null>(null);
 
@@ -48,8 +58,107 @@ export function SmartStockInView() {
   }, [accessibleWarehouses, targetWarehouseId]);
 
   const applyExtractedNote = (raw: ExtractedDeliveryNote, whId: string) => {
-    const matched = matchExtractedToInventory(raw, inventory, whId);
+    const currency = (raw.currency || 'CZK').toUpperCase();
+    const exchangeRate = currency === 'CZK' ? 1 : Number(raw.exchangeRate || 1) || 1;
+    const normalized: ExtractedDeliveryNote = {
+      ...raw,
+      currency,
+      exchangeRate,
+      exchangeRateSource: raw.exchangeRateSource || (currency === 'CZK' ? 'CZK' : 'MANUAL'),
+      items: raw.items.map((item) => ({
+        ...item,
+        originalPurchasePrice:
+          item.originalPurchasePrice !== undefined
+            ? item.originalPurchasePrice
+            : item.purchasePrice,
+      })),
+    };
+    const matched = matchExtractedToInventory(normalized, inventory, whId);
     setNote(matched);
+  };
+
+  const recalcNotePrices = (
+    current: ExtractedDeliveryNote,
+    newCurrency: string,
+    newRate: number,
+    source: 'CZK' | 'CNB' | 'DOKLAD' | 'MANUAL',
+    rateDate?: string,
+    cnbRate?: number
+  ): ExtractedDeliveryNote => {
+    const safeRate = newCurrency === 'CZK' ? 1 : Math.max(0.0001, newRate);
+    return {
+      ...current,
+      currency: newCurrency,
+      exchangeRate: safeRate,
+      exchangeRateSource: source,
+      exchangeRateDate: rateDate !== undefined ? rateDate : current.exchangeRateDate,
+      cnbRate: cnbRate !== undefined ? cnbRate : current.cnbRate,
+      items: current.items.map((line) => {
+        const orig =
+          line.originalPurchasePrice !== undefined ? line.originalPurchasePrice : line.purchasePrice;
+        const czkPurchase =
+          newCurrency === 'CZK' ? round2(orig) : round2(Math.max(0, orig) * safeRate);
+        return {
+          ...line,
+          originalPurchasePrice: orig,
+          purchasePrice: czkPurchase,
+          suggestedSalePrice: czkPurchase > 0 ? round2(czkPurchase * 1.25) : 0,
+        };
+      }),
+    };
+  };
+
+  const fetchAndApplyCnbRate = async (targetCurrency: string) => {
+    if (!note) return;
+    if (targetCurrency === 'CZK') {
+      setNote(recalcNotePrices(note, 'CZK', 1, 'CZK', '', 1));
+      return;
+    }
+    setLoadingRate(true);
+    try {
+      const res = await fetch('/api/cnb-rates');
+      const data = (await res.json()) as CnbRatesResponse;
+      const rate = Number(data.rates?.[targetCurrency] || 0);
+      if (rate > 0) {
+        setNote((prev) =>
+          prev
+            ? recalcNotePrices(
+                prev,
+                targetCurrency,
+                rate,
+                data.source === 'CNB' ? 'CNB' : 'MANUAL',
+                data.date || '',
+                rate
+              )
+            : prev
+        );
+        notify(
+          data.source === 'CNB'
+            ? `Načten kurz ČNB: 1 ${targetCurrency} = ${rate} Kč${data.date ? ` (${data.date})` : ''}.`
+            : `Použit orientační kurz 1 ${targetCurrency} = ${rate} Kč (ČNB dočasně nedostupná).`
+        );
+      } else {
+        setNote((prev) =>
+          prev ? recalcNotePrices(prev, targetCurrency, prev.exchangeRate || 1, 'MANUAL') : prev
+        );
+        notify(`Kurz ČNB pro měnu ${targetCurrency} nebyl nalezen – zadejte kurz ručně.`, 'error');
+      }
+    } catch {
+      notify('Nepodařilo se načíst kurz ČNB – zadejte prosím kurz ručně.', 'error');
+    } finally {
+      setLoadingRate(false);
+    }
+  };
+
+  const handleExchangeRateInput = (val: string) => {
+    if (!note) return;
+    const parsed = Number(val.replace(',', '.'));
+    const cur = note.currency || 'CZK';
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      setNote({ ...note, exchangeRate: 0, exchangeRateSource: 'MANUAL' });
+      return;
+    }
+    setNote(recalcNotePrices(note, cur, parsed, 'MANUAL'));
   };
 
   const handleWarehouseChange = (newWhId: string) => {
@@ -196,6 +305,7 @@ export function SmartStockInView() {
       ean: '',
       quantity: 1,
       unit: 'ks',
+      originalPurchasePrice: 0,
       purchasePrice: 0,
       suggestedSalePrice: 0,
       vatRate: 21,
@@ -221,6 +331,8 @@ export function SmartStockInView() {
         companyId: activeCompany?.id || 'company_1',
         supplierName: note.supplierName,
         documentNumber: note.documentNumber,
+        currency: note.currency || 'CZK',
+        exchangeRate: note.exchangeRate || 1,
         items: note.items,
         existingInventory: inventory,
       });
@@ -235,6 +347,14 @@ export function SmartStockInView() {
     }
   };
 
+  const docCurrency = (note?.currency || 'CZK').toUpperCase();
+  const isForeignCurrency = docCurrency !== 'CZK';
+  const docRate = isForeignCurrency ? Number(note?.exchangeRate || 1) : 1;
+  const currencyOptions = useMemo(() => {
+    if (COMMON_CURRENCIES.includes(docCurrency)) return COMMON_CURRENCIES;
+    return [docCurrency, ...COMMON_CURRENCIES];
+  }, [docCurrency]);
+
   const selectedCount = note ? note.items.filter((i) => i.selected).length : 0;
   const totalPurchase = note
     ? round2(
@@ -243,6 +363,23 @@ export function SmartStockInView() {
           .reduce((s, i) => s + Math.max(0, i.quantity) * Math.max(0, i.purchasePrice), 0)
       )
     : 0;
+  const totalOriginalForeign =
+    note && isForeignCurrency
+      ? round2(
+          note.items
+            .filter((i) => i.selected)
+            .reduce(
+              (s, i) =>
+                s +
+                Math.max(0, i.quantity) *
+                  Math.max(
+                    0,
+                    i.originalPurchasePrice !== undefined ? i.originalPurchasePrice : i.purchasePrice
+                  ),
+              0
+            )
+        )
+      : 0;
 
   return (
     <div className="space-y-6">
@@ -479,6 +616,77 @@ export function SmartStockInView() {
             </div>
           </div>
 
+          {/* Currency & Exchange Rate Bar */}
+          <div className="px-5 py-3 border-b border-slate-100 bg-slate-50/70 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex items-center gap-2">
+                <label className="text-xs font-medium text-slate-600">Měna dokladu:</label>
+                <select
+                  value={docCurrency}
+                  onChange={(e) => fetchAndApplyCnbRate(e.target.value)}
+                  disabled={loadingRate}
+                  className="px-2.5 py-1.5 text-xs font-semibold bg-white border border-slate-200 rounded-lg"
+                >
+                  {currencyOptions.map((c) => (
+                    <option key={c} value={c}>
+                      {c}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {isForeignCurrency && (
+                <>
+                  <div className="flex items-center gap-2">
+                    <label className="text-xs font-medium text-slate-600 whitespace-nowrap">
+                      Kurz (1 {docCurrency} = Kč):
+                    </label>
+                    <input
+                      type="number"
+                      step="0.001"
+                      min="0.0001"
+                      value={note.exchangeRate || ''}
+                      onChange={(e) => handleExchangeRateInput(e.target.value)}
+                      className="w-24 px-2.5 py-1.5 text-xs font-mono text-right bg-white border border-slate-200 rounded-lg tabular-nums"
+                    />
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => fetchAndApplyCnbRate(docCurrency)}
+                    disabled={loadingRate}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-100 rounded-lg disabled:opacity-60"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${loadingRate ? 'animate-spin' : ''}`} />
+                    Načíst kurz ČNB
+                  </button>
+
+                  <span className="text-xs text-slate-500">
+                    {note.exchangeRateSource === 'CNB'
+                      ? `Kurz ČNB${note.exchangeRateDate ? ` ze dne ${note.exchangeRateDate}` : ''}`
+                      : note.exchangeRateSource === 'DOKLAD'
+                        ? 'Kurz převzat z dokladu'
+                        : 'Vlastní / ruční kurz'}
+                  </span>
+                </>
+              )}
+            </div>
+
+            {isForeignCurrency && (
+              <div className="text-xs text-slate-600 tabular-nums">
+                Celkem bez DPH:{' '}
+                <span className="font-semibold text-slate-900">
+                  {totalOriginalForeign.toLocaleString('cs-CZ', {
+                    minimumFractionDigits: 2,
+                    maximumFractionDigits: 2,
+                  })}{' '}
+                  {docCurrency}
+                </span>{' '}
+                → <span className="font-semibold text-slate-900">{formatCzk(totalPurchase)}</span> na sklad
+              </div>
+            )}
+          </div>
+
           <div className="overflow-x-auto">
             <table className="w-full text-left border-collapse">
               <thead>
@@ -488,7 +696,12 @@ export function SmartStockInView() {
                   <th className="py-2.5 px-3">Název & párování na sklad</th>
                   <th className="py-2.5 px-3 w-24 text-right">Množství</th>
                   <th className="py-2.5 px-3 w-20">MJ</th>
-                  <th className="py-2.5 px-3 w-28 text-right">Nákup bez DPH</th>
+                  {isForeignCurrency && (
+                    <th className="py-2.5 px-3 w-28 text-right">Nákup ({docCurrency})</th>
+                  )}
+                  <th className="py-2.5 px-3 w-28 text-right">
+                    {isForeignCurrency ? 'Nákup (Kč)' : 'Nákup bez DPH'}
+                  </th>
                   <th className="py-2.5 px-3 w-28 text-right">Prodej bez DPH</th>
                   <th className="py-2.5 px-3 w-20">DPH</th>
                   <th className="py-2.5 px-3 w-10"></th>
@@ -550,15 +763,44 @@ export function SmartStockInView() {
                         className="w-16 px-2 py-1 text-xs border border-slate-200 rounded-md"
                       />
                     </td>
+                    {isForeignCurrency && (
+                      <td className="py-2 px-3">
+                        <input
+                          type="number"
+                          step="any"
+                          min="0"
+                          value={
+                            line.originalPurchasePrice !== undefined
+                              ? line.originalPurchasePrice
+                              : line.purchasePrice
+                          }
+                          onChange={(e) => {
+                            const orig = Number(e.target.value) || 0;
+                            const czk = round2(Math.max(0, orig) * Math.max(0, docRate));
+                            updateLine(line.id, {
+                              originalPurchasePrice: orig,
+                              purchasePrice: czk,
+                              suggestedSalePrice: czk > 0 ? round2(czk * 1.25) : 0,
+                            });
+                          }}
+                          className="w-24 px-2 py-1 text-sm text-right border border-slate-200 rounded-md tabular-nums bg-slate-50/70"
+                        />
+                      </td>
+                    )}
                     <td className="py-2 px-3">
                       <input
                         type="number"
                         step="any"
                         min="0"
                         value={line.purchasePrice}
-                        onChange={(e) =>
-                          updateLine(line.id, { purchasePrice: Number(e.target.value) || 0 })
-                        }
+                        onChange={(e) => {
+                          const czk = Number(e.target.value) || 0;
+                          updateLine(line.id, {
+                            purchasePrice: czk,
+                            originalPurchasePrice:
+                              isForeignCurrency && docRate > 0 ? round2(czk / docRate) : czk,
+                          });
+                        }}
                         className="w-24 px-2 py-1 text-sm text-right border border-slate-200 rounded-md tabular-nums"
                       />
                     </td>

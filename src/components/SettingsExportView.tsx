@@ -12,10 +12,12 @@ import {
   UserPlus,
   Users,
   Warehouse as WarehouseIcon,
+  X,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import {
   addColleague,
+  createCompany,
   createWarehouse,
   markInvoicesExportedToPohoda,
   removeColleague,
@@ -60,6 +62,32 @@ export function SettingsExportView() {
   const [draftCompany, setDraftCompany] = useState<Company | null>(activeCompany);
   const [aresBusy, setAresBusy] = useState(false);
   const [savingCompany, setSavingCompany] = useState(false);
+
+  // Add new company modal
+  const [newCompOpen, setNewCompOpen] = useState(false);
+  const [newCompBusy, setNewCompBusy] = useState(false);
+  const [newCompAresBusy, setNewCompAresBusy] = useState(false);
+  const [newCompCreateWh, setNewCompCreateWh] = useState(true);
+  const [newCompDraft, setNewCompDraft] = useState({
+    name: '',
+    ico: '',
+    dic: '',
+    street: '',
+    city: '',
+    zip: '',
+    bankName: 'Fio banka',
+    bankAccount: '',
+    iban: '',
+    bic: '',
+    fioApiToken: '',
+    email: userEmail || '',
+    phone: '',
+    invoicePrefix: '',
+    nextInvoiceNumber: 1,
+    vatPayer: true,
+    accentIndex: 2,
+    invoiceTemplate: 'CLASSIC' as InvoiceTemplateId,
+  });
 
   // Warehouse form
   const [whName, setWhName] = useState('');
@@ -152,6 +180,85 @@ export function SettingsExportView() {
       notify(err instanceof Error ? err.message : 'Uložení firmy selhalo.', 'error');
     } finally {
       setSavingCompany(false);
+    }
+  };
+
+  const openNewCompanyModal = () => {
+    const usedAccents = new Set(companies.map((c) => c.accentIndex));
+    const nextAccent =
+      COMPANY_BRAND_PALETTES.find((p) => !usedAccents.has(p.index))?.index ??
+      companies.length % COMPANY_BRAND_PALETTES.length;
+    const nextLetter = String.fromCharCode(65 + Math.min(25, companies.length));
+    setNewCompDraft({
+      name: '',
+      ico: '',
+      dic: '',
+      street: '',
+      city: '',
+      zip: '',
+      bankName: 'Fio banka',
+      bankAccount: '',
+      iban: '',
+      bic: '',
+      fioApiToken: '',
+      email: userEmail || '',
+      phone: '',
+      invoicePrefix: `${nextLetter}${new Date().getFullYear()}`,
+      nextInvoiceNumber: 1,
+      vatPayer: true,
+      accentIndex: nextAccent,
+      invoiceTemplate: 'CLASSIC',
+    });
+    setNewCompCreateWh(true);
+    setNewCompOpen(true);
+  };
+
+  const handleNewCompAres = async () => {
+    const ico = newCompDraft.ico.replace(/\D/g, '');
+    if (ico.length !== 8) {
+      notify('Zadejte 8místné IČO pro načtení z ARES.', 'error');
+      return;
+    }
+    setNewCompAresBusy(true);
+    try {
+      const s = await lookupAres(ico);
+      setNewCompDraft((prev) => ({
+        ...prev,
+        ico: s.ico,
+        dic: s.dic || prev.dic,
+        name: s.name || prev.name,
+        street: s.street || prev.street,
+        city: s.city || prev.city,
+        zip: s.zip || prev.zip,
+      }));
+      notify(`Načteno z ARES: ${s.name}`);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Dotaz na ARES selhal.', 'error');
+    } finally {
+      setNewCompAresBusy(false);
+    }
+  };
+
+  const handleCreateCompany = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!workspace) return;
+    setNewCompBusy(true);
+    try {
+      const newId = await createCompany({
+        workspace,
+        existingCompanies: companies,
+        draft: newCompDraft,
+        createDedicatedWarehouse: newCompCreateWh,
+      });
+      switchCompany(newId);
+      setNewCompOpen(false);
+      notify(
+        `Firma ${newCompDraft.name.trim()} byla přidána${newCompCreateWh ? ' včetně odděleného skladu' : ''}.`
+      );
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Přidání firmy selhalo.', 'error');
+    } finally {
+      setNewCompBusy(false);
     }
   };
 
@@ -303,10 +410,21 @@ export function SettingsExportView() {
                   </button>
                 );
               })}
+
+              {isCurrentUserAdmin && (
+                <button
+                  type="button"
+                  onClick={openNewCompanyModal}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-slate-700 bg-slate-50 hover:bg-slate-100 border border-dashed border-slate-300 rounded-lg transition-colors whitespace-nowrap"
+                >
+                  <Plus className="w-4 h-4" />
+                  Přidat další firmu
+                </button>
+              )}
             </div>
             {!isCurrentUserAdmin && (
               <p className="text-xs text-amber-700">
-                Úpravy firemních údajů jsou vyhrazeny administrátorům týmu.
+                Úpravy a přidávání firem jsou vyhrazeny administrátorům týmu.
               </p>
             )}
           </div>
@@ -630,7 +748,7 @@ export function SettingsExportView() {
                       <p className="text-xs text-slate-500 mt-0.5 tabular-nums">
                         <span className="font-mono text-slate-700">{wh.code}</span> ·{' '}
                         {wh.shared
-                          ? 'Sdílený sklad pro obě firmy'
+                          ? 'Sdílený sklad pro všechny firmy'
                           : `Oddělený sklad (${ownerComp?.name || wh.ownerCompanyId})`}
                         {wh.location ? ` · ${wh.location}` : ''}
                       </p>
@@ -1002,6 +1120,248 @@ export function SettingsExportView() {
             )}
             Stáhnout POHODA XML balíček
           </button>
+        </div>
+      )}
+
+      {/* MODAL: ADD NEW COMPANY */}
+      {newCompOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4 overflow-y-auto">
+          <form
+            onSubmit={handleCreateCompany}
+            className="w-full max-w-2xl bg-white border border-slate-200 rounded-xl p-6 space-y-5 my-8"
+          >
+            <div className="flex items-start justify-between gap-4 border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">Přidat novou firmu</h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Firma se ihned objeví v horním přepínači firem i v synchronizované mobilní aplikaci.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setNewCompOpen(false)}
+                className="p-1 text-slate-400 hover:text-slate-700"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="flex items-end gap-2">
+              <div className="flex-1">
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  IČO (pro automatické vyplnění z ARES)
+                </label>
+                <input
+                  type="text"
+                  value={newCompDraft.ico}
+                  onChange={(e) => setNewCompDraft({ ...newCompDraft, ico: e.target.value })}
+                  placeholder="Např. 12345678"
+                  className="w-full px-3 py-2 text-sm font-mono border border-slate-200 rounded-lg"
+                />
+              </div>
+              <button
+                type="button"
+                disabled={newCompAresBusy}
+                onClick={handleNewCompAres}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-800 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 rounded-lg whitespace-nowrap"
+              >
+                {newCompAresBusy ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Building2 className="w-3.5 h-3.5" />
+                )}
+                Načíst z ARES
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="sm:col-span-2">
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  Název firmy *
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={newCompDraft.name}
+                  onChange={(e) => setNewCompDraft({ ...newCompDraft, name: e.target.value })}
+                  placeholder="Např. Nová Firma s.r.o."
+                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">DIČ</label>
+                <input
+                  type="text"
+                  value={newCompDraft.dic}
+                  onChange={(e) => setNewCompDraft({ ...newCompDraft, dic: e.target.value })}
+                  placeholder="CZ12345678"
+                  className="w-full px-3 py-2 text-sm font-mono border border-slate-200 rounded-lg"
+                />
+              </div>
+
+              <div className="flex items-end pb-2">
+                <label className="inline-flex items-center gap-2 text-sm text-slate-700 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={newCompDraft.vatPayer}
+                    onChange={(e) =>
+                      setNewCompDraft({ ...newCompDraft, vatPayer: e.target.checked })
+                    }
+                    className="rounded border-slate-300"
+                  />
+                  Plátce DPH
+                </label>
+              </div>
+
+              <div className="sm:col-span-2">
+                <label className="block text-xs font-medium text-slate-700 mb-1">Ulice a č.p.</label>
+                <input
+                  type="text"
+                  value={newCompDraft.street}
+                  onChange={(e) => setNewCompDraft({ ...newCompDraft, street: e.target.value })}
+                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">Město</label>
+                <input
+                  type="text"
+                  value={newCompDraft.city}
+                  onChange={(e) => setNewCompDraft({ ...newCompDraft, city: e.target.value })}
+                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">PSČ</label>
+                <input
+                  type="text"
+                  value={newCompDraft.zip}
+                  onChange={(e) => setNewCompDraft({ ...newCompDraft, zip: e.target.value })}
+                  className="w-full px-3 py-2 text-sm font-mono border border-slate-200 rounded-lg"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  Číslo bankovního účtu
+                </label>
+                <input
+                  type="text"
+                  value={newCompDraft.bankAccount}
+                  onChange={(e) =>
+                    setNewCompDraft({
+                      ...newCompDraft,
+                      bankAccount: e.target.value,
+                      iban: czechAccountToIban(e.target.value) || newCompDraft.iban,
+                    })
+                  }
+                  placeholder="123456789/2010"
+                  className="w-full px-3 py-2 text-sm font-mono border border-slate-200 rounded-lg"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  Prefix číselné řady faktur
+                </label>
+                <input
+                  type="text"
+                  value={newCompDraft.invoicePrefix}
+                  onChange={(e) =>
+                    setNewCompDraft({ ...newCompDraft, invoicePrefix: e.target.value })
+                  }
+                  className="w-full px-3 py-2 text-sm font-mono border border-slate-200 rounded-lg"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">E-mail</label>
+                <input
+                  type="email"
+                  value={newCompDraft.email}
+                  onChange={(e) => setNewCompDraft({ ...newCompDraft, email: e.target.value })}
+                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">Telefon</label>
+                <input
+                  type="text"
+                  value={newCompDraft.phone}
+                  onChange={(e) => setNewCompDraft({ ...newCompDraft, phone: e.target.value })}
+                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                />
+              </div>
+
+              <div className="sm:col-span-2">
+                <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                  Barevný akcent firmy
+                </label>
+                <div className="flex flex-wrap items-center gap-2">
+                  {COMPANY_BRAND_PALETTES.map((pal) => {
+                    const active = newCompDraft.accentIndex === pal.index;
+                    return (
+                      <button
+                        key={pal.index}
+                        type="button"
+                        onClick={() => setNewCompDraft({ ...newCompDraft, accentIndex: pal.index })}
+                        className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
+                          active
+                            ? 'border-slate-900 bg-slate-50 text-slate-900'
+                            : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                        }`}
+                      >
+                        <span
+                          className="w-3 h-3 rounded-full"
+                          style={{ backgroundColor: pal.primary }}
+                        />
+                        {pal.nameCz}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="sm:col-span-2 pt-1">
+                <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={newCompCreateWh}
+                    onChange={(e) => setNewCompCreateWh(e.target.checked)}
+                    className="rounded border-slate-300"
+                  />
+                  Automaticky založit pro tuto firmu vlastní oddělený sklad (sdílené sklady bude mít dostupné vždy)
+                </label>
+              </div>
+            </div>
+
+            <div className="pt-3 border-t border-slate-100 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setNewCompOpen(false)}
+                className="px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-900"
+              >
+                Zrušit
+              </button>
+              <button
+                type="submit"
+                disabled={newCompBusy}
+                style={{ backgroundColor: getCompanyPalette(newCompDraft.accentIndex).primary }}
+                className="inline-flex items-center gap-2 px-5 py-2 text-sm font-medium text-white rounded-lg hover:opacity-95 disabled:opacity-60"
+              >
+                {newCompBusy ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Plus className="w-4 h-4" />
+                )}
+                Založit firmu
+              </button>
+            </div>
+          </form>
         </div>
       )}
     </div>
