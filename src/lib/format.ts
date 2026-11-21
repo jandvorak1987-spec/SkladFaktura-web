@@ -5,8 +5,10 @@ import {
   type CompanyBrandPalette,
   type InventoryItem,
   type Invoice,
+  type InvoiceDocumentType,
   type InvoiceLineItem,
   type PohodaExportScope,
+  type RecurringInterval,
   type Warehouse,
   type Workspace,
 } from '../types';
@@ -50,6 +52,57 @@ export function addDaysIso(isoDate: string, days: number): string {
   const dt = new Date(parts[0], parts[1] - 1, parts[2]);
   dt.setDate(dt.getDate() + days);
   return toIsoDate(dt);
+}
+
+export function addMonthsIso(isoDate: string, months: number): string {
+  const parts = isoDate.split('-').map(Number);
+  if (parts.length !== 3 || parts.some(Number.isNaN)) {
+    const dt = new Date();
+    dt.setMonth(dt.getMonth() + months);
+    return toIsoDate(dt);
+  }
+  const dt = new Date(parts[0], parts[1] - 1, parts[2]);
+  dt.setMonth(dt.getMonth() + months);
+  return toIsoDate(dt);
+}
+
+export function getDocumentTypeTitle(docType?: InvoiceDocumentType, vatPayer = true): string {
+  switch (docType) {
+    case 'PROFORMA':
+      return 'ZÁLOHOVÁ FAKTURA';
+    case 'QUOTE':
+      return 'CENOVÁ NABÍDKA';
+    case 'CREDIT_NOTE':
+      return vatPayer ? 'OPRAVNÝ DAŇOVÝ DOKLAD (DOBROPIS)' : 'DOBROPIS';
+    default:
+      return vatPayer ? 'FAKTURA – DAŇOVÝ DOKLAD' : 'FAKTURA';
+  }
+}
+
+export function getDocumentTypeShortLabel(docType?: InvoiceDocumentType): string {
+  switch (docType) {
+    case 'PROFORMA':
+      return 'Záloha';
+    case 'QUOTE':
+      return 'Nabídka';
+    case 'CREDIT_NOTE':
+      return 'Dobropis';
+    default:
+      return 'Faktura';
+  }
+}
+
+export function getRecurringLabel(interval?: RecurringInterval): string {
+  switch (interval) {
+    case 'MONTHLY':
+      return 'Měsíčně';
+    case 'QUARTERLY':
+      return 'Čtvrtletně';
+    case 'YEARLY':
+      return 'Ročně';
+    default:
+      return 'Jednorázová';
+  }
 }
 
 export function formatDateCz(isoDate: string): string {

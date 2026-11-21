@@ -2,30 +2,41 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import {
   ArrowLeft,
+  ArrowRightLeft,
   Ban,
+  BellRing,
   Building2,
+  CalendarClock,
   CheckCircle2,
+  ClipboardList,
   Copy,
   Edit3,
+  FileMinus2,
   FilePlus2,
   FileText,
+  Globe,
   Loader2,
+  Mail,
   Package,
   Plus,
   Printer,
+  RefreshCw,
   Search,
   Trash2,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import {
   cancelInvoice,
+  deleteCancelledInvoice,
   editInvoice,
   issueInvoice,
   markInvoicePaid,
+  recordInvoiceEmailAction,
   updateInvoiceTemplate,
 } from '../lib/firestoreService';
 import {
   addDaysIso,
+  addMonthsIso,
   buildCzechSpdQr,
   calculateInvoiceTotals,
   czechAccountToIban,
@@ -34,10 +45,14 @@ import {
   formatDateCz,
   formatQty,
   getCompanyPalette,
+  getDocumentTypeShortLabel,
+  getDocumentTypeTitle,
+  getRecurringLabel,
   isInvoiceOverdue,
   lineTotalWithoutVat,
   lineTotalWithVat,
   previewNextInvoiceNumber,
+  round2,
   toIsoDate,
 } from '../lib/format';
 import {
@@ -46,10 +61,12 @@ import {
   type Company,
   type CompanyBrandPalette,
   type Invoice,
+  type InvoiceDocumentType,
   type InvoiceLineItem,
   type InvoiceStatus,
   type InvoiceTemplateId,
   type PaymentMethod,
+  type RecurringInterval,
 } from '../types';
 
 interface InvoicesViewProps {
@@ -58,7 +75,11 @@ interface InvoicesViewProps {
   onClearPrefillClient?: () => void;
 }
 
-type StatusFilter = 'ALL' | InvoiceStatus | 'OVERDUE';
+type StatusFilter = 'ALL' | InvoiceStatus | 'OVERDUE' | 'RECURRING' | 'NON_TAX';
+
+const SUPPORTED_CURRENCIES = ['CZK', 'EUR', 'USD', 'PLN', 'GBP', 'CHF'] as const;
+const REVERSE_CHARGE_LEGAL_TEXT =
+  'Daň odvede zákazník (§ 92a zákona č. 235/2004 Sb., o DPH – režim přenesené daňové povinnosti).';
 
 function paymentMethodLabel(method: PaymentMethod): string {
   if (method === 'CASH') return 'Hotově';
@@ -71,14 +92,24 @@ function InvoiceDocumentPreview({
   company,
   palette,
   vatPayer,
+  deliveryNoteMode = false,
 }: {
   invoice: Invoice;
   company?: Company | null;
   palette: CompanyBrandPalette;
   vatPayer: boolean;
+  deliveryNoteMode?: boolean;
 }) {
+  const docType: InvoiceDocumentType = invoice.documentType || 'INVOICE';
+  const isCreditNote = docType === 'CREDIT_NOTE';
+  const isQuote = docType === 'QUOTE';
+  const isProforma = docType === 'PROFORMA';
+  const isReverseCharge = Boolean(invoice.reverseCharge);
+  const showVatColumns = vatPayer && !isReverseCharge;
+  const amountSign = isCreditNote ? -1 : 1;
+
   const template: InvoiceTemplateId = invoice.invoiceTemplate || 'CLASSIC';
-  const totals = calculateInvoiceTotals(invoice.items, vatPayer);
+  const totals = calculateInvoiceTotals(invoice.items, showVatColumns);
   const resolvedBankAccount = invoice.companyBankAccount || company?.bankAccount || '';
   const resolvedIban = (
     invoice.companyIban ||
@@ -90,21 +121,141 @@ function InvoiceDocumentPreview({
     .toUpperCase();
 
   const isCashPayment = invoice.paymentMethod === 'CASH';
-  const spdPayload =
-    !isCashPayment && resolvedIban
-      ? buildCzechSpdQr({
-          iban: resolvedIban,
-          amount: Math.max(0, invoice.totalWithVat - invoice.paidAmount) || invoice.totalWithVat,
-          variableSymbol: invoice.variableSymbol || invoice.invoiceNumber.replace(/\D/g, ''),
-          message: `Faktura ${invoice.invoiceNumber}`,
-          dueDate: invoice.dueDate,
-          currency: invoice.currency || 'CZK',
-        })
-      : null;
+  const allowQr = !isCashPayment && !isQuote && !isCreditNote && Boolean(resolvedIban);
+  const spdPayload = allowQr
+    ? buildCzechSpdQr({
+        iban: resolvedIban,
+        amount: Math.max(0, invoice.totalWithVat - invoice.paidAmount) || invoice.totalWithVat,
+        variableSymbol: invoice.variableSymbol || invoice.invoiceNumber.replace(/\D/g, ''),
+        message: `${getDocumentTypeShortLabel(docType)} ${invoice.invoiceNumber}`,
+        dueDate: invoice.dueDate,
+        currency: invoice.currency || 'CZK',
+      })
+    : null;
+
+  const currency = (invoice.currency || 'CZK').toUpperCase();
+  const fxRate = currency !== 'CZK' && invoice.exchangeRate && invoice.exchangeRate > 0 ? invoice.exchangeRate : 1;
+  const showFxCzkSummary = currency !== 'CZK' && fxRate > 0;
+
+  if (deliveryNoteMode) {
+    return (
+      <div className="print-invoice bg-white border border-slate-200 rounded-xl p-6 sm:p-8 space-y-6 text-slate-900">
+        <div
+          className="flex flex-col sm:flex-row sm:items-end justify-between gap-4 pb-4 border-b-2"
+          style={{ borderColor: palette.primary }}
+        >
+          <div>
+            <p
+              className="text-xs font-semibold uppercase tracking-widest"
+              style={{ color: palette.primary }}
+            >
+              Dodací list (bez cen)
+            </p>
+            <h2 className="text-2xl font-bold mt-1 font-mono text-slate-900">
+              č. DL-{invoice.invoiceNumber}
+            </h2>
+            <p className="text-xs text-slate-500 mt-1">
+              K dokladu č. <span className="font-mono text-slate-700">{invoice.invoiceNumber}</span>
+            </p>
+          </div>
+          <div className="text-left sm:text-right text-xs text-slate-600 space-y-0.5 tabular-nums">
+            <p>
+              Datum vyskladnění:{' '}
+              <strong className="text-slate-900">{formatDateCz(invoice.issueDate)}</strong>
+            </p>
+            <p>
+              Počet položek: <strong className="text-slate-900">{invoice.items.length}</strong>
+            </p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+          <div className="rounded-lg p-4 bg-slate-50 border border-slate-200">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+              Dodavatel (odesílatel)
+            </p>
+            <p className="mt-1.5 text-base font-bold text-slate-900">{invoice.companyName}</p>
+            <p className="text-xs text-slate-600 mt-1">{invoice.companyAddress || '—'}</p>
+            <div className="mt-2 text-xs text-slate-600 font-mono">
+              {invoice.companyIco && <p>IČO: {invoice.companyIco}</p>}
+            </div>
+          </div>
+          <div className="rounded-lg p-4 bg-slate-50 border border-slate-200">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+              Odběratel (příjemce)
+            </p>
+            <p className="mt-1.5 text-base font-bold text-slate-900">{invoice.clientName}</p>
+            <p className="text-xs text-slate-600 mt-1">
+              {[invoice.clientStreet, [invoice.clientZip, invoice.clientCity].filter(Boolean).join(' ')]
+                .filter(Boolean)
+                .join(', ') || '—'}
+            </p>
+            <div className="mt-2 text-xs text-slate-600 font-mono">
+              {invoice.clientIco && <p>IČO: {invoice.clientIco}</p>}
+            </div>
+          </div>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-left border-collapse text-xs">
+            <thead>
+              <tr
+                className="border-b-2 text-[11px] uppercase tracking-wider text-slate-600"
+                style={{ borderColor: palette.primary }}
+              >
+                <th className="py-2 pr-3 w-10">#</th>
+                <th className="py-2 px-2">SKU / Kód</th>
+                <th className="py-2 px-2">Název zboží / popis</th>
+                <th className="py-2 px-2 text-right">Množství</th>
+                <th className="py-2 pl-2 text-center w-24">Kontrola</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {invoice.items.map((item, idx) => (
+                <tr key={`${item.sku}-${idx}`}>
+                  <td className="py-2.5 pr-3 text-slate-400 tabular-nums">{idx + 1}.</td>
+                  <td className="py-2.5 px-2 font-mono text-slate-600 whitespace-nowrap">
+                    {item.sku || '—'}
+                  </td>
+                  <td className="py-2.5 px-2 font-medium text-slate-900">{item.name}</td>
+                  <td className="py-2.5 px-2 text-right font-semibold tabular-nums whitespace-nowrap">
+                    {formatQty(item.quantity)} {item.unit}
+                  </td>
+                  <td className="py-2.5 pl-2 text-center">
+                    <span className="inline-block w-4 h-4 border border-slate-400 rounded-xs align-middle" />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {invoice.note && (
+          <p className="text-xs text-slate-600 border-t border-slate-100 pt-3">
+            <strong className="text-slate-800">Poznámka k dodávce:</strong> {invoice.note}
+          </p>
+        )}
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-8 pt-10 mt-6 border-t border-slate-200 text-xs text-slate-600">
+          <div>
+            <p className="font-semibold text-slate-800">Zboží předal (dodavatel)</p>
+            <div className="mt-10 border-b border-slate-400" />
+            <p className="mt-1.5 text-[11px] text-slate-500">Datum, jméno a podpis</p>
+          </div>
+          <div>
+            <p className="font-semibold text-slate-800">Zboží převzal v pořádku (odběratel)</p>
+            <div className="mt-10 border-b border-slate-400" />
+            <p className="mt-1.5 text-[11px] text-slate-500">Datum, jméno, razítko a podpis</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const isBanner = template === 'MODERN_BANNER';
   const isMinimal = template === 'MINIMAL';
   const isSidebar = template === 'EXECUTIVE_SIDEBAR';
+  const docTitle = getDocumentTypeTitle(docType, vatPayer);
 
   const bodyContent = (
     <div className="space-y-6 text-slate-900">
@@ -115,19 +266,25 @@ function InvoiceDocumentPreview({
           className="text-white rounded-lg p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4"
         >
           <div>
-            <p className="text-xs uppercase tracking-widest opacity-80">
-              {vatPayer ? 'Faktura – Daňový doklad' : 'Faktura'}
-            </p>
+            <p className="text-xs uppercase tracking-widest opacity-80">{docTitle}</p>
             <h2 className="text-2xl font-bold mt-1 font-mono">{invoice.invoiceNumber}</h2>
             <p className="text-sm opacity-90 mt-1">{invoice.companyName}</p>
+            {invoice.relatedInvoiceNumber && (
+              <p className="text-xs opacity-80 mt-1 font-mono">
+                K dokladu č. {invoice.relatedInvoiceNumber}
+              </p>
+            )}
           </div>
           <div className="text-left sm:text-right tabular-nums">
-            <p className="text-xs uppercase opacity-80">Celkem k úhradě</p>
+            <p className="text-xs uppercase opacity-80">
+              {isCreditNote ? 'Celkem k vrácení' : isQuote ? 'Nabídková cena' : 'Celkem k úhradě'}
+            </p>
             <p className="text-2xl font-bold mt-0.5">
-              {formatCzk(invoice.totalWithVat, invoice.currency)}
+              {formatCzk(amountSign * invoice.totalWithVat, currency)}
             </p>
             <p className="text-xs opacity-90 mt-1">
-              Splatnost {formatDateCz(invoice.dueDate)} · VS {invoice.variableSymbol}
+              {isQuote ? 'Platnost do' : 'Splatnost'} {formatDateCz(invoice.dueDate)} · VS{' '}
+              {invoice.variableSymbol}
             </p>
           </div>
         </div>
@@ -143,11 +300,17 @@ function InvoiceDocumentPreview({
               className="text-xs font-semibold uppercase tracking-widest"
               style={{ color: isMinimal ? '#64748B' : palette.primary }}
             >
-              {vatPayer ? 'Faktura – Daňový doklad' : 'Faktura'}
+              {docTitle}
             </p>
             <h2 className="text-2xl font-bold mt-1 font-mono text-slate-900">
               č. {invoice.invoiceNumber}
             </h2>
+            {invoice.relatedInvoiceNumber && (
+              <p className="text-xs text-slate-500 mt-1">
+                Vázáno na doklad č.{' '}
+                <strong className="font-mono text-slate-800">{invoice.relatedInvoiceNumber}</strong>
+              </p>
+            )}
           </div>
           <div className="text-left sm:text-right text-xs text-slate-600 space-y-0.5 tabular-nums">
             <p>
@@ -155,18 +318,34 @@ function InvoiceDocumentPreview({
               <strong className="font-mono text-slate-900">{invoice.variableSymbol}</strong>
             </p>
             <p>
-              Datum vystavení: <strong className="text-slate-900">{formatDateCz(invoice.issueDate)}</strong>
+              Datum vystavení:{' '}
+              <strong className="text-slate-900">{formatDateCz(invoice.issueDate)}</strong>
             </p>
-            {vatPayer && invoice.taxDate && (
+            {vatPayer && !isQuote && !isProforma && invoice.taxDate && (
               <p>
                 DUZP: <strong className="text-slate-900">{formatDateCz(invoice.taxDate)}</strong>
               </p>
             )}
             <p>
-              Datum splatnosti:{' '}
+              {isQuote ? 'Platnost nabídky do:' : 'Datum splatnosti:'}{' '}
               <strong className="text-slate-900">{formatDateCz(invoice.dueDate)}</strong>
             </p>
+            {showFxCzkSummary && (
+              <p>
+                Kurz ČNB:{' '}
+                <strong className="text-slate-900">
+                  1 {currency} = {fxRate} Kč
+                </strong>
+              </p>
+            )}
           </div>
+        </div>
+      )}
+
+      {/* Non-tax document notice */}
+      {isProforma && (
+        <div className="text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-3.5 py-2">
+          Tento doklad není daňovým dokladem. Daňový doklad (ostrá faktura) bude vystaven po připsání platby.
         </div>
       )}
 
@@ -206,63 +385,69 @@ function InvoiceDocumentPreview({
           <div className="mt-3 text-xs text-slate-600 space-y-0.5 font-mono">
             {invoice.clientIco && <p>IČO: {invoice.clientIco}</p>}
             {invoice.clientDic && <p>DIČ: {invoice.clientDic}</p>}
+            {invoice.clientEmail && (
+              <p className="font-sans text-slate-500">E-mail: {invoice.clientEmail}</p>
+            )}
           </div>
         </div>
       </div>
 
-      {/* Payment info & QR */}
-      <div
-        className="rounded-lg p-4 border flex flex-col sm:flex-row sm:items-center justify-between gap-4"
-        style={{
-          backgroundColor: isMinimal ? '#FFFFFF' : palette.soft,
-          borderColor: isMinimal ? '#E2E8F0' : palette.border,
-        }}
-      >
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-2 text-xs">
-          <div>
-            <p className="text-slate-500">Způsob úhrady</p>
-            <p className="font-semibold text-slate-900 mt-0.5">
-              {paymentMethodLabel(invoice.paymentMethod)}
-            </p>
-          </div>
-          <div>
-            <p className="text-slate-500">Bankovní účet</p>
-            <p className="font-mono font-semibold text-slate-900 mt-0.5">
-              {resolvedBankAccount || '—'}
-            </p>
-          </div>
-          <div>
-            <p className="text-slate-500">Variabilní symbol</p>
-            <p className="font-mono font-semibold text-slate-900 mt-0.5">
-              {invoice.variableSymbol || '—'}
-            </p>
-          </div>
-          {resolvedIban && (
-            <div className="col-span-2 sm:col-span-3">
-              <p className="text-slate-500">IBAN</p>
-              <p className="font-mono text-slate-800 mt-0.5">{resolvedIban}</p>
+      {/* Payment info & QR (hidden for Quotes) */}
+      {!isQuote && (
+        <div
+          className="rounded-lg p-4 border flex flex-col sm:flex-row sm:items-center justify-between gap-4"
+          style={{
+            backgroundColor: isMinimal ? '#FFFFFF' : palette.soft,
+            borderColor: isMinimal ? '#E2E8F0' : palette.border,
+          }}
+        >
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-2 text-xs">
+            <div>
+              <p className="text-slate-500">Způsob úhrady</p>
+              <p className="font-semibold text-slate-900 mt-0.5">
+                {paymentMethodLabel(invoice.paymentMethod)}
+              </p>
             </div>
+            <div>
+              <p className="text-slate-500">Bankovní účet</p>
+              <p className="font-mono font-semibold text-slate-900 mt-0.5">
+                {resolvedBankAccount || '—'}
+              </p>
+            </div>
+            <div>
+              <p className="text-slate-500">Variabilní symbol</p>
+              <p className="font-mono font-semibold text-slate-900 mt-0.5">
+                {invoice.variableSymbol || '—'}
+              </p>
+            </div>
+            {resolvedIban && (
+              <div className="col-span-2 sm:col-span-3">
+                <p className="text-slate-500">IBAN</p>
+                <p className="font-mono text-slate-800 mt-0.5">{resolvedIban}</p>
+              </div>
+            )}
+          </div>
+
+          {spdPayload ? (
+            <div className="flex items-center gap-3 bg-white p-2.5 rounded-lg border border-slate-200 self-start sm:self-auto shrink-0">
+              <QRCodeSVG value={spdPayload} size={92} level="M" />
+              <div className="text-[11px] text-slate-600 leading-tight">
+                <p className="font-semibold text-slate-900">QR Platba</p>
+                <p className="mt-0.5">Naskenujte v</p>
+                <p>mobilní bance</p>
+              </div>
+            </div>
+          ) : (
+            !isCashPayment &&
+            !isCreditNote && (
+              <div className="no-print text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 max-w-[220px]">
+                Pro zobrazení <strong>QR Platby</strong> doplňte v <em>Nastavení → Firemní údaje</em>{' '}
+                číslo účtu (např. <span className="font-mono">123456789/2010</span>) nebo IBAN.
+              </div>
+            )
           )}
         </div>
-
-        {spdPayload ? (
-          <div className="flex items-center gap-3 bg-white p-2.5 rounded-lg border border-slate-200 self-start sm:self-auto shrink-0">
-            <QRCodeSVG value={spdPayload} size={92} level="M" />
-            <div className="text-[11px] text-slate-600 leading-tight">
-              <p className="font-semibold text-slate-900">QR Platba</p>
-              <p className="mt-0.5">Naskenujte v</p>
-              <p>mobilní bance</p>
-            </div>
-          </div>
-        ) : (
-          !isCashPayment && (
-            <div className="no-print text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 max-w-[220px]">
-              Pro zobrazení <strong>QR Platby</strong> doplňte v <em>Nastavení → Firemní údaje</em>{' '}
-              číslo účtu (např. <span className="font-mono">123456789/2010</span>) nebo IBAN.
-            </div>
-          )
-        )}
-      </div>
+      )}
 
       {/* Items table */}
       <div className="overflow-x-auto">
@@ -279,7 +464,7 @@ function InvoiceDocumentPreview({
               <th className="py-2 px-2 text-right">Množství</th>
               <th className="py-2 px-2 text-right">Cena / MJ</th>
               <th className="py-2 px-2 text-right">Sleva</th>
-              {vatPayer && <th className="py-2 px-2 text-right">DPH</th>}
+              {showVatColumns && <th className="py-2 px-2 text-right">DPH</th>}
               <th className="py-2 pl-2 text-right">Celkem</th>
             </tr>
           </thead>
@@ -291,23 +476,25 @@ function InvoiceDocumentPreview({
                   {item.sku && <p className="text-[11px] font-mono text-slate-400">{item.sku}</p>}
                 </td>
                 <td className="py-2.5 px-2 text-right tabular-nums whitespace-nowrap">
+                  {isCreditNote ? '−' : ''}
                   {formatQty(item.quantity)} {item.unit}
                 </td>
                 <td className="py-2.5 px-2 text-right tabular-nums whitespace-nowrap">
-                  {formatCzk(item.unitPrice, invoice.currency)}
+                  {formatCzk(item.unitPrice, currency)}
                 </td>
                 <td className="py-2.5 px-2 text-right tabular-nums whitespace-nowrap text-slate-500">
                   {item.discountPercent > 0 ? `${item.discountPercent} %` : '—'}
                 </td>
-                {vatPayer && (
+                {showVatColumns && (
                   <td className="py-2.5 px-2 text-right tabular-nums whitespace-nowrap text-slate-600">
                     {item.vatRate} %
                   </td>
                 )}
                 <td className="py-2.5 pl-2 text-right font-semibold tabular-nums whitespace-nowrap">
                   {formatCzk(
-                    vatPayer ? lineTotalWithVat(item, true) : lineTotalWithoutVat(item),
-                    invoice.currency
+                    amountSign *
+                      (showVatColumns ? lineTotalWithVat(item, true) : lineTotalWithoutVat(item)),
+                    currency
                   )}
                 </td>
               </tr>
@@ -316,10 +503,18 @@ function InvoiceDocumentPreview({
         </table>
       </div>
 
+      {/* Reverse charge / Legal notice */}
+      {(isReverseCharge || invoice.legalNotice) && (
+        <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-2.5 text-xs text-slate-700">
+          <strong className="text-slate-900">Zákonná doložka: </strong>
+          {invoice.legalNotice || REVERSE_CHARGE_LEGAL_TEXT}
+        </div>
+      )}
+
       {/* VAT Summary + Grand total */}
       <div className="flex flex-col sm:flex-row justify-between gap-6 pt-4 border-t border-slate-200">
-        <div className="flex-1 text-xs text-slate-600">
-          {vatPayer && totals.breakdown.length > 0 && (
+        <div className="flex-1 text-xs text-slate-600 space-y-3">
+          {showVatColumns && totals.breakdown.length > 0 && (
             <table className="w-full max-w-xs text-left border-collapse">
               <thead>
                 <tr className="text-[10px] uppercase text-slate-400 border-b border-slate-100">
@@ -332,15 +527,46 @@ function InvoiceDocumentPreview({
                 {totals.breakdown.map((row) => (
                   <tr key={row.rate}>
                     <td className="py-1">{row.rate} %</td>
-                    <td className="py-1 text-right">{formatCzk(row.base, invoice.currency)}</td>
-                    <td className="py-1 text-right">{formatCzk(row.vat, invoice.currency)}</td>
+                    <td className="py-1 text-right">
+                      {formatCzk(amountSign * row.base, currency)}
+                    </td>
+                    <td className="py-1 text-right">
+                      {formatCzk(amountSign * row.vat, currency)}
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
           )}
+
+          {showFxCzkSummary && (
+            <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 max-w-xs space-y-1 tabular-nums">
+              <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                Přepočet do CZK pro DPH (kurz {fxRate} Kč/{currency})
+              </p>
+              <div className="flex justify-between">
+                <span>Základ v CZK:</span>
+                <span className="font-medium text-slate-800">
+                  {formatCzk(amountSign * round2(invoice.totalWithoutVat * fxRate), 'CZK')}
+                </span>
+              </div>
+              {showVatColumns && (
+                <div className="flex justify-between">
+                  <span>DPH v CZK:</span>
+                  <span className="font-medium text-slate-800">
+                    {formatCzk(amountSign * round2(invoice.totalVat * fxRate), 'CZK')}
+                  </span>
+                </div>
+              )}
+              <div className="flex justify-between pt-1 border-t border-slate-200 font-semibold text-slate-900">
+                <span>Celkem v CZK:</span>
+                <span>{formatCzk(amountSign * round2(invoice.totalWithVat * fxRate), 'CZK')}</span>
+              </div>
+            </div>
+          )}
+
           {invoice.note && (
-            <p className="mt-4 text-xs text-slate-600">
+            <p className="text-xs text-slate-600">
               <strong className="text-slate-800">Poznámka:</strong> {invoice.note}
             </p>
           )}
@@ -349,24 +575,27 @@ function InvoiceDocumentPreview({
         <div className="sm:w-64 space-y-1.5 text-sm tabular-nums">
           <div className="flex justify-between text-slate-600">
             <span>Základ bez DPH</span>
-            <span>{formatCzk(invoice.totalWithoutVat, invoice.currency)}</span>
+            <span>{formatCzk(amountSign * invoice.totalWithoutVat, currency)}</span>
           </div>
-          {vatPayer && (
+          {showVatColumns && (
             <div className="flex justify-between text-slate-600">
               <span>DPH celkem</span>
-              <span>{formatCzk(invoice.totalVat, invoice.currency)}</span>
+              <span>{formatCzk(amountSign * invoice.totalVat, currency)}</span>
             </div>
           )}
           <div
             className="flex justify-between pt-2 mt-2 border-t text-base font-bold"
             style={{ borderColor: palette.primary, color: palette.dark }}
           >
-            <span>Celkem k úhradě</span>
-            <span>{formatCzk(invoice.totalWithVat, invoice.currency)}</span>
+            <span>
+              {isCreditNote ? 'Celkem k vrácení' : isQuote ? 'Celkem nabídka' : 'Celkem k úhradě'}
+            </span>
+            <span>{formatCzk(amountSign * invoice.totalWithVat, currency)}</span>
           </div>
           {invoice.status === 'PAID' && (
             <p className="text-xs font-medium text-emerald-700 text-right pt-1">
-              Uhrazeno {invoice.paidDate ? formatDateCz(invoice.paidDate) : ''}
+              {isCreditNote ? 'Vypořádáno' : 'Uhrazeno'}{' '}
+              {invoice.paidDate ? formatDateCz(invoice.paidDate) : ''}
             </p>
           )}
           {invoice.status === 'CANCELLED' && (
@@ -419,10 +648,12 @@ export function InvoicesView({
   const [mode, setMode] = useState<'LIST' | 'CREATE' | 'EDIT' | 'DETAIL'>('LIST');
   const [editingInvoice, setEditingInvoice] = useState<Invoice | null>(null);
   const [selectedInvoiceId, setSelectedInvoiceId] = useState<string | null>(null);
+  const [deliveryNoteMode, setDeliveryNoteMode] = useState(false);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('ALL');
   const [search, setSearch] = useState('');
 
   // Create form state
+  const [documentType, setDocumentType] = useState<InvoiceDocumentType>('INVOICE');
   const [invoiceNumber, setInvoiceNumber] = useState('');
   const [variableSymbol, setVariableSymbol] = useState('');
   const [issueDate, setIssueDate] = useState(toIsoDate());
@@ -430,6 +661,14 @@ export function InvoicesView({
   const [dueDate, setDueDate] = useState(addDaysIso(toIsoDate(), 14));
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('BANK_TRANSFER');
   const [invoiceTemplate, setInvoiceTemplate] = useState<InvoiceTemplateId>('CLASSIC');
+  const [currency, setCurrency] = useState<string>('CZK');
+  const [exchangeRate, setExchangeRate] = useState<string>('1');
+  const [cnbBusy, setCnbBusy] = useState(false);
+  const [cnbDate, setCnbDate] = useState('');
+  const [reverseCharge, setReverseCharge] = useState(false);
+  const [legalNotice, setLegalNotice] = useState('');
+  const [relatedInvoiceNumber, setRelatedInvoiceNumber] = useState('');
+  const [recurringInterval, setRecurringInterval] = useState<RecurringInterval>('NONE');
   const [deductFromStock, setDeductFromStock] = useState(true);
   const [note, setNote] = useState('');
 
@@ -440,10 +679,13 @@ export function InvoicesView({
   const [clientStreet, setClientStreet] = useState('');
   const [clientCity, setClientCity] = useState('');
   const [clientZip, setClientZip] = useState('');
+  const [clientEmail, setClientEmail] = useState('');
 
   const [items, setItems] = useState<InvoiceLineItem[]>([]);
   const [aresBusy, setAresBusy] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [deleteConfirmInvoice, setDeleteConfirmInvoice] = useState<Invoice | null>(null);
+  const [deletingInvoice, setDeletingInvoice] = useState(false);
 
   const accessibleItems = useMemo(() => {
     const whIds = new Set(accessibleWarehouses.map((w) => w.id));
@@ -460,9 +702,67 @@ export function InvoicesView({
     [invoices, selectedInvoiceId]
   );
 
-  const startNewInvoice = (client?: Client | null) => {
+  const suggestNumberForType = (type: InvoiceDocumentType, refNum?: string) => {
+    const baseNext = activeCompany ? previewNextInvoiceNumber(activeCompany) : `20260001`;
+    const stamp = toIsoDate().replace(/-/g, '').slice(2);
+    const seq = String(companyInvoices.length + 1).padStart(3, '0');
+    if (type === 'PROFORMA') return `ZAL-${stamp}-${seq}`;
+    if (type === 'QUOTE') return `NAB-${stamp}-${seq}`;
+    if (type === 'CREDIT_NOTE') return refNum ? `DOB-${refNum}` : `DOB-${stamp}-${seq}`;
+    return baseNext;
+  };
+
+  const fetchCnbRate = async (targetCurrency: string) => {
+    const code = targetCurrency.toUpperCase();
+    if (code === 'CZK') {
+      setExchangeRate('1');
+      setCnbDate('');
+      return;
+    }
+    setCnbBusy(true);
+    try {
+      const resp = await fetch('/api/cnb-rates');
+      const data = await resp.json();
+      if (!resp.ok || !data?.rates?.[code]) {
+        throw new Error(data?.error || `Kurz pro ${code} nebyl nalezen.`);
+      }
+      setExchangeRate(String(data.rates[code]));
+      setCnbDate(data.date || '');
+      notify(`Kurz ČNB (${data.date || 'dnes'}): 1 ${code} = ${data.rates[code]} Kč.`);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Načtení kurzu ČNB selhalo.', 'error');
+    } finally {
+      setCnbBusy(false);
+    }
+  };
+
+  const handleCurrencyChange = (nextCurrency: string) => {
+    setCurrency(nextCurrency);
+    if (nextCurrency === 'CZK') {
+      setExchangeRate('1');
+      setCnbDate('');
+    } else {
+      fetchCnbRate(nextCurrency);
+    }
+  };
+
+  const handleDocumentTypeChange = (nextType: InvoiceDocumentType) => {
+    setDocumentType(nextType);
+    if (mode === 'CREATE') {
+      const num = suggestNumberForType(nextType, relatedInvoiceNumber || undefined);
+      setInvoiceNumber(num);
+      setVariableSymbol(num.replace(/\D/g, ''));
+      setDeductFromStock(nextType === 'INVOICE' || nextType === 'CREDIT_NOTE');
+    }
+  };
+
+  const startNewInvoice = (
+    client?: Client | null,
+    initialType: InvoiceDocumentType = 'INVOICE'
+  ) => {
     const today = toIsoDate();
-    const nextNum = activeCompany ? previewNextInvoiceNumber(activeCompany) : `20260001`;
+    const nextNum = suggestNumberForType(initialType);
+    setDocumentType(initialType);
     setInvoiceNumber(nextNum);
     setVariableSymbol(nextNum.replace(/\D/g, ''));
     setIssueDate(today);
@@ -470,7 +770,14 @@ export function InvoicesView({
     setDueDate(addDaysIso(today, 14));
     setPaymentMethod('BANK_TRANSFER');
     setInvoiceTemplate(activeCompany?.invoiceTemplate || 'CLASSIC');
-    setDeductFromStock(true);
+    setCurrency('CZK');
+    setExchangeRate('1');
+    setCnbDate('');
+    setReverseCharge(false);
+    setLegalNotice('');
+    setRelatedInvoiceNumber('');
+    setRecurringInterval('NONE');
+    setDeductFromStock(initialType === 'INVOICE' || initialType === 'CREDIT_NOTE');
     setNote('');
 
     if (client) {
@@ -481,6 +788,7 @@ export function InvoicesView({
       setClientStreet(client.street);
       setClientCity(client.city);
       setClientZip(client.zip);
+      setClientEmail(client.email || '');
     } else {
       setClientId('');
       setClientName('');
@@ -489,6 +797,7 @@ export function InvoicesView({
       setClientStreet('');
       setClientCity('');
       setClientZip('');
+      setClientEmail('');
     }
 
     setItems([
@@ -505,20 +814,38 @@ export function InvoicesView({
       },
     ]);
     setEditingInvoice(null);
+    setDeliveryNoteMode(false);
     setMode('CREATE');
   };
 
-  const startDuplicateInvoice = (source: Invoice) => {
-    const today = toIsoDate();
-    const nextNum = activeCompany ? previewNextInvoiceNumber(activeCompany) : `20260001`;
-    setInvoiceNumber(nextNum);
-    setVariableSymbol(nextNum.replace(/\D/g, ''));
-    setIssueDate(today);
-    setTaxDate(today);
-    setDueDate(addDaysIso(today, 14));
+  const populateFromInvoice = (
+    source: Invoice,
+    overrides: {
+      docType: InvoiceDocumentType;
+      invNum: string;
+      issue: string;
+      due: string;
+      related?: string;
+      deduct: boolean;
+      recurring?: RecurringInterval;
+    }
+  ) => {
+    setDocumentType(overrides.docType);
+    setInvoiceNumber(overrides.invNum);
+    setVariableSymbol(overrides.invNum.replace(/\D/g, ''));
+    setIssueDate(overrides.issue);
+    setTaxDate(overrides.issue);
+    setDueDate(overrides.due);
     setPaymentMethod(source.paymentMethod || 'BANK_TRANSFER');
     setInvoiceTemplate(source.invoiceTemplate || activeCompany?.invoiceTemplate || 'CLASSIC');
-    setDeductFromStock(source.deductedFromStock);
+    setCurrency(source.currency || 'CZK');
+    setExchangeRate(String(source.exchangeRate && source.exchangeRate > 0 ? source.exchangeRate : 1));
+    setCnbDate('');
+    setReverseCharge(Boolean(source.reverseCharge));
+    setLegalNotice(source.legalNotice || '');
+    setRelatedInvoiceNumber(overrides.related ?? '');
+    setRecurringInterval(overrides.recurring ?? 'NONE');
+    setDeductFromStock(overrides.deduct);
     setNote(source.note || '');
     setClientId(source.clientId || '');
     setClientName(source.clientName || '');
@@ -527,12 +854,93 @@ export function InvoicesView({
     setClientStreet(source.clientStreet || '');
     setClientCity(source.clientCity || '');
     setClientZip(source.clientZip || '');
+    const matchedClient = clients.find(
+      (c) => c.id === source.clientId || (source.clientIco && c.ico === source.clientIco)
+    );
+    setClientEmail(source.clientEmail || matchedClient?.email || '');
     setItems(source.items.map((l) => ({ ...l })));
     setEditingInvoice(null);
+    setDeliveryNoteMode(false);
     setMode('CREATE');
   };
 
+  const startDuplicateInvoice = (source: Invoice) => {
+    const today = toIsoDate();
+    const docType: InvoiceDocumentType = source.documentType || 'INVOICE';
+    populateFromInvoice(source, {
+      docType,
+      invNum: suggestNumberForType(docType),
+      issue: today,
+      due: addDaysIso(today, 14),
+      deduct: docType === 'INVOICE' ? source.deductedFromStock : docType === 'CREDIT_NOTE',
+      recurring: source.recurringInterval || 'NONE',
+    });
+  };
+
+  const startConvertToInvoice = (source: Invoice) => {
+    const today = toIsoDate();
+    populateFromInvoice(source, {
+      docType: 'INVOICE',
+      invNum: suggestNumberForType('INVOICE'),
+      issue: today,
+      due: addDaysIso(today, 14),
+      related: source.invoiceNumber,
+      deduct: true,
+      recurring: 'NONE',
+    });
+    notify(`Připravena ostrá faktura z dokladu ${source.invoiceNumber}.`, 'info');
+  };
+
+  const startCreditNote = (source: Invoice) => {
+    const today = toIsoDate();
+    populateFromInvoice(source, {
+      docType: 'CREDIT_NOTE',
+      invNum: suggestNumberForType('CREDIT_NOTE', source.invoiceNumber),
+      issue: today,
+      due: addDaysIso(today, 14),
+      related: source.invoiceNumber,
+      deduct: source.deductedFromStock,
+      recurring: 'NONE',
+    });
+    notify(`Připraven dobropis k faktuře ${source.invoiceNumber}.`, 'info');
+  };
+
+  const startNextRecurringPeriod = (source: Invoice) => {
+    const interval = source.recurringInterval || 'MONTHLY';
+    const months = interval === 'YEARLY' ? 12 : interval === 'QUARTERLY' ? 3 : 1;
+    const baseIssue = source.issueDate || toIsoDate();
+    const nextIssue = addMonthsIso(baseIssue, months);
+    const origDueOffset =
+      source.issueDate && source.dueDate
+        ? Math.max(
+            1,
+            Math.round(
+              (new Date(`${source.dueDate}T00:00:00`).getTime() -
+                new Date(`${source.issueDate}T00:00:00`).getTime()) /
+                86400000
+            )
+          )
+        : 14;
+    const nextDue = addDaysIso(nextIssue, origDueOffset);
+    const docType: InvoiceDocumentType = source.documentType || 'INVOICE';
+
+    populateFromInvoice(source, {
+      docType,
+      invNum: suggestNumberForType(docType),
+      issue: nextIssue,
+      due: nextDue,
+      related: source.invoiceNumber,
+      deduct: source.deductedFromStock,
+      recurring: interval,
+    });
+    notify(
+      `Předvyplněno další období (${getRecurringLabel(interval).toLowerCase()}) od ${formatDateCz(nextIssue)}.`,
+      'info'
+    );
+  };
+
   const startEditInvoice = (source: Invoice) => {
+    setDocumentType(source.documentType || 'INVOICE');
     setInvoiceNumber(source.invoiceNumber);
     setVariableSymbol(source.variableSymbol);
     setIssueDate(source.issueDate);
@@ -540,6 +948,13 @@ export function InvoicesView({
     setDueDate(source.dueDate);
     setPaymentMethod(source.paymentMethod || 'BANK_TRANSFER');
     setInvoiceTemplate(source.invoiceTemplate || activeCompany?.invoiceTemplate || 'CLASSIC');
+    setCurrency(source.currency || 'CZK');
+    setExchangeRate(String(source.exchangeRate && source.exchangeRate > 0 ? source.exchangeRate : 1));
+    setCnbDate('');
+    setReverseCharge(Boolean(source.reverseCharge));
+    setLegalNotice(source.legalNotice || '');
+    setRelatedInvoiceNumber(source.relatedInvoiceNumber || '');
+    setRecurringInterval(source.recurringInterval || 'NONE');
     setDeductFromStock(source.deductedFromStock);
     setNote(source.note || '');
     setClientId(source.clientId || '');
@@ -549,8 +964,10 @@ export function InvoicesView({
     setClientStreet(source.clientStreet || '');
     setClientCity(source.clientCity || '');
     setClientZip(source.clientZip || '');
+    setClientEmail(source.clientEmail || '');
     setItems(source.items.map((l) => ({ ...l })));
     setEditingInvoice(source);
+    setDeliveryNoteMode(false);
     setMode('EDIT');
   };
 
@@ -567,8 +984,24 @@ export function InvoicesView({
     return companyInvoices.filter((inv) => {
       if (statusFilter === 'OVERDUE' && !isInvoiceOverdue(inv)) return false;
       if (
+        statusFilter === 'RECURRING' &&
+        (!inv.recurringInterval || inv.recurringInterval === 'NONE')
+      ) {
+        return false;
+      }
+      if (
+        statusFilter === 'NON_TAX' &&
+        inv.documentType !== 'QUOTE' &&
+        inv.documentType !== 'PROFORMA' &&
+        inv.documentType !== 'CREDIT_NOTE'
+      ) {
+        return false;
+      }
+      if (
         statusFilter !== 'ALL' &&
         statusFilter !== 'OVERDUE' &&
+        statusFilter !== 'RECURRING' &&
+        statusFilter !== 'NON_TAX' &&
         inv.status !== statusFilter
       ) {
         return false;
@@ -583,9 +1016,10 @@ export function InvoicesView({
     });
   }, [companyInvoices, statusFilter, search]);
 
+  const effectiveDraftVatPayer = (activeCompany?.vatPayer ?? true) && !reverseCharge;
   const draftTotals = useMemo(
-    () => calculateInvoiceTotals(items, activeCompany?.vatPayer ?? true),
-    [items, activeCompany]
+    () => calculateInvoiceTotals(items, effectiveDraftVatPayer),
+    [items, effectiveDraftVatPayer]
   );
 
   const handleSelectClient = (id: string) => {
@@ -598,6 +1032,7 @@ export function InvoicesView({
     setClientStreet(c.street);
     setClientCity(c.city);
     setClientZip(c.zip);
+    setClientEmail(c.email || '');
   };
 
   const handleInlineAres = async () => {
@@ -656,16 +1091,29 @@ export function InvoicesView({
       notify('Vyplňte název odběratele.', 'error');
       return;
     }
+    const parsedFx = currency === 'CZK' ? 1 : Number(exchangeRate.replace(',', '.')) || 0;
+    if (currency !== 'CZK' && parsedFx <= 0) {
+      notify('Zadejte platný směnný kurz v Kč nebo jej načtěte z ČNB.', 'error');
+      return;
+    }
+
     setSaving(true);
     try {
       const payload = {
         company: activeCompany,
+        documentType,
         invoiceNumber,
         variableSymbol,
         issueDate,
         taxDate,
         dueDate,
         paymentMethod,
+        currency,
+        exchangeRate: parsedFx,
+        reverseCharge,
+        legalNotice: legalNotice.trim() || (reverseCharge ? REVERSE_CHARGE_LEGAL_TEXT : ''),
+        relatedInvoiceNumber: relatedInvoiceNumber.trim(),
+        recurringInterval,
         clientId,
         clientName,
         clientIco,
@@ -673,11 +1121,15 @@ export function InvoicesView({
         clientStreet,
         clientCity,
         clientZip,
+        clientEmail: clientEmail.trim(),
         note,
-        deductFromStock,
+        deductFromStock:
+          documentType === 'QUOTE' || documentType === 'PROFORMA' ? false : deductFromStock,
         invoiceTemplate,
         items,
       };
+
+      const label = getDocumentTypeShortLabel(documentType);
 
       if (mode === 'EDIT' && editingInvoice) {
         const updatedId = await editInvoice({
@@ -687,9 +1139,10 @@ export function InvoicesView({
           isAdmin: isCurrentUserAdmin,
           payload,
         });
-        notify(`Změny na faktuře ${invoiceNumber} byly uloženy.`);
+        notify(`Změny na dokladu ${invoiceNumber} byly uloženy.`);
         setEditingInvoice(null);
         setSelectedInvoiceId(updatedId);
+        setDeliveryNoteMode(false);
         setMode('DETAIL');
       } else {
         const newId = await issueInvoice({
@@ -697,15 +1150,97 @@ export function InvoicesView({
           inventory,
           payload,
         });
-        notify(`Faktura ${invoiceNumber} byla vystavena.`);
+        notify(`${label} ${invoiceNumber} byla vystavena.`);
         setSelectedInvoiceId(newId);
+        setDeliveryNoteMode(false);
         setMode('DETAIL');
       }
     } catch (err) {
-      notify(err instanceof Error ? err.message : 'Uložení faktury selhalo.', 'error');
+      notify(err instanceof Error ? err.message : 'Uložení dokladu selhalo.', 'error');
     } finally {
       setSaving(false);
     }
+  };
+
+  const handleSendEmail = async (inv: Invoice, isReminder: boolean) => {
+    const matchedClient = clients.find(
+      (c) => c.id === inv.clientId || (inv.clientIco && c.ico === inv.clientIco)
+    );
+    const toEmail = inv.clientEmail || matchedClient?.email || '';
+    const curr = inv.currency || 'CZK';
+    const docLabel = getDocumentTypeShortLabel(inv.documentType);
+    const bankAcc = inv.companyBankAccount || activeCompany?.bankAccount || '';
+    const diff = daysUntilDue(inv.dueDate);
+    const overdueDays = diff !== null && diff < 0 ? Math.abs(diff) : 0;
+    const reminderNum = (inv.reminderCount || 0) + 1;
+
+    const subject = isReminder
+      ? `${reminderNum}. upomínka – neuhrazená faktura č. ${inv.invoiceNumber} (${inv.companyName})`
+      : `${docLabel} č. ${inv.invoiceNumber} – ${inv.companyName}`;
+
+    const bodyLines = isReminder
+      ? [
+          'Dobrý den,',
+          '',
+          `dovolujeme si Vám připomenout neuhrazenou fakturu č. ${inv.invoiceNumber}, která je ${overdueDays} dní po datu splatnosti (${formatDateCz(inv.dueDate)}).`,
+          '',
+          `Částka k úhradě: ${formatCzk(Math.max(0, inv.totalWithVat - inv.paidAmount) || inv.totalWithVat, curr)}`,
+          `Číslo účtu: ${bankAcc || 'viz doklad'}`,
+          `Variabilní symbol: ${inv.variableSymbol || inv.invoiceNumber}`,
+          '',
+          'Pokud jste platbu již odeslali, považujte prosím tento e-mail za bezpředmětný.',
+          '',
+          `S pozdravem,`,
+          inv.companyName,
+        ]
+      : [
+          'Dobrý den,',
+          '',
+          `v příloze zasíláme doklad ${docLabel.toLowerCase()} č. ${inv.invoiceNumber} ze dne ${formatDateCz(inv.issueDate)}.`,
+          '',
+          `Celková částka: ${formatCzk(inv.totalWithVat, curr)}`,
+          inv.documentType === 'QUOTE'
+            ? `Platnost nabídky do: ${formatDateCz(inv.dueDate)}`
+            : `Datum splatnosti: ${formatDateCz(inv.dueDate)}`,
+          ...(inv.documentType !== 'QUOTE' && inv.documentType !== 'CREDIT_NOTE'
+            ? [
+                `Číslo účtu: ${bankAcc || 'viz doklad'}`,
+                `Variabilní symbol: ${inv.variableSymbol || inv.invoiceNumber}`,
+              ]
+            : []),
+          '',
+          'S pozdravem,',
+          inv.companyName,
+        ];
+
+    const body = bodyLines.join('\n');
+
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(`${subject}\n\n${body}`);
+      }
+    } catch {
+      // Clipboard may be blocked in iframe; continue opening mailto
+    }
+
+    const mailtoUrl = `mailto:${encodeURIComponent(toEmail)}?subject=${encodeURIComponent(
+      subject
+    )}&body=${encodeURIComponent(body)}`;
+    const link = document.createElement('a');
+    link.href = mailtoUrl;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+
+    if (workspace) {
+      await recordInvoiceEmailAction(workspace.id, inv, isReminder);
+    }
+
+    notify(
+      isReminder
+        ? `${reminderNum}. upomínka byla připravena v e-mailovém klientu (text zkopírován do schránky).`
+        : `E-mail s údaji dokladu ${inv.invoiceNumber} byl připraven (text zkopírován do schránky). Tip: pro přiložení PDF klikněte na Tisk / PDF A4.`
+    );
   };
 
   const handleMarkPaid = async (inv: Invoice) => {
@@ -728,6 +1263,62 @@ export function InvoicesView({
     }
   };
 
+  const handleConfirmDeleteCancelled = async () => {
+    if (!workspace || !deleteConfirmInvoice) return;
+    setDeletingInvoice(true);
+    try {
+      const num = deleteConfirmInvoice.invoiceNumber;
+      const deletedId = deleteConfirmInvoice.id;
+      await deleteCancelledInvoice(workspace.id, deleteConfirmInvoice);
+      setDeleteConfirmInvoice(null);
+      if (selectedInvoiceId === deletedId) {
+        setSelectedInvoiceId(null);
+        setMode('LIST');
+      }
+      notify(`Stornovaná faktura ${num} byla trvale smazána ze seznamu.`, 'info');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Smazání faktury selhalo.', 'error');
+    } finally {
+      setDeletingInvoice(false);
+    }
+  };
+
+  const deleteConfirmModal = deleteConfirmInvoice ? (
+    <div className="no-print fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+      <div className="w-full max-w-md bg-white border border-slate-200 rounded-xl p-6 space-y-4">
+        <div className="flex items-center gap-2 text-red-700">
+          <Trash2 className="w-4 h-4 shrink-0" />
+          <h3 className="text-base font-semibold">
+            Smazat stornovanou fakturu {deleteConfirmInvoice.invoiceNumber}?
+          </h3>
+        </div>
+        <p className="text-sm text-slate-600">
+          Faktura pro odběratele <strong>{deleteConfirmInvoice.clientName}</strong> bude trvale
+          odstraněna ze seznamu i ze sdílené databáze. Tuto akci nelze vrátit zpět.
+        </p>
+        <div className="pt-2 flex items-center justify-end gap-2">
+          <button
+            type="button"
+            disabled={deletingInvoice}
+            onClick={() => setDeleteConfirmInvoice(null)}
+            className="px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-900"
+          >
+            Zrušit
+          </button>
+          <button
+            type="button"
+            disabled={deletingInvoice}
+            onClick={handleConfirmDeleteCancelled}
+            className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg disabled:opacity-60"
+          >
+            {deletingInvoice && <Loader2 className="w-4 h-4 animate-spin" />}
+            Trvale smazat
+          </button>
+        </div>
+      </div>
+    </div>
+  ) : null;
+
   const handleChangeInvoiceTemplate = async (inv: Invoice, tpl: InvoiceTemplateId) => {
     if (!workspace || inv.status === 'CANCELLED') return;
     try {
@@ -742,6 +1333,12 @@ export function InvoicesView({
   if (mode === 'DETAIL' && selectedInvoice) {
     const isVatPayer = selectedInvoice.totalVat > 0 || (activeCompany?.vatPayer ?? true);
     const activeTpl: InvoiceTemplateId = selectedInvoice.invoiceTemplate || 'CLASSIC';
+    const selDocType: InvoiceDocumentType = selectedInvoice.documentType || 'INVOICE';
+    const selOverdue = isInvoiceOverdue(selectedInvoice);
+    const canConvert = selDocType === 'QUOTE' || selDocType === 'PROFORMA';
+    const canCreditNote = selDocType === 'INVOICE' && selectedInvoice.status !== 'CANCELLED';
+    const hasRecurring =
+      Boolean(selectedInvoice.recurringInterval) && selectedInvoice.recurringInterval !== 'NONE';
 
     return (
       <div className="space-y-5">
@@ -749,7 +1346,10 @@ export function InvoicesView({
           <div className="flex items-center gap-3">
             <button
               type="button"
-              onClick={() => setMode('LIST')}
+              onClick={() => {
+                setDeliveryNoteMode(false);
+                setMode('LIST');
+              }}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg"
             >
               <ArrowLeft className="w-4 h-4" />
@@ -757,16 +1357,71 @@ export function InvoicesView({
             </button>
             <div>
               <h1 className="text-lg font-bold text-slate-900 font-mono">
-                Faktura {selectedInvoice.invoiceNumber}
+                {getDocumentTypeShortLabel(selDocType)} {selectedInvoice.invoiceNumber}
               </h1>
               <p className="text-xs text-slate-500">
                 {selectedInvoice.clientName} ·{' '}
                 {selectedInvoice.exportedToPohoda ? 'Exportováno do POHODY' : 'Zatím neexportováno'}
+                {selectedInvoice.sentAt && ` · Odesláno ${formatDateCz(selectedInvoice.sentAt)}`}
+                {selectedInvoice.reminderCount && selectedInvoice.reminderCount > 0
+                  ? ` · ${selectedInvoice.reminderCount}× upomínka`
+                  : ''}
+                {hasRecurring && ` · ${getRecurringLabel(selectedInvoice.recurringInterval)}`}
               </p>
             </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            {canConvert && selectedInvoice.status !== 'CANCELLED' && (
+              <button
+                type="button"
+                onClick={() => startConvertToInvoice(selectedInvoice)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-blue-800 bg-blue-50 border border-blue-200 hover:bg-blue-100 rounded-lg"
+              >
+                <ArrowRightLeft className="w-4 h-4" />
+                Převést na fakturu
+              </button>
+            )}
+            {canCreditNote && (
+              <button
+                type="button"
+                onClick={() => startCreditNote(selectedInvoice)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg"
+              >
+                <FileMinus2 className="w-4 h-4" />
+                Dobropis
+              </button>
+            )}
+            {hasRecurring && (
+              <button
+                type="button"
+                onClick={() => startNextRecurringPeriod(selectedInvoice)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg"
+              >
+                <CalendarClock className="w-4 h-4" />
+                Další období
+              </button>
+            )}
+            {selectedInvoice.status !== 'CANCELLED' && (
+              <button
+                type="button"
+                onClick={() => handleSendEmail(selectedInvoice, false)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg"
+              >
+                <Mail className="w-4 h-4" />
+                E-mail
+              </button>
+            )}
+            {selOverdue && selDocType !== 'QUOTE' && (
+              <button
+                type="button"
+                onClick={() => handleSendEmail(selectedInvoice, true)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-amber-800 bg-amber-50 border border-amber-200 hover:bg-amber-100 rounded-lg"
+              >
+                <BellRing className="w-4 h-4" />
+                Upomínka{selectedInvoice.reminderCount ? ` (${selectedInvoice.reminderCount + 1}.)` : ''}
+              </button>
+            )}
             {selectedInvoice.status !== 'CANCELLED' && (
               <button
                 type="button"
@@ -793,7 +1448,7 @@ export function InvoicesView({
                   className="inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-emerald-800 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 rounded-lg"
                 >
                   <CheckCircle2 className="w-4 h-4" />
-                  Označit uhrazeno
+                  Uhrazeno
                 </button>
                 <button
                   type="button"
@@ -805,6 +1460,16 @@ export function InvoicesView({
                 </button>
               </>
             )}
+            {selectedInvoice.status === 'CANCELLED' && isCurrentUserAdmin && (
+              <button
+                type="button"
+                onClick={() => setDeleteConfirmInvoice(selectedInvoice)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-red-700 bg-red-50 border border-red-200 hover:bg-red-100 rounded-lg"
+              >
+                <Trash2 className="w-4 h-4" />
+                Smazat ze seznamu
+              </button>
+            )}
             <button
               type="button"
               onClick={() => window.print()}
@@ -812,16 +1477,43 @@ export function InvoicesView({
               className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white rounded-lg hover:opacity-95"
             >
               <Printer className="w-4 h-4" />
-              Tisk / PDF A4
+              {deliveryNoteMode ? 'Tisk dodacího listu A4' : 'Tisk / PDF A4'}
             </button>
           </div>
         </div>
 
-        {/* Live template switcher */}
-        {selectedInvoice.status !== 'CANCELLED' && (
-          <div className="no-print bg-white border border-slate-200 rounded-xl p-3 flex flex-wrap items-center justify-between gap-3">
-            <span className="text-xs font-medium text-slate-600">Šablona dokladu:</span>
+        {/* Live template & Delivery Note switcher */}
+        <div className="no-print bg-white border border-slate-200 rounded-xl p-3 flex flex-wrap items-center justify-between gap-3">
+          <div className="inline-flex items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200">
+            <button
+              type="button"
+              onClick={() => setDeliveryNoteMode(false)}
+              className={`inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-md transition-colors ${
+                !deliveryNoteMode
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <FileText className="w-3.5 h-3.5" />
+              {getDocumentTypeShortLabel(selDocType)}
+            </button>
+            <button
+              type="button"
+              onClick={() => setDeliveryNoteMode(true)}
+              className={`inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-md transition-colors ${
+                deliveryNoteMode
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <ClipboardList className="w-3.5 h-3.5" />
+              Dodací list (bez cen)
+            </button>
+          </div>
+
+          {!deliveryNoteMode && selectedInvoice.status !== 'CANCELLED' && (
             <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-xs font-medium text-slate-500 mr-1">Šablona:</span>
               {INVOICE_TEMPLATES.map((t) => (
                 <button
                   key={t.id}
@@ -837,15 +1529,17 @@ export function InvoicesView({
                 </button>
               ))}
             </div>
-          </div>
-        )}
+          )}
+        </div>
 
         <InvoiceDocumentPreview
           invoice={selectedInvoice}
           company={activeCompany}
           palette={palette}
           vatPayer={isVatPayer}
+          deliveryNoteMode={deliveryNoteMode}
         />
+        {deleteConfirmModal}
       </div>
     );
   }
@@ -853,6 +1547,9 @@ export function InvoicesView({
   // CREATE / EDIT VIEW
   if (mode === 'CREATE' || mode === 'EDIT') {
     const isEditing = mode === 'EDIT' && editingInvoice !== null;
+    const fxNum = currency === 'CZK' ? 1 : Number(exchangeRate.replace(',', '.')) || 0;
+    const isNonStockDoc = documentType === 'QUOTE' || documentType === 'PROFORMA';
+
     return (
       <form onSubmit={handleIssueInvoice} className="space-y-6">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -875,7 +1572,9 @@ export function InvoicesView({
             </button>
             <div>
               <h1 className="text-xl font-bold text-slate-900">
-                {isEditing ? `Úprava faktury ${editingInvoice.invoiceNumber}` : 'Nová faktura'}
+                {isEditing
+                  ? `Úprava dokladu ${editingInvoice.invoiceNumber}`
+                  : `Nový doklad · ${getDocumentTypeShortLabel(documentType)}`}
               </h1>
               <p className="text-xs text-slate-500">
                 {isEditing
@@ -892,17 +1591,56 @@ export function InvoicesView({
             className="inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-medium text-white rounded-lg hover:opacity-95 disabled:opacity-60"
           >
             {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <FilePlus2 className="w-4 h-4" />}
-            {isEditing ? 'Uložit změny' : 'Vystavit fakturu'} · {formatCzk(draftTotals.totalWithVat)}
+            {isEditing ? 'Uložit změny' : `Vystavit (${getDocumentTypeShortLabel(documentType)})`} ·{' '}
+            {formatCzk(
+              (documentType === 'CREDIT_NOTE' ? -1 : 1) * draftTotals.totalWithVat,
+              currency
+            )}
           </button>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* Document metadata */}
           <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-4">
-            <h2 className="text-sm font-semibold text-slate-900">Údaje dokladu</h2>
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-sm font-semibold text-slate-900">Údaje dokladu</h2>
+              {relatedInvoiceNumber && (
+                <span className="text-[11px] font-mono text-slate-600 bg-slate-100 px-2 py-0.5 rounded">
+                  K dokladu {relatedInvoiceNumber}
+                </span>
+              )}
+            </div>
+
             <div className="grid grid-cols-2 gap-3">
+              <div className="col-span-2">
+                <label className="block text-xs font-medium text-slate-700 mb-1">Typ dokladu</label>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                  {(
+                    [
+                      ['INVOICE', 'Faktura'],
+                      ['PROFORMA', 'Záloha'],
+                      ['QUOTE', 'Nabídka'],
+                      ['CREDIT_NOTE', 'Dobropis'],
+                    ] as [InvoiceDocumentType, string][]
+                  ).map(([tId, tLabel]) => (
+                    <button
+                      key={tId}
+                      type="button"
+                      onClick={() => handleDocumentTypeChange(tId)}
+                      className={`px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
+                        documentType === tId
+                          ? 'bg-slate-900 border-slate-900 text-white'
+                          : 'bg-white border-slate-200 text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      {tLabel}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">Číslo faktury *</label>
+                <label className="block text-xs font-medium text-slate-700 mb-1">Číslo dokladu *</label>
                 <input
                   type="text"
                   required
@@ -937,7 +1675,9 @@ export function InvoicesView({
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">Datum splatnosti</label>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  {documentType === 'QUOTE' ? 'Platnost nabídky do' : 'Datum splatnosti'}
+                </label>
                 <input
                   type="date"
                   value={dueDate}
@@ -966,6 +1706,73 @@ export function InvoicesView({
                   <option value="CARD">Platební karta</option>
                 </select>
               </div>
+
+              {/* Currency + ČNB Exchange Rate */}
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">Měna dokladu</label>
+                <div className="relative">
+                  <Globe className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <select
+                    value={currency}
+                    onChange={(e) => handleCurrencyChange(e.target.value)}
+                    className="w-full pl-8 pr-3 py-2 text-sm font-medium border border-slate-200 rounded-lg bg-white"
+                  >
+                    {SUPPORTED_CURRENCIES.map((c) => (
+                      <option key={c} value={c}>
+                        {c}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  Opakovaná fakturace
+                </label>
+                <select
+                  value={recurringInterval}
+                  onChange={(e) => setRecurringInterval(e.target.value as RecurringInterval)}
+                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg bg-white"
+                >
+                  <option value="NONE">Jednorázová</option>
+                  <option value="MONTHLY">Měsíčně</option>
+                  <option value="QUARTERLY">Čtvrtletně</option>
+                  <option value="YEARLY">Ročně</option>
+                </select>
+              </div>
+
+              {currency !== 'CZK' && (
+                <div className="col-span-2 bg-slate-50 border border-slate-200 rounded-lg p-3 flex flex-wrap items-end gap-2">
+                  <div className="flex-1 min-w-[140px]">
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Kurz (1 {currency} = Kč){cnbDate ? ` · ČNB ${cnbDate}` : ''}
+                    </label>
+                    <input
+                      type="number"
+                      step="any"
+                      min="0.0001"
+                      value={exchangeRate}
+                      onChange={(e) => setExchangeRate(e.target.value)}
+                      className="w-full px-3 py-1.5 text-sm font-mono border border-slate-200 rounded-lg bg-white tabular-nums"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    disabled={cnbBusy}
+                    onClick={() => fetchCnbRate(currency)}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-800 bg-white border border-slate-200 hover:bg-slate-100 rounded-lg whitespace-nowrap"
+                  >
+                    {cnbBusy ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="w-3.5 h-3.5" />
+                    )}
+                    Načíst kurz ČNB
+                  </button>
+                </div>
+              )}
+
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1">Šablona PDF</label>
                 <select
@@ -980,17 +1787,74 @@ export function InvoicesView({
                   ))}
                 </select>
               </div>
-              <div className="flex items-end">
-                <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 pb-2 cursor-pointer">
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  Vázaný doklad č.
+                </label>
+                <input
+                  type="text"
+                  value={relatedInvoiceNumber}
+                  onChange={(e) => setRelatedInvoiceNumber(e.target.value)}
+                  placeholder="Volitelné (např. ZAL / původní FA)"
+                  className="w-full px-3 py-2 text-sm font-mono border border-slate-200 rounded-lg"
+                />
+              </div>
+
+              <div className="col-span-2 flex flex-wrap items-center gap-x-6 gap-y-2 pt-1">
+                <label
+                  className={`inline-flex items-center gap-2 text-xs font-medium cursor-pointer ${
+                    isNonStockDoc ? 'text-slate-400' : 'text-slate-700'
+                  }`}
+                >
                   <input
                     type="checkbox"
-                    checked={deductFromStock}
+                    disabled={isNonStockDoc}
+                    checked={isNonStockDoc ? false : deductFromStock}
                     onChange={(e) => setDeductFromStock(e.target.checked)}
                     className="rounded border-slate-300"
                   />
-                  Automaticky odepsat ze skladu
+                  {documentType === 'CREDIT_NOTE'
+                    ? 'Vrátit zboží zpět na sklad'
+                    : isNonStockDoc
+                      ? 'Nabídky a zálohy neodepisují sklad'
+                      : 'Automaticky odepsat ze skladu'}
                 </label>
+
+                {activeCompany?.vatPayer && (
+                  <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={reverseCharge}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setReverseCharge(checked);
+                        if (checked && !legalNotice.trim()) {
+                          setLegalNotice(REVERSE_CHARGE_LEGAL_TEXT);
+                        } else if (!checked && legalNotice === REVERSE_CHARGE_LEGAL_TEXT) {
+                          setLegalNotice('');
+                        }
+                      }}
+                      className="rounded border-slate-300"
+                    />
+                    Přenesená daňová povinnost (Reverse Charge)
+                  </label>
+                )}
               </div>
+
+              {reverseCharge && (
+                <div className="col-span-2">
+                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                    Zákonná doložka na dokladu
+                  </label>
+                  <input
+                    type="text"
+                    value={legalNotice}
+                    onChange={(e) => setLegalNotice(e.target.value)}
+                    className="w-full px-3 py-2 text-xs border border-slate-200 rounded-lg bg-slate-50"
+                  />
+                </div>
+              )}
             </div>
           </div>
 
@@ -1061,6 +1925,19 @@ export function InvoicesView({
               </div>
 
               <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  E-mail odběratele
+                </label>
+                <input
+                  type="email"
+                  value={clientEmail}
+                  onChange={(e) => setClientEmail(e.target.value)}
+                  placeholder="fakturace@klient.cz"
+                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                />
+              </div>
+
+              <div className="col-span-2">
                 <label className="block text-xs font-medium text-slate-700 mb-1">Ulice</label>
                 <input
                   type="text"
@@ -1153,7 +2030,7 @@ export function InvoicesView({
                   <th className="py-2 px-2 w-20">MJ</th>
                   <th className="py-2 px-2 w-32 text-right">Cena bez DPH</th>
                   <th className="py-2 px-2 w-20 text-right">Sleva %</th>
-                  {activeCompany?.vatPayer && <th className="py-2 px-2 w-20">DPH</th>}
+                  {effectiveDraftVatPayer && <th className="py-2 px-2 w-20">DPH</th>}
                   <th className="py-2 pl-2 w-32 text-right">Celkem</th>
                   <th className="py-2 pl-2 w-8"></th>
                 </tr>
@@ -1219,7 +2096,7 @@ export function InvoicesView({
                         className="w-16 px-2 py-1.5 text-sm text-right border border-slate-200 rounded-md tabular-nums"
                       />
                     </td>
-                    {activeCompany?.vatPayer && (
+                    {effectiveDraftVatPayer && (
                       <td className="py-2 px-2">
                         <select
                           value={line.vatRate}
@@ -1234,9 +2111,10 @@ export function InvoicesView({
                     )}
                     <td className="py-2 pl-2 text-right font-semibold tabular-nums whitespace-nowrap">
                       {formatCzk(
-                        activeCompany?.vatPayer
+                        effectiveDraftVatPayer
                           ? lineTotalWithVat(line, true)
-                          : lineTotalWithoutVat(line)
+                          : lineTotalWithoutVat(line),
+                        currency
                       )}
                     </td>
                     <td className="py-2 pl-2 text-right">
@@ -1258,7 +2136,7 @@ export function InvoicesView({
 
           <div className="pt-4 border-t border-slate-100 flex flex-col sm:flex-row justify-between gap-4">
             <div className="flex-1 max-w-md">
-              <label className="block text-xs font-medium text-slate-700 mb-1">Poznámka na faktuře</label>
+              <label className="block text-xs font-medium text-slate-700 mb-1">Poznámka na dokladu</label>
               <input
                 type="text"
                 value={note}
@@ -1268,21 +2146,34 @@ export function InvoicesView({
               />
             </div>
 
-            <div className="sm:w-64 space-y-1 text-sm tabular-nums">
+            <div className="sm:w-72 space-y-1 text-sm tabular-nums">
               <div className="flex justify-between text-slate-600">
                 <span>Celkem bez DPH</span>
-                <span>{formatCzk(draftTotals.totalWithoutVat)}</span>
+                <span>{formatCzk(draftTotals.totalWithoutVat, currency)}</span>
               </div>
-              {activeCompany?.vatPayer && (
+              {effectiveDraftVatPayer && (
                 <div className="flex justify-between text-slate-600">
                   <span>DPH</span>
-                  <span>{formatCzk(draftTotals.totalVat)}</span>
+                  <span>{formatCzk(draftTotals.totalVat, currency)}</span>
                 </div>
               )}
               <div className="flex justify-between text-base font-bold text-slate-900 pt-1.5 border-t border-slate-200">
-                <span>Celkem k úhradě</span>
-                <span>{formatCzk(draftTotals.totalWithVat)}</span>
+                <span>
+                  {documentType === 'CREDIT_NOTE' ? 'Celkem k vrácení' : 'Celkem k úhradě'}
+                </span>
+                <span>
+                  {formatCzk(
+                    (documentType === 'CREDIT_NOTE' ? -1 : 1) * draftTotals.totalWithVat,
+                    currency
+                  )}
+                </span>
               </div>
+              {currency !== 'CZK' && fxNum > 0 && (
+                <div className="flex justify-between text-xs text-slate-500 pt-1">
+                  <span>Přepočet CZK (kurz {fxNum})</span>
+                  <span>{formatCzk(round2(draftTotals.totalWithVat * fxNum), 'CZK')}</span>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -1307,15 +2198,31 @@ export function InvoicesView({
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={() => startNewInvoice()}
-          style={{ backgroundColor: palette.primary }}
-          className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white rounded-lg hover:opacity-95 self-start md:self-auto whitespace-nowrap"
-        >
-          <FilePlus2 className="w-4 h-4" />
-          Nová faktura
-        </button>
+        <div className="flex flex-wrap items-center gap-2 self-start md:self-auto">
+          <button
+            type="button"
+            onClick={() => startNewInvoice(null, 'QUOTE')}
+            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg whitespace-nowrap"
+          >
+            + Nabídka
+          </button>
+          <button
+            type="button"
+            onClick={() => startNewInvoice(null, 'PROFORMA')}
+            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg whitespace-nowrap"
+          >
+            + Záloha
+          </button>
+          <button
+            type="button"
+            onClick={() => startNewInvoice(null, 'INVOICE')}
+            style={{ backgroundColor: palette.primary }}
+            className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white rounded-lg hover:opacity-95 whitespace-nowrap"
+          >
+            <FilePlus2 className="w-4 h-4" />
+            Nová faktura
+          </button>
+        </div>
       </div>
 
       {/* Filters */}
@@ -1327,6 +2234,8 @@ export function InvoicesView({
               ['ISSUED', 'Neuhrazené'],
               ['OVERDUE', 'Po splatnosti'],
               ['PAID', 'Uhrazené'],
+              ['NON_TAX', 'Nabídky / Zálohy / Dobropisy'],
+              ['RECURRING', 'Opakované'],
               ['CANCELLED', 'Stornované'],
             ] as [StatusFilter, string][]
           ).map(([id, label]) => (
@@ -1362,9 +2271,9 @@ export function InvoicesView({
         {filteredInvoices.length === 0 ? (
           <div className="p-12 text-center">
             <FileText className="w-8 h-8 text-slate-300 mx-auto" />
-            <p className="mt-3 text-sm font-medium text-slate-900">Žádné faktury</p>
+            <p className="mt-3 text-sm font-medium text-slate-900">Žádné doklady</p>
             <p className="mt-1 text-xs text-slate-500">
-              Vystavte první fakturu s QR platbou a automatickým odpisem ze skladu.
+              Vystavte fakturu, zálohu nebo cenovou nabídku s QR platbou a automatickým skladem.
             </p>
           </div>
         ) : (
@@ -1372,7 +2281,7 @@ export function InvoicesView({
             <table className="w-full text-left border-collapse">
               <thead>
                 <tr className="border-b border-slate-200 bg-slate-50/70 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
-                  <th className="py-3 px-4">Číslo / VS</th>
+                  <th className="py-3 px-4">Číslo / Typ</th>
                   <th className="py-3 px-4">Odběratel</th>
                   <th className="py-3 px-4">Vystaveno / Splatnost</th>
                   <th className="py-3 px-4 text-right">Částka s DPH</th>
@@ -1384,42 +2293,85 @@ export function InvoicesView({
                 {filteredInvoices.map((inv) => {
                   const overdue = isInvoiceOverdue(inv);
                   const diff = daysUntilDue(inv.dueDate);
+                  const rowDocType: InvoiceDocumentType = inv.documentType || 'INVOICE';
+                  const isRowCredit = rowDocType === 'CREDIT_NOTE';
+                  const canRowConvert =
+                    (rowDocType === 'QUOTE' || rowDocType === 'PROFORMA') &&
+                    inv.status !== 'CANCELLED';
+                  const isRowRecurring =
+                    Boolean(inv.recurringInterval) && inv.recurringInterval !== 'NONE';
                   return (
                     <tr
                       key={inv.id}
                       onClick={() => {
                         setSelectedInvoiceId(inv.id);
+                        setDeliveryNoteMode(false);
                         setMode('DETAIL');
                       }}
                       className="hover:bg-slate-50/80 cursor-pointer transition-colors"
                     >
                       <td className="py-3 px-4 font-mono tabular-nums whitespace-nowrap">
-                        <p className="font-semibold text-slate-900">{inv.invoiceNumber}</p>
-                        <p className="text-xs text-slate-500">VS {inv.variableSymbol}</p>
+                        <div className="flex items-center gap-1.5">
+                          <span className="font-semibold text-slate-900">{inv.invoiceNumber}</span>
+                          {rowDocType !== 'INVOICE' && (
+                            <span
+                              className={`font-sans text-[10px] font-semibold px-1.5 py-0.5 rounded ${
+                                rowDocType === 'CREDIT_NOTE'
+                                  ? 'bg-red-50 text-red-700'
+                                  : rowDocType === 'PROFORMA'
+                                    ? 'bg-blue-50 text-blue-700'
+                                    : 'bg-slate-100 text-slate-700'
+                              }`}
+                            >
+                              {getDocumentTypeShortLabel(rowDocType)}
+                            </span>
+                          )}
+                          {isRowRecurring && (
+                            <span className="font-sans text-[10px] font-medium px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700">
+                              {getRecurringLabel(inv.recurringInterval)}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-xs text-slate-500">
+                          VS {inv.variableSymbol}
+                          {inv.reverseCharge && ' · PDP'}
+                          {inv.currency && inv.currency !== 'CZK' && ` · ${inv.currency}`}
+                        </p>
                       </td>
                       <td className="py-3 px-4">
                         <p className="font-medium text-slate-900">{inv.clientName}</p>
                         <p className="text-xs text-slate-500 tabular-nums">
                           {inv.clientIco ? `IČO ${inv.clientIco}` : '—'}
                           {inv.exportedToPohoda && ' · POHODA ✓'}
+                          {inv.sentAt && ' · E-mail ✓'}
+                          {inv.reminderCount && inv.reminderCount > 0
+                            ? ` · ${inv.reminderCount}× upomínka`
+                            : ''}
                         </p>
                       </td>
                       <td className="py-3 px-4 text-xs text-slate-600 tabular-nums whitespace-nowrap">
                         <p>{formatDateCz(inv.issueDate)}</p>
                         <p className={overdue ? 'text-red-600 font-medium' : 'text-slate-500'}>
-                          Splatnost {formatDateCz(inv.dueDate)}
+                          {rowDocType === 'QUOTE' ? 'Platnost' : 'Splatnost'}{' '}
+                          {formatDateCz(inv.dueDate)}
                           {overdue && diff !== null && ` (${Math.abs(diff)} d)`}
                         </p>
                       </td>
-                      <td className="py-3 px-4 text-right font-semibold text-slate-900 tabular-nums whitespace-nowrap">
-                        {formatCzk(inv.totalWithVat, inv.currency)}
+                      <td
+                        className={`py-3 px-4 text-right font-semibold tabular-nums whitespace-nowrap ${
+                          isRowCredit ? 'text-red-700' : 'text-slate-900'
+                        }`}
+                      >
+                        {formatCzk((isRowCredit ? -1 : 1) * inv.totalWithVat, inv.currency)}
                       </td>
                       <td className="py-3 px-4 text-xs font-medium whitespace-nowrap">
                         {inv.status === 'PAID' ? (
-                          <span className="text-emerald-700">Uhrazeno</span>
+                          <span className="text-emerald-700">
+                            {isRowCredit ? 'Vypořádáno' : 'Uhrazeno'}
+                          </span>
                         ) : inv.status === 'CANCELLED' ? (
                           <span className="text-slate-400">Stornováno</span>
-                        ) : overdue ? (
+                        ) : overdue && rowDocType !== 'QUOTE' ? (
                           <span className="text-red-600">Po splatnosti</span>
                         ) : (
                           <span className="text-amber-700">Vystaveno</span>
@@ -1430,11 +2382,41 @@ export function InvoicesView({
                         onClick={(e) => e.stopPropagation()}
                       >
                         <div className="inline-flex items-center gap-1">
+                          {canRowConvert && (
+                            <button
+                              type="button"
+                              onClick={() => startConvertToInvoice(inv)}
+                              title="Převést na ostrou fakturu"
+                              className="p-1.5 text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded-md"
+                            >
+                              <ArrowRightLeft className="w-4 h-4" />
+                            </button>
+                          )}
+                          {isRowRecurring && inv.status !== 'CANCELLED' && (
+                            <button
+                              type="button"
+                              onClick={() => startNextRecurringPeriod(inv)}
+                              title="Vystavit fakturu pro další období"
+                              className="p-1.5 text-emerald-600 hover:text-emerald-800 hover:bg-emerald-50 rounded-md"
+                            >
+                              <CalendarClock className="w-4 h-4" />
+                            </button>
+                          )}
+                          {overdue && rowDocType !== 'QUOTE' && (
+                            <button
+                              type="button"
+                              onClick={() => handleSendEmail(inv, true)}
+                              title="Odeslat upomínku e-mailem"
+                              className="p-1.5 text-amber-600 hover:text-amber-800 hover:bg-amber-50 rounded-md"
+                            >
+                              <BellRing className="w-4 h-4" />
+                            </button>
+                          )}
                           {inv.status !== 'CANCELLED' && (
                             <button
                               type="button"
                               onClick={() => startEditInvoice(inv)}
-                              title="Upravit fakturu"
+                              title="Upravit doklad"
                               className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md"
                             >
                               <Edit3 className="w-4 h-4" />
@@ -1443,11 +2425,21 @@ export function InvoicesView({
                           <button
                             type="button"
                             onClick={() => startDuplicateInvoice(inv)}
-                            title="Duplikovat fakturu"
+                            title="Duplikovat doklad"
                             className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md"
                           >
                             <Copy className="w-4 h-4" />
                           </button>
+                          {inv.status === 'CANCELLED' && isCurrentUserAdmin && (
+                            <button
+                              type="button"
+                              onClick={() => setDeleteConfirmInvoice(inv)}
+                              title="Trvale smazat stornovanou fakturu"
+                              className="p-1.5 text-red-500 hover:text-red-700 hover:bg-red-50 rounded-md"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          )}
                         </div>
                       </td>
                     </tr>
@@ -1458,6 +2450,7 @@ export function InvoicesView({
           </div>
         )}
       </div>
+      {deleteConfirmModal}
     </div>
   );
 }

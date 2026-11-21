@@ -2,6 +2,7 @@ import React, { useMemo, useState } from 'react';
 import {
   ArrowDownLeft,
   ArrowUpRight,
+  ClipboardCheck,
   Copy,
   Download,
   Edit3,
@@ -17,6 +18,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
+import { InventoryAuditPanel } from './InventoryAuditPanel';
 import { InventoryBulkModals, type BulkActionModalType } from './InventoryBulkModals';
 import { useApp } from '../context/AppContext';
 import {
@@ -40,7 +42,7 @@ interface InventoryViewProps {
   onNavigate: (section: AppSection) => void;
 }
 
-type InventoryTab = 'ITEMS' | 'MOVEMENTS';
+type InventoryTab = 'ITEMS' | 'MOVEMENTS' | 'AUDIT';
 
 interface ItemFormState {
   id?: string;
@@ -399,6 +401,18 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
               <History className="w-3.5 h-3.5" />
               Deník pohybů ({filteredMovements.length})
             </button>
+            <button
+              type="button"
+              onClick={() => setTab('AUDIT')}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+                tab === 'AUDIT'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <ClipboardCheck className="w-3.5 h-3.5" />
+              Inventura
+            </button>
           </div>
 
           <div className="flex flex-wrap items-center gap-2 flex-1 lg:justify-end">
@@ -722,6 +736,15 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
           )}
           </div>
         </div>
+      ) : tab === 'AUDIT' && workspace ? (
+        <InventoryAuditPanel
+          items={filteredItems}
+          warehouses={accessibleWarehouses}
+          workspace={workspace}
+          activeCompanyId={activeCompany?.id || 'company_1'}
+          accentColor={palette.primary}
+          onNotify={notify}
+        />
       ) : (
         <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
           {filteredMovements.length === 0 ? (

@@ -141,6 +141,9 @@ export interface InvoiceLineItem {
   discountPercent: number;
 }
 
+export type InvoiceDocumentType = 'INVOICE' | 'PROFORMA' | 'QUOTE' | 'CREDIT_NOTE';
+export type RecurringInterval = 'NONE' | 'MONTHLY' | 'QUARTERLY' | 'YEARLY';
+
 export interface Invoice {
   id: string;
   workspaceId: string;
@@ -154,6 +157,13 @@ export interface Invoice {
   companyIban: string;
   invoiceNumber: string;
   variableSymbol: string;
+  documentType?: InvoiceDocumentType;
+  reverseCharge?: boolean;
+  relatedInvoiceNumber?: string;
+  recurringInterval?: RecurringInterval;
+  reminderCount?: number;
+  lastReminderDate?: string;
+  clientEmail?: string;
   issueDate: string;
   taxDate: string;
   dueDate: string;
@@ -167,6 +177,9 @@ export interface Invoice {
   clientCity: string;
   clientZip: string;
   currency: string;
+  exchangeRate?: number;
+  legalNotice?: string;
+  sentAt?: string;
   totalWithoutVat: number;
   totalVat: number;
   totalWithVat: number;
@@ -290,5 +303,6 @@ export type AppSection =
   | 'invoices'
   | 'bank-matching'
   | 'clients'
+  | 'reports'
   | 'alerts'
   | 'settings';

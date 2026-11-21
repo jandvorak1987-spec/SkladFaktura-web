@@ -19,10 +19,12 @@ import type {
   ExtractedLineItem,
   InventoryItem,
   Invoice,
+  InvoiceDocumentType,
   InvoiceLineItem,
   InvoiceTemplateId,
   ParsedBankTx,
   PaymentMethod,
+  RecurringInterval,
   TeamMember,
   Workspace,
 } from '../types';
@@ -1042,6 +1044,66 @@ export async function bulkDeleteInventoryItems(
   return itemIds.length;
 }
 
+export async function commitInventoryAudit(params: {
+  workspace: Workspace;
+  activeCompanyId: string;
+  adjustments: Array<{ item: InventoryItem; countedQty: number }>;
+  documentRef?: string;
+}): Promise<number> {
+  const { workspace, activeCompanyId, adjustments, documentRef } = params;
+  const diffs = adjustments
+    .map((a) => ({
+      item: a.item,
+      countedQty: round2(a.countedQty),
+      delta: round2(a.countedQty - a.item.quantity),
+    }))
+    .filter((d) => d.delta !== 0);
+
+  if (diffs.length === 0) return 0;
+
+  const root = wsRoot(workspace.id);
+  const docLabel = (documentRef || `Inventura ${toIsoDate()}`).slice(0, 100);
+
+  for (let i = 0; i < diffs.length; i += 180) {
+    const chunk = diffs.slice(i, i + 180);
+    const batch = writeBatch(db);
+
+    for (const { item, countedQty, delta } of chunk) {
+      batch.update(doc(root, 'inventory', item.id), {
+        quantity: countedQty,
+        updatedAt: serverTimestamp(),
+      });
+      batch.set(doc(collection(root, 'stockMovements')), {
+        workspaceId: workspace.id,
+        memberEmails: workspace.memberEmails,
+        itemId: item.id,
+        itemName: item.name.slice(0, 200),
+        itemSku: item.sku.slice(0, 64),
+        warehouseId: item.warehouseId || 'shared_main',
+        companyId: activeCompanyId || 'company_1',
+        movementType: delta > 0 ? 'RECEIPT' : 'ISSUE',
+        quantityDelta: delta,
+        unit: (item.unit || 'ks').slice(0, 20),
+        unitPrice: Math.max(0, round2(item.purchasePrice)),
+        documentRef: docLabel,
+        note: `Inventurní ${delta > 0 ? 'přebytek' : 'manko'} (${item.quantity} → ${countedQty})`.slice(
+          0,
+          300
+        ),
+        createdAt: serverTimestamp(),
+      });
+    }
+
+    try {
+      await batch.commit();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `workspaces/${workspace.id}/inventory`);
+    }
+  }
+
+  return diffs.length;
+}
+
 /**
  * Bulk stock-in commit for Smart Stock In (AI Příjemka / CSV Import).
  */
@@ -1226,6 +1288,14 @@ export interface CreateInvoicePayload {
   company: Company;
   invoiceNumber: string;
   variableSymbol: string;
+  documentType?: InvoiceDocumentType;
+  reverseCharge?: boolean;
+  relatedInvoiceNumber?: string;
+  recurringInterval?: RecurringInterval;
+  clientEmail?: string;
+  currency?: string;
+  exchangeRate?: number;
+  legalNotice?: string;
   issueDate: string;
   taxDate: string;
   dueDate: string;
@@ -1250,6 +1320,13 @@ export async function issueInvoice(params: {
 }): Promise<string> {
   const { workspace, inventory, payload } = params;
   const { company } = payload;
+  const docType: InvoiceDocumentType = payload.documentType || 'INVOICE';
+  const isReverseCharge = Boolean(payload.reverseCharge);
+  const currency = (payload.currency || 'CZK').trim().toUpperCase().slice(0, 3) || 'CZK';
+  const exchangeRate =
+    currency === 'CZK' ? 1 : Math.max(0.0001, Math.round(Number(payload.exchangeRate || 1) * 10000) / 10000);
+  const effectiveVatPayer = company.vatPayer && !isReverseCharge && docType !== 'QUOTE';
+
   const cleanItems = payload.items
     .filter((i) => i.name.trim().length > 0 && i.quantity > 0)
     .slice(0, 100)
@@ -1261,19 +1338,33 @@ export async function issueInvoice(params: {
       quantity: round2(i.quantity),
       unit: (i.unit || 'ks').trim().slice(0, 20),
       unitPrice: Math.max(0, round2(i.unitPrice)),
-      vatRate: i.vatRate === 0 || i.vatRate === 12 || i.vatRate === 21 ? i.vatRate : 21,
+      vatRate: isReverseCharge
+        ? 0
+        : i.vatRate === 0 || i.vatRate === 12 || i.vatRate === 21
+          ? i.vatRate
+          : 21,
       discountPercent: Math.min(100, Math.max(0, round2(i.discountPercent || 0))),
     }));
 
   if (cleanItems.length === 0) {
-    throw new Error('Faktura musí obsahovat alespoň jednu položku.');
+    throw new Error('Doklad musí obsahovat alespoň jednu položku.');
   }
 
-  const totals = calculateInvoiceTotals(cleanItems, company.vatPayer);
+  const totals = calculateInvoiceTotals(cleanItems, effectiveVatPayer);
   const root = wsRoot(workspace.id);
   const invRef = doc(collection(root, 'invoices'));
   const invNum = payload.invoiceNumber.trim().slice(0, 40);
   const vs = (payload.variableSymbol.trim() || invNum.replace(/\D/g, '')).slice(0, 20);
+  const legalNotice = (
+    payload.legalNotice ??
+    (isReverseCharge
+      ? 'Daň odvede zákazník (režim přenesené daňové povinnosti dle § 92a zákona o DPH / čl. 196 směrnice EU).'
+      : '')
+  )
+    .trim()
+    .slice(0, 400);
+
+  const shouldMoveStock = Boolean(payload.deductFromStock) && docType !== 'QUOTE' && docType !== 'PROFORMA';
 
   const batch = writeBatch(db);
   batch.set(invRef, {
@@ -1291,6 +1382,13 @@ export async function issueInvoice(params: {
       .slice(0, 40),
     invoiceNumber: invNum,
     variableSymbol: vs,
+    documentType: docType,
+    reverseCharge: isReverseCharge,
+    relatedInvoiceNumber: (payload.relatedInvoiceNumber || '').trim().slice(0, 40),
+    recurringInterval: payload.recurringInterval || 'NONE',
+    reminderCount: 0,
+    lastReminderDate: '',
+    clientEmail: (payload.clientEmail || '').trim().slice(0, 160),
     issueDate: payload.issueDate.slice(0, 20),
     taxDate: payload.taxDate.slice(0, 20),
     dueDate: payload.dueDate.slice(0, 20),
@@ -1303,7 +1401,10 @@ export async function issueInvoice(params: {
     clientStreet: payload.clientStreet.trim().slice(0, 200),
     clientCity: payload.clientCity.trim().slice(0, 120),
     clientZip: payload.clientZip.trim().slice(0, 20),
-    currency: 'CZK',
+    currency,
+    exchangeRate,
+    legalNotice,
+    sentAt: '',
     totalWithoutVat: totals.totalWithoutVat,
     totalVat: totals.totalVat,
     totalWithVat: totals.totalWithVat,
@@ -1311,7 +1412,7 @@ export async function issueInvoice(params: {
     paidDate: '',
     matchedTransactionId: '',
     note: payload.note.trim().slice(0, 500),
-    deductedFromStock: Boolean(payload.deductFromStock),
+    deductedFromStock: shouldMoveStock,
     exportedToPohoda: false,
     invoiceTemplate: payload.invoiceTemplate || company.invoiceTemplate || 'CLASSIC',
     items: cleanItems,
@@ -1319,30 +1420,34 @@ export async function issueInvoice(params: {
     updatedAt: serverTimestamp(),
   });
 
-  // Increment company nextInvoiceNumber atomically
-  batch.update(doc(root, 'companies', company.id), {
-    nextInvoiceNumber: Math.max(1, Math.floor((company.nextInvoiceNumber || 1) + 1)),
-    updatedAt: serverTimestamp(),
-  });
+  // Increment company nextInvoiceNumber atomically only for standard tax invoices
+  if (docType === 'INVOICE') {
+    batch.update(doc(root, 'companies', company.id), {
+      nextInvoiceNumber: Math.max(1, Math.floor((company.nextInvoiceNumber || 1) + 1)),
+      updatedAt: serverTimestamp(),
+    });
+  }
 
-  // Deduct stock atomically
-  if (payload.deductFromStock) {
+  // Deduct stock (INVOICE) or return stock (CREDIT_NOTE) atomically
+  if (shouldMoveStock) {
+    const isCreditNote = docType === 'CREDIT_NOTE';
     const invMap = new Map(inventory.map((i) => [i.id, i]));
-    const deductions = new Map<string, number>();
+    const quantities = new Map<string, number>();
     for (const line of cleanItems) {
       if (line.inventoryItemId && invMap.has(line.inventoryItemId)) {
-        deductions.set(
+        quantities.set(
           line.inventoryItemId,
-          (deductions.get(line.inventoryItemId) || 0) + line.quantity
+          (quantities.get(line.inventoryItemId) || 0) + line.quantity
         );
       }
     }
 
-    for (const [itemId, qty] of deductions.entries()) {
+    for (const [itemId, qty] of quantities.entries()) {
       const stockItem = invMap.get(itemId);
       if (!stockItem) continue;
+      const delta = isCreditNote ? round2(qty) : -round2(qty);
       batch.update(doc(root, 'inventory', itemId), {
-        quantity: round2(stockItem.quantity - qty),
+        quantity: round2(stockItem.quantity + delta),
         updatedAt: serverTimestamp(),
       });
       batch.set(doc(collection(root, 'stockMovements')), {
@@ -1353,12 +1458,15 @@ export async function issueInvoice(params: {
         itemSku: stockItem.sku.slice(0, 64),
         warehouseId: stockItem.warehouseId || 'shared_main',
         companyId: company.id,
-        movementType: 'ISSUE',
-        quantityDelta: -round2(qty),
+        movementType: isCreditNote ? 'RECEIPT' : 'ISSUE',
+        quantityDelta: delta,
         unit: stockItem.unit.slice(0, 20),
         unitPrice: stockItem.salePrice,
-        documentRef: `FA ${invNum}`.slice(0, 100),
-        note: `Výdej k faktuře pro ${payload.clientName}`.slice(0, 300),
+        documentRef: `${isCreditNote ? 'DOB' : 'FA'} ${invNum}`.slice(0, 100),
+        note: `${isCreditNote ? 'Vratka z dobropisu' : 'Výdej k faktuře'} pro ${payload.clientName}`.slice(
+          0,
+          300
+        ),
         createdAt: serverTimestamp(),
       });
     }
@@ -1470,9 +1578,39 @@ export async function editInvoice(params: {
     }
   };
 
+  const docType: InvoiceDocumentType =
+    payload.documentType || originalInvoice.documentType || 'INVOICE';
+  const isReverseCharge = Boolean(payload.reverseCharge);
+  const currency =
+    (payload.currency || originalInvoice.currency || 'CZK').trim().toUpperCase().slice(0, 3) || 'CZK';
+  const exchangeRate =
+    currency === 'CZK'
+      ? 1
+      : Math.max(0.0001, Math.round(Number(payload.exchangeRate || 1) * 10000) / 10000);
+  const effectiveVatPayer = company.vatPayer && !isReverseCharge && docType !== 'QUOTE';
+  const recomputedTotals = calculateInvoiceTotals(cleanItems, effectiveVatPayer);
+  const legalNotice = (
+    payload.legalNotice ??
+    (isReverseCharge
+      ? 'Daň odvede zákazník (režim přenesené daňové povinnosti dle § 92a zákona o DPH / čl. 196 směrnice EU).'
+      : '')
+  )
+    .trim()
+    .slice(0, 400);
+
   const editableFields = {
     invoiceNumber: invNum,
     variableSymbol: vs,
+    documentType: docType,
+    reverseCharge: isReverseCharge,
+    relatedInvoiceNumber: (payload.relatedInvoiceNumber ?? originalInvoice.relatedInvoiceNumber ?? '')
+      .trim()
+      .slice(0, 40),
+    recurringInterval: payload.recurringInterval ?? originalInvoice.recurringInterval ?? 'NONE',
+    clientEmail: (payload.clientEmail ?? originalInvoice.clientEmail ?? '').trim().slice(0, 160),
+    currency,
+    exchangeRate,
+    legalNotice,
     issueDate: payload.issueDate.slice(0, 20),
     taxDate: payload.taxDate.slice(0, 20),
     dueDate: payload.dueDate.slice(0, 20),
@@ -1484,9 +1622,9 @@ export async function editInvoice(params: {
     clientStreet: payload.clientStreet.trim().slice(0, 200),
     clientCity: payload.clientCity.trim().slice(0, 120),
     clientZip: payload.clientZip.trim().slice(0, 20),
-    totalWithoutVat: totals.totalWithoutVat,
-    totalVat: totals.totalVat,
-    totalWithVat: totals.totalWithVat,
+    totalWithoutVat: recomputedTotals.totalWithoutVat,
+    totalVat: recomputedTotals.totalVat,
+    totalWithVat: recomputedTotals.totalWithVat,
     note: payload.note.trim().slice(0, 500),
     deductedFromStock: Boolean(payload.deductFromStock),
     invoiceTemplate: payload.invoiceTemplate || company.invoiceTemplate || 'CLASSIC',
@@ -1590,6 +1728,42 @@ export async function cancelInvoice(workspaceId: string, invoice: Invoice): Prom
     });
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+export async function deleteCancelledInvoice(workspaceId: string, invoice: Invoice): Promise<void> {
+  if (invoice.status !== 'CANCELLED') {
+    throw new Error('Trvale smazat lze pouze stornovanou fakturu.');
+  }
+  const path = `workspaces/${workspaceId}/invoices/${invoice.id}`;
+  try {
+    await deleteDoc(doc(wsRoot(workspaceId), 'invoices', invoice.id));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
+  }
+}
+
+export async function recordInvoiceEmailAction(
+  workspaceId: string,
+  invoice: Invoice,
+  isReminder: boolean
+): Promise<void> {
+  try {
+    const today = toIsoDate();
+    if (isReminder) {
+      await updateDoc(doc(wsRoot(workspaceId), 'invoices', invoice.id), {
+        reminderCount: (invoice.reminderCount || 0) + 1,
+        lastReminderDate: today,
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      await updateDoc(doc(wsRoot(workspaceId), 'invoices', invoice.id), {
+        sentAt: today,
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch {
+    // Non-blocking: live rules may restrict custom keys for non-admin updates; email client still opens cleanly
   }
 }
 

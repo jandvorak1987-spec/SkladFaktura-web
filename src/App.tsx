@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import {
+  BarChart3,
   Bell,
   FilePlus2,
   FileText,
@@ -25,6 +26,7 @@ import { InvoicesView } from './components/InvoicesView';
 import { BankMatchingView } from './components/BankMatchingView';
 import { ClientsView } from './components/ClientsView';
 import { AlertsCenterView } from './components/AlertsCenterView';
+import { ReportsVatView } from './components/ReportsVatView';
 import { SettingsExportView } from './components/SettingsExportView';
 import { getCompanyPalette } from './lib/format';
 import type { AppSection, Client } from './types';
@@ -40,6 +42,7 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'inventory', label: 'Sklad a pohyby', icon: Package },
   { id: 'smart-stock-in', label: 'AI Příjemka', icon: Sparkles },
   { id: 'invoices', label: 'Faktury', icon: FileText },
+  { id: 'reports', label: 'Přehledy a DPH', icon: BarChart3 },
   { id: 'bank-matching', label: 'Párování banky', icon: Landmark },
   { id: 'clients', label: 'Klienti (ARES)', icon: Users },
   { id: 'alerts', label: 'Upozornění', icon: Bell },
@@ -332,6 +335,7 @@ function WorkspaceShell() {
               onClearPrefillClient={() => setPrefillClient(null)}
             />
           )}
+          {section === 'reports' && <ReportsVatView />}
           {section === 'bank-matching' && <BankMatchingView />}
           {section === 'clients' && (
             <ClientsView onCreateInvoiceForClient={(c) => openNewInvoice(c)} />
