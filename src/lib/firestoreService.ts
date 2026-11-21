@@ -29,6 +29,7 @@ import type {
 import { db, handleFirestoreError, OperationType } from './firebase';
 import {
   calculateInvoiceTotals,
+  czechAccountToIban,
   formatCompanyAddress,
   hasAdminRights,
   nowSyncLabel,
@@ -452,7 +453,10 @@ export async function saveCompany(workspace: Workspace, company: Company): Promi
       zip: company.zip.trim().slice(0, 20),
       bankName: company.bankName.trim().slice(0, 80),
       bankAccount: company.bankAccount.trim().slice(0, 40),
-      iban: company.iban.replace(/\s+/g, '').toUpperCase().slice(0, 40),
+      iban: (company.iban.trim() || czechAccountToIban(company.bankAccount) || '')
+        .replace(/\s+/g, '')
+        .toUpperCase()
+        .slice(0, 40),
       bic: company.bic.trim().toUpperCase().slice(0, 20),
       fioApiToken: company.fioApiToken.trim().slice(0, 160),
       lastBankSyncAt: company.lastBankSyncAt.trim().slice(0, 40),
@@ -893,7 +897,10 @@ export async function issueInvoice(params: {
     companyDic: company.dic.slice(0, 25),
     companyAddress: formatCompanyAddress(company).slice(0, 260),
     companyBankAccount: company.bankAccount.slice(0, 40),
-    companyIban: company.iban.slice(0, 40),
+    companyIban: (company.iban.trim() || czechAccountToIban(company.bankAccount) || '')
+      .replace(/\s+/g, '')
+      .toUpperCase()
+      .slice(0, 40),
     invoiceNumber: invNum,
     variableSymbol: vs,
     issueDate: payload.issueDate.slice(0, 20),

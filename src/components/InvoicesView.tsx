@@ -28,6 +28,7 @@ import {
   addDaysIso,
   buildCzechSpdQr,
   calculateInvoiceTotals,
+  czechAccountToIban,
   daysUntilDue,
   formatCzk,
   formatDateCz,
@@ -42,6 +43,7 @@ import {
 import {
   INVOICE_TEMPLATES,
   type Client,
+  type Company,
   type CompanyBrandPalette,
   type Invoice,
   type InvoiceLineItem,
@@ -66,23 +68,37 @@ function paymentMethodLabel(method: PaymentMethod): string {
 
 function InvoiceDocumentPreview({
   invoice,
+  company,
   palette,
   vatPayer,
 }: {
   invoice: Invoice;
+  company?: Company | null;
   palette: CompanyBrandPalette;
   vatPayer: boolean;
 }) {
   const template: InvoiceTemplateId = invoice.invoiceTemplate || 'CLASSIC';
   const totals = calculateInvoiceTotals(invoice.items, vatPayer);
+  const resolvedBankAccount = invoice.companyBankAccount || company?.bankAccount || '';
+  const resolvedIban = (
+    invoice.companyIban ||
+    company?.iban ||
+    (resolvedBankAccount ? czechAccountToIban(resolvedBankAccount) : '') ||
+    ''
+  )
+    .replace(/\s+/g, '')
+    .toUpperCase();
+
+  const isCashPayment = invoice.paymentMethod === 'CASH';
   const spdPayload =
-    invoice.paymentMethod === 'BANK_TRANSFER' && invoice.companyIban
+    !isCashPayment && resolvedIban
       ? buildCzechSpdQr({
-          iban: invoice.companyIban,
+          iban: resolvedIban,
           amount: Math.max(0, invoice.totalWithVat - invoice.paidAmount) || invoice.totalWithVat,
-          variableSymbol: invoice.variableSymbol,
+          variableSymbol: invoice.variableSymbol || invoice.invoiceNumber.replace(/\D/g, ''),
           message: `Faktura ${invoice.invoiceNumber}`,
           dueDate: invoice.dueDate,
+          currency: invoice.currency || 'CZK',
         })
       : null;
 
@@ -212,7 +228,7 @@ function InvoiceDocumentPreview({
           <div>
             <p className="text-slate-500">Bankovní účet</p>
             <p className="font-mono font-semibold text-slate-900 mt-0.5">
-              {invoice.companyBankAccount || '—'}
+              {resolvedBankAccount || '—'}
             </p>
           </div>
           <div>
@@ -221,23 +237,30 @@ function InvoiceDocumentPreview({
               {invoice.variableSymbol || '—'}
             </p>
           </div>
-          {invoice.companyIban && (
+          {resolvedIban && (
             <div className="col-span-2 sm:col-span-3">
               <p className="text-slate-500">IBAN</p>
-              <p className="font-mono text-slate-800 mt-0.5">{invoice.companyIban}</p>
+              <p className="font-mono text-slate-800 mt-0.5">{resolvedIban}</p>
             </div>
           )}
         </div>
 
-        {spdPayload && (
+        {spdPayload ? (
           <div className="flex items-center gap-3 bg-white p-2.5 rounded-lg border border-slate-200 self-start sm:self-auto shrink-0">
-            <QRCodeSVG value={spdPayload} size={84} level="M" />
+            <QRCodeSVG value={spdPayload} size={92} level="M" />
             <div className="text-[11px] text-slate-600 leading-tight">
               <p className="font-semibold text-slate-900">QR Platba</p>
               <p className="mt-0.5">Naskenujte v</p>
               <p>mobilní bance</p>
             </div>
           </div>
+        ) : (
+          !isCashPayment && (
+            <div className="no-print text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 max-w-[220px]">
+              Pro zobrazení <strong>QR Platby</strong> doplňte v <em>Nastavení → Firemní údaje</em>{' '}
+              číslo účtu (např. <span className="font-mono">123456789/2010</span>) nebo IBAN.
+            </div>
+          )
         )}
       </div>
 
@@ -819,6 +842,7 @@ export function InvoicesView({
 
         <InvoiceDocumentPreview
           invoice={selectedInvoice}
+          company={activeCompany}
           palette={palette}
           vatPayer={isVatPayer}
         />

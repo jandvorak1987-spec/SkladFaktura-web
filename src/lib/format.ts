@@ -233,19 +233,22 @@ export function buildCzechSpdQr(params: {
   variableSymbol: string;
   message: string;
   dueDate?: string;
+  currency?: string;
 }): string | null {
-  const cleanIban = params.iban.replace(/\s+/g, '').toUpperCase();
+  const converted = czechAccountToIban(params.iban) || params.iban;
+  const cleanIban = converted.replace(/\s+/g, '').toUpperCase();
   if (cleanIban.length < 15) return null;
 
   const amount = Math.max(0, params.amount).toFixed(2);
   const vs = params.variableSymbol.replace(/\D/g, '').slice(0, 10);
+  const currency = (params.currency || 'CZK').trim().toUpperCase().slice(0, 3) || 'CZK';
   const msg = params.message
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/\*/g, ' ')
     .slice(0, 60);
 
-  const parts = ['SPD*1.0', `ACC:${cleanIban}`, `AM:${amount}`, 'CC:CZK'];
+  const parts = ['SPD*1.0', `ACC:${cleanIban}`, `AM:${amount}`, `CC:${currency}`];
   if (vs) parts.push(`X-VS:${vs}`);
   if (params.dueDate && /^\d{4}-\d{2}-\d{2}$/.test(params.dueDate)) {
     parts.push(`DT:${params.dueDate.replace(/-/g, '')}`);
