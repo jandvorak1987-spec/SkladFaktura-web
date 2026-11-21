@@ -33,10 +33,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = (
+      process.env.GEMINI_API_KEY ||
+      process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
+      process.env.GOOGLE_API_KEY ||
+      process.env.VITE_GEMINI_API_KEY ||
+      process.env.API_KEY ||
+      ''
+    ).trim();
     if (!apiKey) {
+      const envName = process.env.VERCEL_ENV || process.env.NODE_ENV || 'production';
       res.status(500).json({
-        error: 'GEMINI_API_KEY není nastaven v proměnných prostředí na Vercelu (Settings → Environment Variables).',
+        error: `GEMINI_API_KEY není nastaven v prostředí "${envName}" na Vercelu (Settings → Environment Variables → zaškrtnout Production i Preview → poté Deployments → Redeploy).`,
       });
       return;
     }

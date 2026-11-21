@@ -84,20 +84,54 @@ export function SmartStockInView() {
 
     setExtracting(true);
     try {
-      const base64Data = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const result = String(reader.result || '');
-          const comma = result.indexOf(',');
-          resolve(comma >= 0 ? result.slice(comma + 1) : result);
-        };
-        reader.onerror = () => reject(new Error('Nepodařilo se načíst soubor.'));
-        reader.readAsDataURL(file);
-      });
+      let base64Data = '';
+      let mimeType = file.type || 'image/jpeg';
+
+      if (mimeType.startsWith('image/') && file.size > 1_500_000) {
+        const compressed = await new Promise<{ data: string; mime: string }>((resolve, reject) => {
+          const img = new Image();
+          const objectUrl = URL.createObjectURL(file);
+          img.onload = () => {
+            URL.revokeObjectURL(objectUrl);
+            const maxDim = 1800;
+            const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(1, Math.round(img.width * scale));
+            canvas.height = Math.max(1, Math.round(img.height * scale));
+            const ctx = canvas.getContext('2d');
+            if (!ctx) {
+              reject(new Error('Nepodařilo se zpracovat obrázek.'));
+              return;
+            }
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+            const comma = dataUrl.indexOf(',');
+            resolve({ data: comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl, mime: 'image/jpeg' });
+          };
+          img.onerror = () => {
+            URL.revokeObjectURL(objectUrl);
+            reject(new Error('Nepodařilo se načíst obrázek.'));
+          };
+          img.src = objectUrl;
+        });
+        base64Data = compressed.data;
+        mimeType = compressed.mime;
+      } else {
+        base64Data = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const result = String(reader.result || '');
+            const comma = result.indexOf(',');
+            resolve(comma >= 0 ? result.slice(comma + 1) : result);
+          };
+          reader.onerror = () => reject(new Error('Nepodařilo se načíst soubor.'));
+          reader.readAsDataURL(file);
+        });
+      }
 
       const extracted = await extractAiDeliveryNote({
         base64Data,
-        mimeType: file.type || 'image/jpeg',
+        mimeType,
         fileName: file.name,
       });
       applyExtractedNote(extracted, effectiveWarehouseId);
