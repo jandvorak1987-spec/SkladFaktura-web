@@ -54,6 +54,23 @@ function isModelNotFoundError(err: unknown): boolean {
   return msg.includes('404') || msg.includes('not_found') || msg.includes('no longer available');
 }
 
+function isQuotaExceededError(err: unknown): boolean {
+  if (!err) return false;
+  const obj = err as {
+    status?: number | string;
+    code?: number | string;
+    message?: string;
+    error?: { code?: number | string; status?: string };
+    response?: { status?: number | string };
+  };
+  const status = Number(obj.status ?? obj.code ?? obj.error?.code ?? obj.response?.status ?? 0);
+  if (status === 429) return true;
+  const statusText = String(obj.status ?? obj.error?.status ?? '').toUpperCase();
+  if (statusText === 'RESOURCE_EXHAUSTED') return true;
+  const msg = String(obj.message || err).toLowerCase();
+  return msg.includes('429') || msg.includes('resource_exhausted') || msg.includes('quota exceeded');
+}
+
 async function generateWithFallback(
   ai: GoogleGenAI,
   requestParams: Omit<GenerateContentParameters, 'model'>,
@@ -79,7 +96,7 @@ async function generateWithFallback(
       });
     } catch (err) {
       lastError = err;
-      if (isModelNotFoundError(err)) {
+      if (isModelNotFoundError(err) || isQuotaExceededError(err)) {
         break;
       }
       if (!isHighDemandError(err)) {
@@ -95,7 +112,7 @@ async function generateWithFallback(
   }
 
   console.warn(
-    `[ai-stock-import] Model ${primaryModel} selhal po opakováních, přepínám na ${fallbackModel}.`
+    `[ai-stock-import] Model ${primaryModel} není dostupný (503/429/404), přepínám na ${fallbackModel}.`
   );
   for (let fbAttempt = 0; fbAttempt <= 1; fbAttempt++) {
     try {
@@ -556,6 +573,13 @@ async function startServer() {
         items,
       });
     } catch (err) {
+      if (isQuotaExceededError(err)) {
+        res.status(429).json({
+          error:
+            'Denní bezplatný limit požadavků Gemini API (Free Tier) byl vyčerpán pro oba modely. Pro vyšší limity aktivuj placený tarif (Billing) u svého Gemini API klíče v Google AI Studio, případně počkej na denní obnovení kvóty.',
+        });
+        return;
+      }
       const message = err instanceof Error ? err.message : 'neznámá chyba';
       res.status(500).json({ error: `AI zpracování dokladu selhalo: ${message}` });
     }

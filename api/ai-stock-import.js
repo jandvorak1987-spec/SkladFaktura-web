@@ -92,6 +92,16 @@ function isModelNotFoundError(err) {
   return msg.includes('404') || msg.includes('not_found') || msg.includes('no longer available');
 }
 
+function isQuotaExceededError(err) {
+  if (!err) return false;
+  const status = Number(err.status ?? err.code ?? err.error?.code ?? err.response?.status ?? 0);
+  if (status === 429) return true;
+  const statusText = String(err.status ?? err.error?.status ?? '').toUpperCase();
+  if (statusText === 'RESOURCE_EXHAUSTED') return true;
+  const msg = String(err.message || err).toLowerCase();
+  return msg.includes('429') || msg.includes('resource_exhausted') || msg.includes('quota exceeded');
+}
+
 async function generateWithFallback(
   ai,
   requestParams,
@@ -112,7 +122,7 @@ async function generateWithFallback(
       });
     } catch (err) {
       lastError = err;
-      if (isModelNotFoundError(err)) {
+      if (isModelNotFoundError(err) || isQuotaExceededError(err)) {
         break;
       }
       if (!isHighDemandError(err)) {
@@ -128,7 +138,7 @@ async function generateWithFallback(
   }
 
   console.warn(
-    `[ai-stock-import] Model ${primaryModel} selhal po opakováních, přepínám na ${fallbackModel}.`
+    `[ai-stock-import] Model ${primaryModel} není dostupný (503/429/404), přepínám na ${fallbackModel}.`
   );
   for (let fbAttempt = 0; fbAttempt <= 1; fbAttempt++) {
     try {
@@ -331,6 +341,13 @@ export default async function handler(req, res) {
       items,
     });
   } catch (err) {
+    if (isQuotaExceededError(err)) {
+      res.status(429).json({
+        error:
+          'Denní bezplatný limit požadavků Gemini API (Free Tier) byl vyčerpán pro oba modely. Pro vyšší limity aktivuj placený tarif (Billing) u svého Gemini API klíče v Google AI Studio, případně počkej na denní obnovení kvóty.',
+      });
+      return;
+    }
     const message = err instanceof Error ? err.message : 'neznámá chyba';
     res.status(500).json({ error: `AI zpracování dokladu selhalo: ${message}` });
   }
