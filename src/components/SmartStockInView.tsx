@@ -1,6 +1,8 @@
 import React, { useMemo, useRef, useState } from 'react';
 import {
   Check,
+  Cpu,
+  Eye,
   FileSpreadsheet,
   FileText,
   Image as ImageIcon,
@@ -15,9 +17,15 @@ import { useApp } from '../context/AppContext';
 import { matchExtractedToInventory, parseQuickStockCsv } from '../lib/bankParser';
 import { commitBulkStockIn } from '../lib/firestoreService';
 import { formatCzk, getCompanyPalette, round2 } from '../lib/format';
+import {
+  extractFileLocally,
+  extractTextLocally,
+  type LocalExtractionMethod,
+} from '../lib/localDocumentReader';
 import type { ExtractedDeliveryNote, ExtractedLineItem } from '../types';
 
 type InputMode = 'FILE' | 'TEXT' | 'CSV';
+type ProcessingEngine = 'LOCAL' | 'GEMINI';
 
 const COMMON_CURRENCIES = ['CZK', 'EUR', 'USD', 'PLN', 'GBP', 'CHF', 'HUF'];
 
@@ -41,12 +49,14 @@ export function SmartStockInView() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const [mode, setMode] = useState<InputMode>('FILE');
+  const [engine, setEngine] = useState<ProcessingEngine>('LOCAL');
   const [targetWarehouseId, setTargetWarehouseId] = useState<string>(
     accessibleWarehouses[0]?.id || 'shared_main'
   );
   const [rawText, setRawText] = useState('');
   const [csvText, setCsvText] = useState('');
   const [extracting, setExtracting] = useState(false);
+  const [progressText, setProgressText] = useState('');
   const [committing, setCommitting] = useState(false);
   const [loadingRate, setLoadingRate] = useState(false);
   const [lastFilePayload, setLastFilePayload] = useState<{
@@ -55,6 +65,9 @@ export function SmartStockInView() {
     fileName: string;
   } | null>(null);
   const [lastExtractError, setLastExtractError] = useState<string | null>(null);
+  const [rawExtractedText, setRawExtractedText] = useState('');
+  const [showRawText, setShowRawText] = useState(false);
+  const [lastMethod, setLastMethod] = useState<LocalExtractionMethod | 'GEMINI' | null>(null);
 
   const [note, setNote] = useState<ExtractedDeliveryNote | null>(null);
 
@@ -198,7 +211,69 @@ export function SmartStockInView() {
     }
 
     setExtracting(true);
+    setLastExtractError(null);
+    setRawExtractedText('');
+    setShowRawText(false);
+
+    const isXmlFile = lower.endsWith('.xml') || lower.endsWith('.isdoc') || file.type.includes('xml');
+
     try {
+      if (engine === 'LOCAL' || isXmlFile) {
+        setProgressText('Zpracovávám doklad lokálně bez AI…');
+        const result = await extractFileLocally(file, {
+          ownCompanyIco: activeCompany?.ico,
+          onProgress: (label) => setProgressText(label),
+        });
+        setRawExtractedText(result.rawText);
+        setLastMethod(result.method);
+
+        const methodLabel =
+          result.method === 'ISDOC_XML'
+            ? 'ISDOC XML'
+            : result.method === 'POHODA_XML'
+              ? 'POHODA XML'
+              : result.method === 'PDF_TEXT'
+                ? 'PDF text'
+                : 'lokální OCR';
+
+        if (result.note.items.length === 0) {
+          applyExtractedNote(
+            {
+              ...result.note,
+              items: [
+                {
+                  id: `manual_${Date.now()}`,
+                  sku: 'SKU-001',
+                  name: '',
+                  ean: '',
+                  quantity: 1,
+                  unit: 'ks',
+                  originalPurchasePrice: 0,
+                  purchasePrice: 0,
+                  suggestedSalePrice: 0,
+                  vatRate: 21,
+                  selected: true,
+                },
+              ],
+            },
+            effectiveWarehouseId
+          );
+          setShowRawText(true);
+          notify(
+            `Doklad byl přečten (${methodLabel}), ale tabulka položek má nestandardní formát. Rozpoznaný text je zobrazen níže pro rychlou kontrolu.`,
+            'info'
+          );
+        } else {
+          applyExtractedNote(result.note, effectiveWarehouseId);
+          notify(
+            `Lokálně (${methodLabel}) rozpoznáno ${result.note.items.length} položek z ${file.name}.`
+          );
+        }
+        return;
+      }
+
+      // Optional Gemini AI mode
+      setProgressText('AI čte položky, množství a ceny z dokladu…');
       let base64Data = '';
       let mimeType = file.type || 'image/jpeg';
 
@@ -253,24 +328,28 @@ export function SmartStockInView() {
       setLastExtractError(null);
 
       const extracted = await extractAiDeliveryNote(payload);
+      setLastMethod('GEMINI');
       applyExtractedNote(extracted, effectiveWarehouseId);
       setLastExtractError(null);
       notify(`AI rozpoznala ${extracted.items.length} položek z dokladu ${file.name}.`);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'AI zpracování selhalo.';
+      const msg = err instanceof Error ? err.message : 'Zpracování dokladu selhalo.';
       setLastExtractError(msg);
       notify(msg, 'error');
     } finally {
       setExtracting(false);
+      setProgressText('');
     }
   };
 
   const handleRetryLastFile = async () => {
     if (!lastFilePayload || extracting) return;
     setExtracting(true);
+    setProgressText('Znovu odesílám doklad do Gemini AI…');
     setLastExtractError(null);
     try {
       const extracted = await extractAiDeliveryNote(lastFilePayload);
+      setLastMethod('GEMINI');
       applyExtractedNote(extracted, effectiveWarehouseId);
       setLastExtractError(null);
       notify(
@@ -282,6 +361,7 @@ export function SmartStockInView() {
       notify(msg, 'error');
     } finally {
       setExtracting(false);
+      setProgressText('');
     }
   };
 
@@ -291,12 +371,31 @@ export function SmartStockInView() {
       return;
     }
     setExtracting(true);
+    setLastExtractError(null);
     try {
-      const extracted = await extractAiDeliveryNote({ rawText: rawText.trim() });
-      applyExtractedNote(extracted, effectiveWarehouseId);
-      notify(`AI extrahovala ${extracted.items.length} položek.`);
+      if (engine === 'LOCAL') {
+        const result = await extractTextLocally(rawText.trim(), {
+          ownCompanyIco: activeCompany?.ico,
+        });
+        setRawExtractedText(result.rawText);
+        setLastMethod('TEXT');
+        if (result.note.items.length === 0) {
+          notify(
+            'V textu se nepodařilo automaticky rozpoznat řádky s množstvím a cenou. Zkontrolujte formát nebo přepněte na záložku CSV.',
+            'error'
+          );
+          return;
+        }
+        applyExtractedNote(result.note, effectiveWarehouseId);
+        notify(`Lokálně rozpoznáno ${result.note.items.length} položek z textu.`);
+      } else {
+        const extracted = await extractAiDeliveryNote({ rawText: rawText.trim() });
+        setLastMethod('GEMINI');
+        applyExtractedNote(extracted, effectiveWarehouseId);
+        notify(`AI extrahovala ${extracted.items.length} položek.`);
+      }
     } catch (err) {
-      notify(err instanceof Error ? err.message : 'AI zpracování textu selhalo.', 'error');
+      notify(err instanceof Error ? err.message : 'Zpracování textu selhalo.', 'error');
     } finally {
       setExtracting(false);
     }
@@ -447,43 +546,80 @@ export function SmartStockInView() {
 
       {/* Source selector */}
       <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-4">
-        <div className="inline-flex items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200">
-          <button
-            type="button"
-            onClick={() => setMode('FILE')}
-            className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
-              mode === 'FILE'
-                ? 'bg-white text-slate-900 shadow-xs'
-                : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            <ImageIcon className="w-3.5 h-3.5" />
-            Fotka / PDF dokladu
-          </button>
-          <button
-            type="button"
-            onClick={() => setMode('TEXT')}
-            className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
-              mode === 'TEXT'
-                ? 'bg-white text-slate-900 shadow-xs'
-                : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            <FileText className="w-3.5 h-3.5" />
-            Vložit text (AI)
-          </button>
-          <button
-            type="button"
-            onClick={() => setMode('CSV')}
-            className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
-              mode === 'CSV'
-                ? 'bg-white text-slate-900 shadow-xs'
-                : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            <FileSpreadsheet className="w-3.5 h-3.5" />
-            Rychlý CSV / Excel
-          </button>
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+          <div className="inline-flex items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200 self-start">
+            <button
+              type="button"
+              onClick={() => setMode('FILE')}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                mode === 'FILE'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <ImageIcon className="w-3.5 h-3.5" />
+              PDF / XML / Fotka
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode('TEXT')}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                mode === 'TEXT'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <FileText className="w-3.5 h-3.5" />
+              Vložit text
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode('CSV')}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                mode === 'CSV'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5" />
+              Rychlý CSV / Excel
+            </button>
+          </div>
+
+          {mode !== 'CSV' && (
+            <div className="inline-flex items-center gap-1 bg-slate-100 p-0.5 rounded-lg border border-slate-200 self-start md:self-auto">
+              <button
+                type="button"
+                onClick={() => {
+                  setEngine('LOCAL');
+                  setLastExtractError(null);
+                }}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+                  engine === 'LOCAL'
+                    ? 'bg-white text-slate-900 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <Cpu className="w-3.5 h-3.5 text-emerald-700" />
+                Lokální (bez AI · bez limitů)
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setEngine('GEMINI');
+                  setLastExtractError(null);
+                }}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+                  engine === 'GEMINI'
+                    ? 'bg-white text-slate-900 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                Gemini AI
+              </button>
+            </div>
+          )}
         </div>
 
         {mode === 'FILE' && (
@@ -491,53 +627,74 @@ export function SmartStockInView() {
             {lastExtractError && !extracting && (
               <div className="bg-amber-50 border border-amber-200 rounded-xl p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <p className="text-xs text-amber-900 leading-relaxed">{lastExtractError}</p>
-                {lastFilePayload && (
-                  <button
-                    type="button"
-                    onClick={handleRetryLastFile}
-                    className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 rounded-lg whitespace-nowrap shrink-0"
-                  >
-                    <RefreshCw className="w-3.5 h-3.5" />
-                    Zkusit znovu ({lastFilePayload.fileName})
-                  </button>
-                )}
+                <div className="flex items-center gap-2 shrink-0">
+                  {engine === 'GEMINI' && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEngine('LOCAL');
+                        setLastExtractError(null);
+                      }}
+                      className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-medium text-emerald-900 bg-emerald-100 hover:bg-emerald-200 rounded-lg whitespace-nowrap"
+                    >
+                      <Cpu className="w-3.5 h-3.5" />
+                      Přepnout na Lokální (bez AI)
+                    </button>
+                  )}
+                  {lastFilePayload && engine === 'GEMINI' && (
+                    <button
+                      type="button"
+                      onClick={handleRetryLastFile}
+                      className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 rounded-lg whitespace-nowrap"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      Zkusit znovu
+                    </button>
+                  )}
+                </div>
               </div>
             )}
             <div className="border-2 border-dashed border-slate-200 rounded-xl p-8 text-center bg-slate-50/50">
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="image/*,application/pdf,.csv,.tsv,.txt"
-              onChange={handleFileSelected}
-              className="hidden"
-            />
-            {extracting ? (
-              <div className="flex flex-col items-center gap-3 py-4">
-                <Loader2 className="w-7 h-7 text-slate-700 animate-spin" />
-                <p className="text-sm font-medium text-slate-900">
-                  AI čte položky, množství a ceny z dokladu…
-                </p>
-              </div>
-            ) : (
-              <>
-                <Upload className="w-8 h-8 text-slate-400 mx-auto" />
-                <p className="mt-3 text-sm font-medium text-slate-900">
-                  Nahrajte dodací list, nákupní fakturu nebo CSV soubor
-                </p>
-                <p className="mt-1 text-xs text-slate-500">
-                  Podporováno: JPG, PNG, WebP, PDF (AI extrakce) a CSV/TSV
-                </p>
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  style={{ backgroundColor: palette.primary }}
-                  className="mt-4 inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white rounded-lg hover:opacity-95"
-                >
-                  <Sparkles className="w-4 h-4" />
-                  Vybrat soubor k rozpoznání
-                </button>
-              </>
-            )}
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*,application/pdf,.xml,.isdoc,.csv,.tsv,.txt"
+                onChange={handleFileSelected}
+                className="hidden"
+              />
+              {extracting ? (
+                <div className="flex flex-col items-center gap-3 py-4">
+                  <Loader2 className="w-7 h-7 text-slate-700 animate-spin" />
+                  <p className="text-sm font-medium text-slate-900">
+                    {progressText || 'Čtu položky, množství a ceny z dokladu…'}
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <Upload className="w-8 h-8 text-slate-400 mx-auto" />
+                  <p className="mt-3 text-sm font-medium text-slate-900">
+                    Nahrajte fakturu, dodací list, ISDOC/POHODA XML nebo CSV
+                  </p>
+                  <p className="mt-1 text-xs text-slate-500">
+                    {engine === 'LOCAL'
+                      ? 'Lokální zpracování v prohlížeči (bez AI, bez limitů a chyb 503): PDF, ISDOC/XML, JPG/PNG (lokální OCR) i CSV'
+                      : 'Gemini AI extrakce: PDF, JPG, PNG, WebP (XML a CSV se vždy čtou lokálně)'}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    style={{ backgroundColor: palette.primary }}
+                    className="mt-4 inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white rounded-lg hover:opacity-95"
+                  >
+                    {engine === 'LOCAL' ? (
+                      <Cpu className="w-4 h-4" />
+                    ) : (
+                      <Sparkles className="w-4 h-4" />
+                    )}
+                    Vybrat soubor k naskladnění
+                  </button>
+                </>
+              )}
             </div>
           </div>
         )}
@@ -561,10 +718,16 @@ export function SmartStockInView() {
               >
                 {extracting ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
+                ) : engine === 'LOCAL' ? (
+                  <Cpu className="w-4 h-4" />
                 ) : (
                   <Sparkles className="w-4 h-4" />
                 )}
-                {extracting ? 'Zpracovávám…' : 'Rozpoznat položky pomocí AI'}
+                {extracting
+                  ? 'Zpracovávám…'
+                  : engine === 'LOCAL'
+                    ? 'Rozpoznat položky lokálně (bez AI)'
+                    : 'Rozpoznat položky pomocí AI'}
               </button>
             </div>
           </div>
@@ -599,6 +762,31 @@ export function SmartStockInView() {
           </div>
         )}
       </div>
+
+      {/* Optional raw extracted text preview for local PDF / OCR inspection */}
+      {rawExtractedText && (
+        <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+          <button
+            type="button"
+            onClick={() => setShowRawText((v) => !v)}
+            className="w-full px-4 py-2.5 flex items-center justify-between text-xs font-medium text-slate-600 hover:bg-slate-50 transition-colors"
+          >
+            <span className="inline-flex items-center gap-1.5">
+              <Eye className="w-3.5 h-3.5 text-slate-400" />
+              Rozpoznaný text z dokladu
+              {lastMethod && (
+                <span className="font-mono text-[11px] text-slate-400">({lastMethod})</span>
+              )}
+            </span>
+            <span className="text-slate-500">{showRawText ? 'Skrýt' : 'Zobrazit'}</span>
+          </button>
+          {showRawText && (
+            <pre className="px-4 py-3 text-[11px] font-mono text-slate-700 bg-slate-50 border-t border-slate-100 max-h-60 overflow-auto whitespace-pre-wrap">
+              {rawExtractedText}
+            </pre>
+          )}
+        </div>
+      )}
 
       {/* Review & Commit table */}
       {note && (
