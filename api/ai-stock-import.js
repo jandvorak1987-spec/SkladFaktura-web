@@ -65,6 +65,68 @@ function findGeminiApiKey() {
   return '';
 }
 
+const PRIMARY_MODEL = 'gemini-4-hydrogen';
+const FALLBACK_MODEL = 'gemini-2.5-flash';
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isHighDemandError(err) {
+  if (!err) return false;
+  const status = Number(err.status ?? err.code ?? err.error?.code ?? err.response?.status ?? 0);
+  if (status === 503) return true;
+  const statusText = String(err.status ?? err.error?.status ?? '').toUpperCase();
+  if (statusText === 'UNAVAILABLE') return true;
+  const msg = String(err.message || err).toLowerCase();
+  return msg.includes('503') || msg.includes('high demand') || msg.includes('unavailable');
+}
+
+async function generateWithFallback(
+  ai,
+  requestParams,
+  {
+    primaryModel = PRIMARY_MODEL,
+    fallbackModel = FALLBACK_MODEL,
+    maxRetries = 2,
+    retryDelayMs = 2000,
+  } = {}
+) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await ai.models.generateContent({
+        ...requestParams,
+        model: primaryModel,
+      });
+    } catch (err) {
+      lastError = err;
+      if (!isHighDemandError(err)) {
+        throw err;
+      }
+      if (attempt < maxRetries) {
+        console.warn(
+          `[ai-stock-import] Model ${primaryModel} vrátil 503/high demand (pokus ${attempt + 1}/${maxRetries + 1}), opakuji za ${retryDelayMs} ms…`
+        );
+        await sleep(retryDelayMs);
+      }
+    }
+  }
+
+  console.warn(
+    `[ai-stock-import] Model ${primaryModel} selhal i po ${maxRetries} opakováních (503/high demand), přepínám na ${fallbackModel}.`
+  );
+  try {
+    return await ai.models.generateContent({
+      ...requestParams,
+      model: fallbackModel,
+    });
+  } catch (fallbackErr) {
+    throw fallbackErr || lastError;
+  }
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Metoda není povolena.' });
@@ -145,8 +207,7 @@ export default async function handler(req, res) {
       });
     }
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
+    const response = await generateWithFallback(ai, {
       contents: { parts },
       config: {
         systemInstruction,

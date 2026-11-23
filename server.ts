@@ -2,12 +2,90 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI, Type } from '@google/genai';
+import {
+  GoogleGenAI,
+  Type,
+  type GenerateContentParameters,
+  type GenerateContentResponse,
+} from '@google/genai';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 3000);
+const PRIMARY_GEMINI_MODEL = 'gemini-4-hydrogen';
+const FALLBACK_GEMINI_MODEL = 'gemini-2.5-flash';
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isHighDemandError(err: unknown): boolean {
+  if (!err) return false;
+  const obj = err as {
+    status?: number | string;
+    code?: number | string;
+    message?: string;
+    error?: { code?: number | string; status?: string };
+    response?: { status?: number | string };
+  };
+  const status = Number(obj.status ?? obj.code ?? obj.error?.code ?? obj.response?.status ?? 0);
+  if (status === 503) return true;
+  const statusText = String(obj.status ?? obj.error?.status ?? '').toUpperCase();
+  if (statusText === 'UNAVAILABLE') return true;
+  const msg = String(obj.message || err).toLowerCase();
+  return msg.includes('503') || msg.includes('high demand') || msg.includes('unavailable');
+}
+
+async function generateWithFallback(
+  ai: GoogleGenAI,
+  requestParams: Omit<GenerateContentParameters, 'model'>,
+  options?: {
+    primaryModel?: string;
+    fallbackModel?: string;
+    maxRetries?: number;
+    retryDelayMs?: number;
+  }
+): Promise<GenerateContentResponse> {
+  const primaryModel = options?.primaryModel || PRIMARY_GEMINI_MODEL;
+  const fallbackModel = options?.fallbackModel || FALLBACK_GEMINI_MODEL;
+  const maxRetries = options?.maxRetries ?? 2;
+  const retryDelayMs = options?.retryDelayMs ?? 2000;
+
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await ai.models.generateContent({
+        ...requestParams,
+        model: primaryModel,
+      });
+    } catch (err) {
+      lastError = err;
+      if (!isHighDemandError(err)) {
+        throw err;
+      }
+      if (attempt < maxRetries) {
+        console.warn(
+          `[ai-stock-import] Model ${primaryModel} vrátil 503/high demand (pokus ${attempt + 1}/${maxRetries + 1}), opakuji za ${retryDelayMs} ms…`
+        );
+        await sleep(retryDelayMs);
+      }
+    }
+  }
+
+  console.warn(
+    `[ai-stock-import] Model ${primaryModel} selhal i po ${maxRetries} opakováních (503/high demand), přepínám na ${fallbackModel}.`
+  );
+  try {
+    return await ai.models.generateContent({
+      ...requestParams,
+      model: fallbackModel,
+    });
+  } catch (fallbackErr) {
+    throw fallbackErr || lastError;
+  }
+}
 
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -331,8 +409,7 @@ async function startServer() {
         });
       }
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+      const response = await generateWithFallback(ai, {
         contents: { parts },
         config: {
           systemInstruction,
