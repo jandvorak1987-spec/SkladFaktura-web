@@ -14,7 +14,7 @@ const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 3000);
 const PRIMARY_GEMINI_MODEL = 'gemini-4-hydrogen';
-const FALLBACK_GEMINI_MODEL = 'gemini-2.5-flash';
+const FALLBACK_GEMINI_MODEL = 'gemini-3.1-flash-lite';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -35,6 +35,23 @@ function isHighDemandError(err: unknown): boolean {
   if (statusText === 'UNAVAILABLE') return true;
   const msg = String(obj.message || err).toLowerCase();
   return msg.includes('503') || msg.includes('high demand') || msg.includes('unavailable');
+}
+
+function isModelNotFoundError(err: unknown): boolean {
+  if (!err) return false;
+  const obj = err as {
+    status?: number | string;
+    code?: number | string;
+    message?: string;
+    error?: { code?: number | string; status?: string };
+    response?: { status?: number | string };
+  };
+  const status = Number(obj.status ?? obj.code ?? obj.error?.code ?? obj.response?.status ?? 0);
+  if (status === 404) return true;
+  const statusText = String(obj.status ?? obj.error?.status ?? '').toUpperCase();
+  if (statusText === 'NOT_FOUND') return true;
+  const msg = String(obj.message || err).toLowerCase();
+  return msg.includes('404') || msg.includes('not_found') || msg.includes('no longer available');
 }
 
 async function generateWithFallback(
@@ -62,6 +79,9 @@ async function generateWithFallback(
       });
     } catch (err) {
       lastError = err;
+      if (isModelNotFoundError(err)) {
+        break;
+      }
       if (!isHighDemandError(err)) {
         throw err;
       }
@@ -75,16 +95,25 @@ async function generateWithFallback(
   }
 
   console.warn(
-    `[ai-stock-import] Model ${primaryModel} selhal i po ${maxRetries} opakováních (503/high demand), přepínám na ${fallbackModel}.`
+    `[ai-stock-import] Model ${primaryModel} selhal po opakováních, přepínám na ${fallbackModel}.`
   );
-  try {
-    return await ai.models.generateContent({
-      ...requestParams,
-      model: fallbackModel,
-    });
-  } catch (fallbackErr) {
-    throw fallbackErr || lastError;
+  for (let fbAttempt = 0; fbAttempt <= 1; fbAttempt++) {
+    try {
+      return await ai.models.generateContent({
+        ...requestParams,
+        model: fallbackModel,
+      });
+    } catch (fallbackErr) {
+      lastError = fallbackErr;
+      if (isHighDemandError(fallbackErr) && fbAttempt < 1) {
+        await sleep(retryDelayMs);
+        continue;
+      }
+      throw fallbackErr || lastError;
+    }
   }
+
+  throw lastError;
 }
 
 function getGeminiClient(): GoogleGenAI {

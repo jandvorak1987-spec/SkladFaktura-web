@@ -66,7 +66,7 @@ function findGeminiApiKey() {
 }
 
 const PRIMARY_MODEL = 'gemini-4-hydrogen';
-const FALLBACK_MODEL = 'gemini-2.5-flash';
+const FALLBACK_MODEL = 'gemini-3.1-flash-lite';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -80,6 +80,16 @@ function isHighDemandError(err) {
   if (statusText === 'UNAVAILABLE') return true;
   const msg = String(err.message || err).toLowerCase();
   return msg.includes('503') || msg.includes('high demand') || msg.includes('unavailable');
+}
+
+function isModelNotFoundError(err) {
+  if (!err) return false;
+  const status = Number(err.status ?? err.code ?? err.error?.code ?? err.response?.status ?? 0);
+  if (status === 404) return true;
+  const statusText = String(err.status ?? err.error?.status ?? '').toUpperCase();
+  if (statusText === 'NOT_FOUND') return true;
+  const msg = String(err.message || err).toLowerCase();
+  return msg.includes('404') || msg.includes('not_found') || msg.includes('no longer available');
 }
 
 async function generateWithFallback(
@@ -102,6 +112,9 @@ async function generateWithFallback(
       });
     } catch (err) {
       lastError = err;
+      if (isModelNotFoundError(err)) {
+        break;
+      }
       if (!isHighDemandError(err)) {
         throw err;
       }
@@ -115,16 +128,25 @@ async function generateWithFallback(
   }
 
   console.warn(
-    `[ai-stock-import] Model ${primaryModel} selhal i po ${maxRetries} opakováních (503/high demand), přepínám na ${fallbackModel}.`
+    `[ai-stock-import] Model ${primaryModel} selhal po opakováních, přepínám na ${fallbackModel}.`
   );
-  try {
-    return await ai.models.generateContent({
-      ...requestParams,
-      model: fallbackModel,
-    });
-  } catch (fallbackErr) {
-    throw fallbackErr || lastError;
+  for (let fbAttempt = 0; fbAttempt <= 1; fbAttempt++) {
+    try {
+      return await ai.models.generateContent({
+        ...requestParams,
+        model: fallbackModel,
+      });
+    } catch (fallbackErr) {
+      lastError = fallbackErr;
+      if (isHighDemandError(fallbackErr) && fbAttempt < 1) {
+        await sleep(retryDelayMs);
+        continue;
+      }
+      throw fallbackErr || lastError;
+    }
   }
+
+  throw lastError;
 }
 
 export default async function handler(req, res) {
