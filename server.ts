@@ -114,7 +114,8 @@ async function generateWithFallback(
   console.warn(
     `[ai-stock-import] Model ${primaryModel} není dostupný (503/429/404), přepínám na ${fallbackModel}.`
   );
-  for (let fbAttempt = 0; fbAttempt <= 1; fbAttempt++) {
+  const fallbackDelays = [2000, 4000, 6000];
+  for (let fbAttempt = 0; fbAttempt <= fallbackDelays.length; fbAttempt++) {
     try {
       return await ai.models.generateContent({
         ...requestParams,
@@ -122,8 +123,12 @@ async function generateWithFallback(
       });
     } catch (fallbackErr) {
       lastError = fallbackErr;
-      if (isHighDemandError(fallbackErr) && fbAttempt < 1) {
-        await sleep(retryDelayMs);
+      if (isHighDemandError(fallbackErr) && fbAttempt < fallbackDelays.length) {
+        const waitMs = fallbackDelays[fbAttempt];
+        console.warn(
+          `[ai-stock-import] Záložní model ${fallbackModel} vrátil 503/high demand (pokus ${fbAttempt + 1}/${fallbackDelays.length + 1}), opakuji za ${waitMs} ms…`
+        );
+        await sleep(waitMs);
         continue;
       }
       throw fallbackErr || lastError;
@@ -577,6 +582,13 @@ async function startServer() {
         res.status(429).json({
           error:
             'Denní bezplatný limit požadavků Gemini API (Free Tier) byl vyčerpán pro oba modely. Pro vyšší limity aktivuj placený tarif (Billing) u svého Gemini API klíče v Google AI Studio, případně počkej na denní obnovení kvóty.',
+        });
+        return;
+      }
+      if (isHighDemandError(err)) {
+        res.status(503).json({
+          error:
+            'Servery Google Gemini jsou momentálně dočasně přetížené (chyba 503 – high demand) i po automatických opakováních a přepnutí na záložní model. Klikni prosím na „Zkusit znovu“ za 15–30 sekund.',
         });
         return;
       }

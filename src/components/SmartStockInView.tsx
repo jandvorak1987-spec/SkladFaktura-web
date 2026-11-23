@@ -49,6 +49,12 @@ export function SmartStockInView() {
   const [extracting, setExtracting] = useState(false);
   const [committing, setCommitting] = useState(false);
   const [loadingRate, setLoadingRate] = useState(false);
+  const [lastFilePayload, setLastFilePayload] = useState<{
+    base64Data: string;
+    mimeType: string;
+    fileName: string;
+  } | null>(null);
+  const [lastExtractError, setLastExtractError] = useState<string | null>(null);
 
   const [note, setNote] = useState<ExtractedDeliveryNote | null>(null);
 
@@ -238,15 +244,42 @@ export function SmartStockInView() {
         });
       }
 
-      const extracted = await extractAiDeliveryNote({
+      const payload = {
         base64Data,
         mimeType,
         fileName: file.name,
-      });
+      };
+      setLastFilePayload(payload);
+      setLastExtractError(null);
+
+      const extracted = await extractAiDeliveryNote(payload);
       applyExtractedNote(extracted, effectiveWarehouseId);
+      setLastExtractError(null);
       notify(`AI rozpoznala ${extracted.items.length} položek z dokladu ${file.name}.`);
     } catch (err) {
-      notify(err instanceof Error ? err.message : 'AI zpracování selhalo.', 'error');
+      const msg = err instanceof Error ? err.message : 'AI zpracování selhalo.';
+      setLastExtractError(msg);
+      notify(msg, 'error');
+    } finally {
+      setExtracting(false);
+    }
+  };
+
+  const handleRetryLastFile = async () => {
+    if (!lastFilePayload || extracting) return;
+    setExtracting(true);
+    setLastExtractError(null);
+    try {
+      const extracted = await extractAiDeliveryNote(lastFilePayload);
+      applyExtractedNote(extracted, effectiveWarehouseId);
+      setLastExtractError(null);
+      notify(
+        `AI rozpoznala ${extracted.items.length} položek z dokladu ${lastFilePayload.fileName}.`
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'AI zpracování selhalo.';
+      setLastExtractError(msg);
+      notify(msg, 'error');
     } finally {
       setExtracting(false);
     }
@@ -454,7 +487,23 @@ export function SmartStockInView() {
         </div>
 
         {mode === 'FILE' && (
-          <div className="border-2 border-dashed border-slate-200 rounded-xl p-8 text-center bg-slate-50/50">
+          <div className="space-y-3">
+            {lastExtractError && !extracting && (
+              <div className="bg-amber-50 border border-amber-200 rounded-xl p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <p className="text-xs text-amber-900 leading-relaxed">{lastExtractError}</p>
+                {lastFilePayload && (
+                  <button
+                    type="button"
+                    onClick={handleRetryLastFile}
+                    className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 rounded-lg whitespace-nowrap shrink-0"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    Zkusit znovu ({lastFilePayload.fileName})
+                  </button>
+                )}
+              </div>
+            )}
+            <div className="border-2 border-dashed border-slate-200 rounded-xl p-8 text-center bg-slate-50/50">
             <input
               ref={fileInputRef}
               type="file"
@@ -489,6 +538,7 @@ export function SmartStockInView() {
                 </button>
               </>
             )}
+            </div>
           </div>
         )}
 
