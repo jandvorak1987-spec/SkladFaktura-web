@@ -1,37 +1,58 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
+  Archive,
   Check,
   Cpu,
   Eye,
   FileSpreadsheet,
   FileText,
+  Files,
   Globe,
   Image as ImageIcon,
   Loader2,
+  Paperclip,
   Plus,
   RefreshCw,
+  Search,
   Sparkles,
   Trash2,
   Upload,
+  X,
 } from 'lucide-react';
 import { QtyInput, parseQtyNumber } from './QtyInput';
+import { StockInDocumentModal } from './StockInDocumentModal';
 import { useApp } from '../context/AppContext';
 import {
+  areNamesCompatible,
   findMatchingInventoryItem,
   matchExtractedToInventory,
   parseQuickStockCsv,
 } from '../lib/bankParser';
 import { commitBulkStockIn } from '../lib/firestoreService';
-import { formatCzk, formatQty, getCompanyPalette, round2 } from '../lib/format';
+import {
+  formatCzk,
+  formatQty,
+  formatTimestampCz,
+  getCompanyPalette,
+  round2,
+  timestampToMs,
+} from '../lib/format';
 import {
   extractFileLocally,
   extractTextLocally,
   type LocalExtractionMethod,
 } from '../lib/localDocumentReader';
 import { categorizeItemsViaNerx } from '../lib/nerxCategorizer';
-import type { ExtractedDeliveryNote, ExtractedLineItem } from '../types';
+import {
+  listArchivedStockInDocuments,
+  mapLinesToArchivedItems,
+  saveArchivedStockInDocument,
+  type ArchivedStockInDocument,
+} from '../lib/stockInArchive';
+import type { ExtractedDeliveryNote, ExtractedLineItem, InventoryItem } from '../types';
 
-type InputMode = 'FILE' | 'TEXT' | 'CSV';
+type InputMode = 'FILE' | 'TEXT' | 'CSV' | 'ARCHIVE';
 type ProcessingEngine = 'LOCAL' | 'GEMINI';
 
 const COMMON_CURRENCIES = ['CZK', 'EUR', 'USD', 'PLN', 'GBP', 'CHF', 'HUF'];
@@ -42,12 +63,25 @@ interface CnbRatesResponse {
   source: 'CNB' | 'FALLBACK';
 }
 
+interface QueuedStockInDoc {
+  id: string;
+  fileName: string;
+  mimeType: string;
+  fileSize: number;
+  fileBlob?: Blob | null;
+  rawText: string;
+  method: LocalExtractionMethod | 'GEMINI' | 'CSV';
+  note: ExtractedDeliveryNote;
+}
+
 export function SmartStockInView() {
   const {
     workspace,
     activeCompany,
+    warehouses,
     accessibleWarehouses,
     inventory,
+    movements,
     extractAiDeliveryNote,
     notify,
   } = useApp();
@@ -65,20 +99,64 @@ export function SmartStockInView() {
   const [extracting, setExtracting] = useState(false);
   const [progressText, setProgressText] = useState('');
   const [committing, setCommitting] = useState(false);
+  const [committingAll, setCommittingAll] = useState(false);
   const [loadingRate, setLoadingRate] = useState(false);
   const [lastFilePayload, setLastFilePayload] = useState<{
     base64Data: string;
     mimeType: string;
     fileName: string;
+    fileBlob?: Blob;
   } | null>(null);
   const [lastExtractError, setLastExtractError] = useState<string | null>(null);
-  const [rawExtractedText, setRawExtractedText] = useState('');
   const [showRawText, setShowRawText] = useState(false);
-  const [lastMethod, setLastMethod] = useState<LocalExtractionMethod | 'GEMINI' | null>(null);
 
-  const [note, setNote] = useState<ExtractedDeliveryNote | null>(null);
+  // Multi-document queue (supports 1 or N documents at once)
+  const [queuedDocs, setQueuedDocs] = useState<QueuedStockInDoc[]>([]);
+  const [activeDocId, setActiveDocId] = useState<string | null>(null);
+
   const [defaultCategory, setDefaultCategory] = useState('');
   const [categorizingNerx, setCategorizingNerx] = useState(false);
+
+  // Stock-in document archive
+  const [archivedDocs, setArchivedDocs] = useState<ArchivedStockInDocument[]>([]);
+  const [archiveTick, setArchiveTick] = useState(0);
+  const [archiveSearch, setArchiveSearch] = useState('');
+  const [viewingDocRef, setViewingDocRef] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!workspace?.id) return;
+    let active = true;
+    listArchivedStockInDocuments(workspace.id).then((docs) => {
+      if (active) setArchivedDocs(docs);
+    });
+    return () => {
+      active = false;
+    };
+  }, [workspace?.id, archiveTick]);
+
+  const activeDoc = useMemo(
+    () => queuedDocs.find((d) => d.id === activeDocId) || queuedDocs[0] || null,
+    [queuedDocs, activeDocId]
+  );
+
+  const note = activeDoc?.note || null;
+
+  const setNote = (
+    updater:
+      | ExtractedDeliveryNote
+      | null
+      | ((prev: ExtractedDeliveryNote | null) => ExtractedDeliveryNote | null)
+  ) => {
+    setQueuedDocs((prevDocs) => {
+      const current = prevDocs.find((d) => d.id === activeDocId) || prevDocs[0];
+      if (!current) return prevDocs;
+      const nextNote = typeof updater === 'function' ? updater(current.note) : updater;
+      if (!nextNote) {
+        return prevDocs.filter((d) => d.id !== current.id);
+      }
+      return prevDocs.map((d) => (d.id === current.id ? { ...d, note: nextNote } : d));
+    });
+  };
 
   const effectiveWarehouseId = useMemo(() => {
     if (accessibleWarehouses.some((w) => w.id === targetWarehouseId)) return targetWarehouseId;
@@ -89,6 +167,8 @@ export function SmartStockInView() {
     () => new Map(accessibleWarehouses.map((w) => [w.id, w.name])),
     [accessibleWarehouses]
   );
+
+  const inventoryById = useMemo(() => new Map(inventory.map((i) => [i.id, i])), [inventory]);
 
   const targetWhInventory = useMemo(
     () =>
@@ -107,7 +187,7 @@ export function SmartStockInView() {
     return Array.from(set).sort((a, b) => a.localeCompare(b, 'cs'));
   }, [inventory]);
 
-  const applyExtractedNote = (raw: ExtractedDeliveryNote, whId: string) => {
+  const normalizeAndMatchNote = (raw: ExtractedDeliveryNote, whId: string): ExtractedDeliveryNote => {
     const currency = (raw.currency || 'CZK').toUpperCase();
     const exchangeRate = currency === 'CZK' ? 1 : Number(raw.exchangeRate || 1) || 1;
     const normalized: ExtractedDeliveryNote = {
@@ -123,8 +203,23 @@ export function SmartStockInView() {
             : item.purchasePrice,
       })),
     };
-    const matched = matchExtractedToInventory(normalized, inventory, whId);
-    setNote(matched);
+    return matchExtractedToInventory(normalized, inventory, whId);
+  };
+
+  const enqueueDocs = (newDocs: QueuedStockInDoc[]) => {
+    if (newDocs.length === 0) return;
+    setQueuedDocs((prev) => [...prev, ...newDocs]);
+    setActiveDocId(newDocs[0].id);
+  };
+
+  const removeQueuedDoc = (docId: string) => {
+    setQueuedDocs((prev) => {
+      const remaining = prev.filter((d) => d.id !== docId);
+      if (activeDocId === docId) {
+        setActiveDocId(remaining[0]?.id || null);
+      }
+      return remaining;
+    });
   };
 
   const recalcNotePrices = (
@@ -213,68 +308,74 @@ export function SmartStockInView() {
 
   const handleWarehouseChange = (newWhId: string) => {
     setTargetWarehouseId(newWhId);
-    if (note) {
-      setNote(matchExtractedToInventory(note, inventory, newWhId));
-    }
+    setQueuedDocs((prev) =>
+      prev.map((d) => ({
+        ...d,
+        note: matchExtractedToInventory(d.note, inventory, newWhId),
+      }))
+    );
   };
 
-  const handleFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    e.target.value = '';
-
+  const extractSingleFile = async (
+    file: File,
+    index: number,
+    total: number
+  ): Promise<QueuedStockInDoc | null> => {
+    const prefix = total > 1 ? `(${index + 1}/${total}) ${file.name}: ` : '';
     const lower = file.name.toLowerCase();
-    if (lower.endsWith('.csv') || lower.endsWith('.tsv') || lower.endsWith('.txt')) {
+
+    if (lower.endsWith('.csv') || lower.endsWith('.tsv')) {
       const text = await file.text();
-      if (lower.endsWith('.csv') || lower.endsWith('.tsv')) {
-        const parsed = parseQuickStockCsv(text);
-        if (parsed.items.length === 0) {
-          notify('CSV soubor neobsahuje rozpoznatelné řádky položek.', 'error');
-          return;
-        }
-        applyExtractedNote(parsed, effectiveWarehouseId);
-        notify(`Rozpoznáno ${parsed.items.length} položek z CSV.`);
-        return;
+      const parsed = parseQuickStockCsv(text);
+      if (parsed.items.length === 0) {
+        notify(`${file.name}: CSV soubor neobsahuje rozpoznatelné řádky položek.`, 'error');
+        return null;
       }
-      setRawText(text);
-      setMode('TEXT');
-      return;
+      return {
+        id: `q_${Date.now()}_${index}_${Math.random().toString(36).slice(2, 6)}`,
+        fileName: file.name,
+        mimeType: file.type || 'text/csv',
+        fileSize: file.size,
+        fileBlob: file,
+        rawText: text,
+        method: 'CSV',
+        note: normalizeAndMatchNote(parsed, effectiveWarehouseId),
+      };
     }
 
-    setExtracting(true);
-    setLastExtractError(null);
-    setRawExtractedText('');
-    setShowRawText(false);
+    if (lower.endsWith('.txt')) {
+      const text = await file.text();
+      const result = await extractTextLocally(text, { ownCompanyIco: activeCompany?.ico });
+      return {
+        id: `q_${Date.now()}_${index}_${Math.random().toString(36).slice(2, 6)}`,
+        fileName: file.name,
+        mimeType: file.type || 'text/plain',
+        fileSize: file.size,
+        fileBlob: file,
+        rawText: result.rawText,
+        method: 'TEXT',
+        note: normalizeAndMatchNote(result.note, effectiveWarehouseId),
+      };
+    }
 
     const isXmlFile = lower.endsWith('.xml') || lower.endsWith('.isdoc') || file.type.includes('xml');
 
-    try {
-      if (engine === 'LOCAL' || isXmlFile) {
-        setProgressText('Zpracovávám doklad lokálně bez AI…');
-        const result = await extractFileLocally(file, {
-          ownCompanyIco: activeCompany?.ico,
-          onProgress: (label) => setProgressText(label),
-        });
-        setRawExtractedText(result.rawText);
-        setLastMethod(result.method);
+    if (engine === 'LOCAL' || isXmlFile) {
+      setProgressText(`${prefix}Zpracovávám doklad lokálně bez AI…`);
+      const result = await extractFileLocally(file, {
+        ownCompanyIco: activeCompany?.ico,
+        onProgress: (label) => setProgressText(`${prefix}${label}`),
+      });
 
-        const methodLabel =
-          result.method === 'ISDOC_XML'
-            ? 'ISDOC XML'
-            : result.method === 'POHODA_XML'
-              ? 'POHODA XML'
-              : result.method === 'PDF_TEXT'
-                ? 'PDF text'
-                : 'lokální OCR';
-
-        if (result.note.items.length === 0) {
-          applyExtractedNote(
-            {
+      const baseNote: ExtractedDeliveryNote =
+        result.note.items.length > 0
+          ? result.note
+          : {
               ...result.note,
               items: [
                 {
-                  id: `manual_${Date.now()}`,
-                  sku: 'SKU-001',
+                  id: `manual_${Date.now()}_${index}`,
+                  sku: '',
                   name: '',
                   ean: '',
                   quantity: 0,
@@ -286,87 +387,123 @@ export function SmartStockInView() {
                   selected: true,
                 },
               ],
-            },
-            effectiveWarehouseId
-          );
-          setShowRawText(true);
-          notify(
-            `Doklad byl přečten (${methodLabel}), ale tabulka položek má nestandardní formát. Rozpoznaný text je zobrazen níže pro rychlou kontrolu.`,
-            'info'
-          );
+            };
+
+      if (result.note.items.length === 0) {
+        setShowRawText(true);
+      }
+
+      return {
+        id: `q_${Date.now()}_${index}_${Math.random().toString(36).slice(2, 6)}`,
+        fileName: file.name,
+        mimeType: file.type || 'application/octet-stream',
+        fileSize: file.size,
+        fileBlob: file,
+        rawText: result.rawText,
+        method: result.method,
+        note: normalizeAndMatchNote(baseNote, effectiveWarehouseId),
+      };
+    }
+
+    // Optional Gemini AI mode
+    setProgressText(`${prefix}AI čte položky, množství a ceny z dokladu…`);
+    let base64Data = '';
+    let mimeType = file.type || 'image/jpeg';
+
+    if (mimeType.startsWith('image/') && file.size > 1_500_000) {
+      const compressed = await new Promise<{ data: string; mime: string }>((resolve, reject) => {
+        const img = new Image();
+        const objectUrl = URL.createObjectURL(file);
+        img.onload = () => {
+          URL.revokeObjectURL(objectUrl);
+          const maxDim = 1800;
+          const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.max(1, Math.round(img.width * scale));
+          canvas.height = Math.max(1, Math.round(img.height * scale));
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            reject(new Error('Nepodařilo se zpracovat obrázek.'));
+            return;
+          }
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+          const comma = dataUrl.indexOf(',');
+          resolve({ data: comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl, mime: 'image/jpeg' });
+        };
+        img.onerror = () => {
+          URL.revokeObjectURL(objectUrl);
+          reject(new Error('Nepodařilo se načíst obrázek.'));
+        };
+        img.src = objectUrl;
+      });
+      base64Data = compressed.data;
+      mimeType = compressed.mime;
+    } else {
+      base64Data = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const result = String(reader.result || '');
+          const comma = result.indexOf(',');
+          resolve(comma >= 0 ? result.slice(comma + 1) : result);
+        };
+        reader.onerror = () => reject(new Error('Nepodařilo se načíst soubor.'));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    const payload = { base64Data, mimeType, fileName: file.name };
+    setLastFilePayload({ ...payload, fileBlob: file });
+
+    const extracted = await extractAiDeliveryNote(payload);
+    return {
+      id: `q_${Date.now()}_${index}_${Math.random().toString(36).slice(2, 6)}`,
+      fileName: file.name,
+      mimeType: file.type || mimeType,
+      fileSize: file.size,
+      fileBlob: file,
+      rawText: '',
+      method: 'GEMINI',
+      note: normalizeAndMatchNote(extracted, effectiveWarehouseId),
+    };
+  };
+
+  const handleFilesSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const fileList = Array.from(e.target.files || []);
+    if (fileList.length === 0) return;
+    e.target.value = '';
+
+    setExtracting(true);
+    setLastExtractError(null);
+    setShowRawText(false);
+
+    const added: QueuedStockInDoc[] = [];
+    let failedCount = 0;
+
+    try {
+      for (let i = 0; i < fileList.length; i++) {
+        try {
+          const docItem = await extractSingleFile(fileList[i], i, fileList.length);
+          if (docItem) added.push(docItem);
+        } catch (err) {
+          failedCount++;
+          const msg = err instanceof Error ? err.message : 'Zpracování dokladu selhalo.';
+          setLastExtractError(`${fileList[i].name}: ${msg}`);
+          notify(`${fileList[i].name}: ${msg}`, 'error');
+        }
+      }
+
+      if (added.length > 0) {
+        enqueueDocs(added);
+        const totalLines = added.reduce((s, d) => s + d.note.items.length, 0);
+        if (added.length === 1) {
+          notify(`Načten doklad ${added[0].fileName} (${totalLines} položek).`);
         } else {
-          applyExtractedNote(result.note, effectiveWarehouseId);
           notify(
-            `Lokálně (${methodLabel}) rozpoznáno ${result.note.items.length} položek z ${file.name}.`
+            `Načteno ${added.length} dokladů k hromadnému naskladnění (celkem ${totalLines} položek)${failedCount > 0 ? `, ${failedCount} selhalo` : ''}.`
           );
         }
-        return;
       }
-
-      // Optional Gemini AI mode
-      setProgressText('AI čte položky, množství a ceny z dokladu…');
-      let base64Data = '';
-      let mimeType = file.type || 'image/jpeg';
-
-      if (mimeType.startsWith('image/') && file.size > 1_500_000) {
-        const compressed = await new Promise<{ data: string; mime: string }>((resolve, reject) => {
-          const img = new Image();
-          const objectUrl = URL.createObjectURL(file);
-          img.onload = () => {
-            URL.revokeObjectURL(objectUrl);
-            const maxDim = 1800;
-            const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
-            const canvas = document.createElement('canvas');
-            canvas.width = Math.max(1, Math.round(img.width * scale));
-            canvas.height = Math.max(1, Math.round(img.height * scale));
-            const ctx = canvas.getContext('2d');
-            if (!ctx) {
-              reject(new Error('Nepodařilo se zpracovat obrázek.'));
-              return;
-            }
-            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-            const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
-            const comma = dataUrl.indexOf(',');
-            resolve({ data: comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl, mime: 'image/jpeg' });
-          };
-          img.onerror = () => {
-            URL.revokeObjectURL(objectUrl);
-            reject(new Error('Nepodařilo se načíst obrázek.'));
-          };
-          img.src = objectUrl;
-        });
-        base64Data = compressed.data;
-        mimeType = compressed.mime;
-      } else {
-        base64Data = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => {
-            const result = String(reader.result || '');
-            const comma = result.indexOf(',');
-            resolve(comma >= 0 ? result.slice(comma + 1) : result);
-          };
-          reader.onerror = () => reject(new Error('Nepodařilo se načíst soubor.'));
-          reader.readAsDataURL(file);
-        });
-      }
-
-      const payload = {
-        base64Data,
-        mimeType,
-        fileName: file.name,
-      };
-      setLastFilePayload(payload);
-      setLastExtractError(null);
-
-      const extracted = await extractAiDeliveryNote(payload);
-      setLastMethod('GEMINI');
-      applyExtractedNote(extracted, effectiveWarehouseId);
-      setLastExtractError(null);
-      notify(`AI rozpoznala ${extracted.items.length} položek z dokladu ${file.name}.`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Zpracování dokladu selhalo.';
-      setLastExtractError(msg);
-      notify(msg, 'error');
     } finally {
       setExtracting(false);
       setProgressText('');
@@ -379,13 +516,23 @@ export function SmartStockInView() {
     setProgressText('Znovu odesílám doklad do Gemini AI…');
     setLastExtractError(null);
     try {
-      const extracted = await extractAiDeliveryNote(lastFilePayload);
-      setLastMethod('GEMINI');
-      applyExtractedNote(extracted, effectiveWarehouseId);
-      setLastExtractError(null);
-      notify(
-        `AI rozpoznala ${extracted.items.length} položek z dokladu ${lastFilePayload.fileName}.`
-      );
+      const extracted = await extractAiDeliveryNote({
+        base64Data: lastFilePayload.base64Data,
+        mimeType: lastFilePayload.mimeType,
+        fileName: lastFilePayload.fileName,
+      });
+      const queued: QueuedStockInDoc = {
+        id: `q_${Date.now()}_retry`,
+        fileName: lastFilePayload.fileName,
+        mimeType: lastFilePayload.mimeType,
+        fileSize: lastFilePayload.fileBlob?.size || 0,
+        fileBlob: lastFilePayload.fileBlob || null,
+        rawText: '',
+        method: 'GEMINI',
+        note: normalizeAndMatchNote(extracted, effectiveWarehouseId),
+      };
+      enqueueDocs([queued]);
+      notify(`AI rozpoznala ${extracted.items.length} položek z dokladu ${lastFilePayload.fileName}.`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'AI zpracování selhalo.';
       setLastExtractError(msg);
@@ -408,8 +555,6 @@ export function SmartStockInView() {
         const result = await extractTextLocally(rawText.trim(), {
           ownCompanyIco: activeCompany?.ico,
         });
-        setRawExtractedText(result.rawText);
-        setLastMethod('TEXT');
         if (result.note.items.length === 0) {
           notify(
             'V textu se nepodařilo automaticky rozpoznat řádky s množstvím a cenou. Zkontrolujte formát nebo přepněte na záložku CSV.',
@@ -417,12 +562,35 @@ export function SmartStockInView() {
           );
           return;
         }
-        applyExtractedNote(result.note, effectiveWarehouseId);
+        const blob = new Blob([rawText.trim()], { type: 'text/plain;charset=utf-8' });
+        enqueueDocs([
+          {
+            id: `q_${Date.now()}_text`,
+            fileName: `${result.note.documentNumber || 'text-doklad'}.txt`,
+            mimeType: 'text/plain',
+            fileSize: blob.size,
+            fileBlob: blob,
+            rawText: result.rawText,
+            method: 'TEXT',
+            note: normalizeAndMatchNote(result.note, effectiveWarehouseId),
+          },
+        ]);
         notify(`Lokálně rozpoznáno ${result.note.items.length} položek z textu.`);
       } else {
         const extracted = await extractAiDeliveryNote({ rawText: rawText.trim() });
-        setLastMethod('GEMINI');
-        applyExtractedNote(extracted, effectiveWarehouseId);
+        const blob = new Blob([rawText.trim()], { type: 'text/plain;charset=utf-8' });
+        enqueueDocs([
+          {
+            id: `q_${Date.now()}_text_ai`,
+            fileName: `${extracted.documentNumber || 'text-doklad'}.txt`,
+            mimeType: 'text/plain',
+            fileSize: blob.size,
+            fileBlob: blob,
+            rawText: rawText.trim(),
+            method: 'GEMINI',
+            note: normalizeAndMatchNote(extracted, effectiveWarehouseId),
+          },
+        ]);
         notify(`AI extrahovala ${extracted.items.length} položek.`);
       }
     } catch (err) {
@@ -442,7 +610,19 @@ export function SmartStockInView() {
       notify('Nepodařilo se načíst žádné položky. Zkontrolujte oddělovač (středník/tabulátor).', 'error');
       return;
     }
-    applyExtractedNote(parsed, effectiveWarehouseId);
+    const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8' });
+    enqueueDocs([
+      {
+        id: `q_${Date.now()}_csv`,
+        fileName: `${parsed.documentNumber || 'import'}.csv`,
+        mimeType: 'text/csv',
+        fileSize: blob.size,
+        fileBlob: blob,
+        rawText: csvText,
+        method: 'CSV',
+        note: normalizeAndMatchNote(parsed, effectiveWarehouseId),
+      },
+    ]);
     notify(`Načteno ${parsed.items.length} položek z CSV.`);
   };
 
@@ -505,7 +685,7 @@ export function SmartStockInView() {
     if (!note) return;
     const newLine: ExtractedLineItem = {
       id: `manual_${Date.now()}`,
-      sku: `SKU-${Date.now() % 10000}`,
+      sku: '',
       name: '',
       ean: '',
       category: '',
@@ -564,9 +744,36 @@ export function SmartStockInView() {
     }
   };
 
-  const handleCommit = async () => {
-    if (!workspace || !note) return;
-    const selected = note.items.filter((i) => i.selected && i.name.trim() && i.quantity > 0);
+  const archiveCommittedDoc = async (docItem: QueuedStockInDoc) => {
+    if (!workspace) return;
+    try {
+      await saveArchivedStockInDocument({
+        workspaceId: workspace.id,
+        documentNumber: (docItem.note.documentNumber || docItem.fileName || 'Příjemka').slice(0, 100),
+        supplierName: docItem.note.supplierName || '',
+        supplierIco: docItem.note.supplierIco || '',
+        warehouseId: effectiveWarehouseId,
+        companyId: activeCompany?.id || 'company_1',
+        currency: docItem.note.currency || 'CZK',
+        exchangeRate: docItem.note.exchangeRate || 1,
+        fileName: docItem.fileName,
+        mimeType: docItem.mimeType,
+        fileSize: docItem.fileSize,
+        fileBlob: docItem.fileBlob || null,
+        rawText: docItem.rawText || '',
+        items: mapLinesToArchivedItems(docItem.note.items, defaultCategory),
+      });
+      setArchiveTick((t) => t + 1);
+    } catch {
+      // Non-fatal: stock-in itself succeeded even if browser storage is restricted
+    }
+  };
+
+  const handleCommitActive = async () => {
+    if (!workspace || !activeDoc) return;
+    const selected = activeDoc.note.items.filter(
+      (i) => i.selected && i.name.trim() && i.quantity > 0
+    );
     if (selected.length === 0) {
       notify('Vyberte alespoň jednu platnou položku k naskladnění.', 'error');
       return;
@@ -577,24 +784,192 @@ export function SmartStockInView() {
         workspace,
         warehouseId: effectiveWarehouseId,
         companyId: activeCompany?.id || 'company_1',
-        supplierName: note.supplierName,
-        documentNumber: note.documentNumber,
+        supplierName: activeDoc.note.supplierName,
+        documentNumber: activeDoc.note.documentNumber || activeDoc.fileName,
         defaultCategory,
-        currency: note.currency || 'CZK',
-        exchangeRate: note.exchangeRate || 1,
-        items: note.items,
+        currency: activeDoc.note.currency || 'CZK',
+        exchangeRate: activeDoc.note.exchangeRate || 1,
+        items: activeDoc.note.items,
         existingInventory: inventory,
       });
-      notify(`Úspěšně naskladněno ${count} položek a zapsáno do deníku pohybů.`);
-      setNote(null);
-      setRawText('');
-      setCsvText('');
+      await archiveCommittedDoc(activeDoc);
+      removeQueuedDoc(activeDoc.id);
+      if (queuedDocs.length <= 1) {
+        setRawText('');
+        setCsvText('');
+      }
+      notify(`Naskladněno ${count} položek a originál dokladu byl uložen do archivu.`);
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Hromadné naskladnění selhalo.', 'error');
     } finally {
       setCommitting(false);
     }
   };
+
+  const handleCommitAllQueued = async () => {
+    if (!workspace || queuedDocs.length === 0) return;
+    const validDocs = queuedDocs.filter((d) =>
+      d.note.items.some((i) => i.selected && i.name.trim() && i.quantity > 0)
+    );
+    if (validDocs.length === 0) {
+      notify('Žádný z nahraných dokladů neobsahuje platné položky k naskladnění.', 'error');
+      return;
+    }
+
+    setCommittingAll(true);
+    let totalItemsCommitted = 0;
+    let committedDocCount = 0;
+    const committedIds = new Set<string>();
+
+    // Maintain a running in-memory inventory copy across documents in this batch
+    // so if two invoices share the same product, the second adds to the first cleanly
+    const runningInventory: InventoryItem[] = inventory.map((i) => ({ ...i }));
+
+    try {
+      for (const qDoc of validDocs) {
+        const rematched = matchExtractedToInventory(qDoc.note, runningInventory, effectiveWarehouseId);
+        const count = await commitBulkStockIn({
+          workspace,
+          warehouseId: effectiveWarehouseId,
+          companyId: activeCompany?.id || 'company_1',
+          supplierName: rematched.supplierName,
+          documentNumber: rematched.documentNumber || qDoc.fileName,
+          defaultCategory,
+          currency: rematched.currency || 'CZK',
+          exchangeRate: rematched.exchangeRate || 1,
+          items: rematched.items,
+          existingInventory: runningInventory,
+          onCardMutated: (mutatedCard) => {
+            const idx = runningInventory.findIndex((i) => i.id === mutatedCard.id);
+            if (idx >= 0) runningInventory[idx] = mutatedCard;
+            else runningInventory.push(mutatedCard);
+          },
+        });
+
+        await archiveCommittedDoc(qDoc);
+        committedIds.add(qDoc.id);
+        committedDocCount++;
+        totalItemsCommitted += count;
+      }
+
+      setQueuedDocs((prev) => prev.filter((d) => !committedIds.has(d.id)));
+      setActiveDocId(null);
+      setRawText('');
+      setCsvText('');
+      notify(
+        `Hromadně naskladněno ${committedDocCount} dokladů (${totalItemsCommitted} položek) a všechny originály uloženy do archivu.`
+      );
+    } catch (err) {
+      if (committedIds.size > 0) {
+        setQueuedDocs((prev) => prev.filter((d) => !committedIds.has(d.id)));
+      }
+      notify(
+        err instanceof Error ? err.message : 'Hromadné naskladnění více dokladů selhalo.',
+        'error'
+      );
+    } finally {
+      setCommittingAll(false);
+    }
+  };
+
+  // Merge local IndexedDB archive + historical receipt documentRefs from Firestore movements
+  const mergedArchiveEntries = useMemo(() => {
+    const byRef = new Map<
+      string,
+      {
+        documentRef: string;
+        supplierName: string;
+        latestMs: number;
+        itemCount: number;
+        totalValue: number;
+        hasFile: boolean;
+        fileName: string;
+        archivedDoc: ArchivedStockInDocument | null;
+        mislinkedCount: number;
+        orphanCount: number;
+      }
+    >();
+
+    for (const d of archivedDocs) {
+      const ref = (d.documentNumber || d.fileName || d.id).trim();
+      const existing = byRef.get(ref);
+      if (!existing || d.createdAtMs > existing.latestMs) {
+        byRef.set(ref, {
+          documentRef: ref,
+          supplierName: d.supplierName || '',
+          latestMs: d.createdAtMs,
+          itemCount: d.items.length,
+          totalValue: round2(d.items.reduce((s, i) => s + i.quantity * i.purchasePrice, 0)),
+          hasFile: Boolean(d.fileBlob),
+          fileName: d.fileName || '',
+          archivedDoc: d,
+          mislinkedCount: 0,
+          orphanCount: 0,
+        });
+      }
+    }
+
+    // Group Firestore receipt movements by documentRef
+    const movGroups = new Map<string, typeof movements>();
+    for (const mov of movements) {
+      if (mov.quantityDelta <= 0) continue;
+      const ref = (mov.documentRef || '').trim();
+      if (!ref || ref === 'Ruční úprava' || ref === 'Příjemka') continue;
+      const arr = movGroups.get(ref) || [];
+      arr.push(mov);
+      movGroups.set(ref, arr);
+    }
+
+    for (const [ref, movs] of movGroups.entries()) {
+      let mislinkedCount = 0;
+      let orphanCount = 0;
+      let totalValue = 0;
+      let latestMs = 0;
+      for (const m of movs) {
+        totalValue += Math.abs(m.quantityDelta) * Math.max(0, m.unitPrice || 0);
+        const ms = timestampToMs(m.createdAt);
+        if (ms > latestMs) latestMs = ms;
+        const card = m.itemId ? inventoryById.get(m.itemId) : undefined;
+        if (!card) orphanCount++;
+        else if (!areNamesCompatible(m.itemName, card.name)) mislinkedCount++;
+      }
+
+      const existing = byRef.get(ref);
+      if (existing) {
+        existing.itemCount = movs.length;
+        existing.totalValue = round2(totalValue);
+        existing.latestMs = Math.max(existing.latestMs, latestMs);
+        existing.mislinkedCount = mislinkedCount;
+        existing.orphanCount = orphanCount;
+      } else {
+        const noteSupplier = movs[0]?.note?.replace(/^Příjemka\s*[–-]\s*/i, '') || '';
+        byRef.set(ref, {
+          documentRef: ref,
+          supplierName: noteSupplier,
+          latestMs,
+          itemCount: movs.length,
+          totalValue: round2(totalValue),
+          hasFile: false,
+          fileName: '',
+          archivedDoc: null,
+          mislinkedCount,
+          orphanCount,
+        });
+      }
+    }
+
+    const q = archiveSearch.trim().toLowerCase();
+    return Array.from(byRef.values())
+      .filter((entry) => {
+        if (!q) return true;
+        return (
+          entry.documentRef.toLowerCase().includes(q) ||
+          entry.supplierName.toLowerCase().includes(q) ||
+          entry.fileName.toLowerCase().includes(q)
+        );
+      })
+      .sort((a, b) => b.latestMs - a.latestMs);
+  }, [archivedDocs, movements, inventoryById, archiveSearch]);
 
   const docCurrency = (note?.currency || 'CZK').toUpperCase();
   const isForeignCurrency = docCurrency !== 'CZK';
@@ -630,16 +1005,41 @@ export function SmartStockInView() {
         )
       : 0;
 
+  const grandTotalQueuedCzk = useMemo(
+    () =>
+      round2(
+        queuedDocs.reduce(
+          (sum, d) =>
+            sum +
+            d.note.items
+              .filter((i) => i.selected)
+              .reduce((s, i) => s + Math.max(0, i.quantity) * Math.max(0, i.purchasePrice), 0),
+          0
+        )
+      ),
+    [queuedDocs]
+  );
+
+  const totalQueuedSelectedItems = useMemo(
+    () =>
+      queuedDocs.reduce(
+        (sum, d) =>
+          sum + d.note.items.filter((i) => i.selected && i.name.trim() && i.quantity > 0).length,
+        0
+      ),
+    [queuedDocs]
+  );
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
         <div>
           <p className="text-xs font-medium uppercase tracking-wider text-slate-500">
-            Hromadné naskladnění · {activeCompany?.name}
+            Hromadné naskladnění & archiv dokladů · {activeCompany?.name}
           </p>
           <h1 className="text-2xl font-bold text-slate-900 mt-1">AI Příjemka</h1>
           <p className="text-sm text-slate-500 mt-0.5">
-            Nahrajte fotku nebo PDF dodacího listu, vložte text dokladu nebo rychlý CSV seznam.
+            Nahrajte jeden nebo více dokladů najednou (PDF, XML, fotky, CSV) — každý doklad se po naskladnění uloží do archivu.
           </p>
         </div>
 
@@ -663,8 +1063,8 @@ export function SmartStockInView() {
 
       {/* Source selector */}
       <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-4">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
-          <div className="inline-flex items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200 self-start">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="inline-flex flex-wrap items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200 self-start">
             <button
               type="button"
               onClick={() => setMode('FILE')}
@@ -675,7 +1075,7 @@ export function SmartStockInView() {
               }`}
             >
               <ImageIcon className="w-3.5 h-3.5" />
-              PDF / XML / Fotka
+              PDF / XML / Fotky
             </button>
             <button
               type="button"
@@ -701,10 +1101,22 @@ export function SmartStockInView() {
               <FileSpreadsheet className="w-3.5 h-3.5" />
               Rychlý CSV / Excel
             </button>
+            <button
+              type="button"
+              onClick={() => setMode('ARCHIVE')}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors tabular-nums ${
+                mode === 'ARCHIVE'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Archive className="w-3.5 h-3.5" />
+              Archiv dokladů ({mergedArchiveEntries.length})
+            </button>
           </div>
 
-          {mode !== 'CSV' && (
-            <div className="inline-flex items-center gap-1 bg-slate-100 p-0.5 rounded-lg border border-slate-200 self-start md:self-auto">
+          {mode !== 'CSV' && mode !== 'ARCHIVE' && (
+            <div className="inline-flex items-center gap-1 bg-slate-100 p-0.5 rounded-lg border border-slate-200 self-start lg:self-auto">
               <button
                 type="button"
                 onClick={() => {
@@ -739,6 +1151,16 @@ export function SmartStockInView() {
           )}
         </div>
 
+        {/* Hidden multi-file input accessible from both upload dropzone and "+ Přidat další doklady" */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept="image/*,application/pdf,.xml,.isdoc,.csv,.tsv,.txt"
+          onChange={handleFilesSelected}
+          className="hidden"
+        />
+
         {mode === 'FILE' && (
           <div className="space-y-3">
             {lastExtractError && !extracting && (
@@ -772,29 +1194,22 @@ export function SmartStockInView() {
               </div>
             )}
             <div className="border-2 border-dashed border-slate-200 rounded-xl p-8 text-center bg-slate-50/50">
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/*,application/pdf,.xml,.isdoc,.csv,.tsv,.txt"
-                onChange={handleFileSelected}
-                className="hidden"
-              />
               {extracting ? (
                 <div className="flex flex-col items-center gap-3 py-4">
                   <Loader2 className="w-7 h-7 text-slate-700 animate-spin" />
                   <p className="text-sm font-medium text-slate-900">
-                    {progressText || 'Čtu položky, množství a ceny z dokladu…'}
+                    {progressText || 'Čtu položky, množství a ceny z dokladů…'}
                   </p>
                 </div>
               ) : (
                 <>
                   <Upload className="w-8 h-8 text-slate-400 mx-auto" />
                   <p className="mt-3 text-sm font-medium text-slate-900">
-                    Nahrajte fakturu, dodací list, ISDOC/POHODA XML nebo CSV
+                    Nahrajte jeden nebo více dokladů najednou (PDF, ISDOC/POHODA XML, fotky, CSV)
                   </p>
                   <p className="mt-1 text-xs text-slate-500">
                     {engine === 'LOCAL'
-                      ? 'Lokální zpracování v prohlížeči (bez AI, bez limitů a chyb 503): PDF, ISDOC/XML, JPG/PNG (lokální OCR) i CSV'
+                      ? 'Lokální zpracování bez limitů a chyb 503 · Můžete označit více souborů najednou pro hromadné naskladnění'
                       : 'Gemini AI extrakce: PDF, JPG, PNG, WebP (XML a CSV se vždy čtou lokálně)'}
                   </p>
                   <button
@@ -803,12 +1218,8 @@ export function SmartStockInView() {
                     style={{ backgroundColor: palette.primary }}
                     className="mt-4 inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white rounded-lg hover:opacity-95"
                   >
-                    {engine === 'LOCAL' ? (
-                      <Cpu className="w-4 h-4" />
-                    ) : (
-                      <Sparkles className="w-4 h-4" />
-                    )}
-                    Vybrat soubor k naskladnění
+                    <Files className="w-4 h-4" />
+                    Vybrat doklad(y) k naskladnění
                   </button>
                 </>
               )}
@@ -878,10 +1289,202 @@ export function SmartStockInView() {
             </div>
           </div>
         )}
+
+        {mode === 'ARCHIVE' && (
+          <div className="space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <p className="text-xs text-slate-500">
+                Uchované doklady z příjemek včetně originálních PDF/fotek a přehledu naskladněných položek. Kliknutím doklad otevřete.
+              </p>
+              <div className="relative sm:w-64">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                <input
+                  type="text"
+                  value={archiveSearch}
+                  onChange={(e) => setArchiveSearch(e.target.value)}
+                  placeholder="Hledat č. dokladu, dodavatele…"
+                  className="w-full pl-9 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg"
+                />
+              </div>
+            </div>
+
+            {mergedArchiveEntries.length === 0 ? (
+              <div className="p-8 text-center border border-dashed border-slate-200 rounded-xl text-xs text-slate-500">
+                Zatím nejsou k dispozici žádné doklady příjemek. Po naskladnění se zde každý doklad automaticky uloží.
+              </div>
+            ) : (
+              <div className="border border-slate-200 rounded-xl overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="border-b border-slate-200 bg-slate-50/70 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+                        <th className="py-2.5 px-4">Číslo dokladu</th>
+                        <th className="py-2.5 px-4">Dodavatel / Soubor</th>
+                        <th className="py-2.5 px-4">Datum</th>
+                        <th className="py-2.5 px-4 text-right">Položek</th>
+                        <th className="py-2.5 px-4 text-right">Hodnota</th>
+                        <th className="py-2.5 px-4 text-right">Akce</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {mergedArchiveEntries.map((entry) => (
+                        <tr
+                          key={entry.documentRef}
+                          className={
+                            entry.mislinkedCount > 0 || entry.orphanCount > 0
+                              ? 'bg-amber-50/40 hover:bg-amber-50/70'
+                              : 'hover:bg-slate-50/60'
+                          }
+                        >
+                          <td className="py-3 px-4 font-mono font-semibold text-slate-900">
+                            {entry.documentRef}
+                            {entry.mislinkedCount > 0 && (
+                              <span className="ml-2 inline-flex items-center gap-1 text-[11px] font-sans font-medium text-amber-800">
+                                <AlertTriangle className="w-3 h-3" />
+                                {entry.mislinkedCount}× jiná karta
+                              </span>
+                            )}
+                            {entry.orphanCount > 0 && (
+                              <span className="ml-2 inline-flex items-center gap-1 text-[11px] font-sans font-medium text-red-700">
+                                <AlertTriangle className="w-3 h-3" />
+                                {entry.orphanCount}× chybí
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-3 px-4">
+                            <p className="font-medium text-slate-800">
+                              {entry.supplierName || '—'}
+                            </p>
+                            {entry.hasFile ? (
+                              <p className="text-[11px] text-emerald-700 inline-flex items-center gap-1 mt-0.5">
+                                <Paperclip className="w-3 h-3" />
+                                {entry.fileName || 'Originální soubor uložen'}
+                              </p>
+                            ) : (
+                              <p className="text-[11px] text-slate-400 mt-0.5">
+                                Bez přiloženého souboru (lze přiložit po otevření)
+                              </p>
+                            )}
+                          </td>
+                          <td className="py-3 px-4 text-slate-500 tabular-nums whitespace-nowrap">
+                            {entry.latestMs
+                              ? new Date(entry.latestMs).toLocaleString('cs-CZ')
+                              : formatTimestampCz(null)}
+                          </td>
+                          <td className="py-3 px-4 text-right font-medium text-slate-700 tabular-nums">
+                            {entry.itemCount}
+                          </td>
+                          <td className="py-3 px-4 text-right font-semibold text-slate-900 tabular-nums whitespace-nowrap">
+                            {formatCzk(entry.totalValue)}
+                          </td>
+                          <td className="py-3 px-4 text-right whitespace-nowrap">
+                            <button
+                              type="button"
+                              onClick={() => setViewingDocRef(entry.documentRef)}
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-800 bg-white border border-slate-200 hover:bg-slate-100 rounded-lg"
+                            >
+                              <Eye className="w-3.5 h-3.5" />
+                              Otevřít doklad
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
+      {/* Multi-document queue bar (shown whenever 1+ documents are loaded) */}
+      {queuedDocs.length > 0 && mode !== 'ARCHIVE' && (
+        <div className="bg-slate-900 text-white rounded-xl p-4 space-y-3">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <Files className="w-4 h-4 text-emerald-400 shrink-0" />
+              <span className="text-xs font-semibold tabular-nums">
+                Fronta k naskladnění: {queuedDocs.length}{' '}
+                {queuedDocs.length === 1 ? 'doklad' : queuedDocs.length < 5 ? 'doklady' : 'dokladů'}{' '}
+                · {totalQueuedSelectedItems} položek · {formatCzk(grandTotalQueuedCzk)}
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={extracting}
+                onClick={() => fileInputRef.current?.click()}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-white/10 hover:bg-white/20 rounded-lg whitespace-nowrap"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                Přidat další doklady
+              </button>
+              {queuedDocs.length > 1 && (
+                <button
+                  type="button"
+                  disabled={committingAll || committing || totalQueuedSelectedItems === 0}
+                  onClick={handleCommitAllQueued}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg disabled:opacity-50 whitespace-nowrap"
+                >
+                  {committingAll ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Check className="w-3.5 h-3.5" />
+                  )}
+                  {committingAll
+                    ? 'Naskladňuji všechny doklady…'
+                    : `Naskladnit vše (${queuedDocs.length} dokladů · ${formatCzk(grandTotalQueuedCzk)})`}
+                </button>
+              )}
+            </div>
+          </div>
+
+          {queuedDocs.length > 1 && (
+            <div className="flex flex-wrap items-center gap-1.5 pt-2 border-t border-white/10">
+              {queuedDocs.map((d) => {
+                const isActive = d.id === activeDoc?.id;
+                const docItemsCount = d.note.items.filter((i) => i.selected).length;
+                return (
+                  <div
+                    key={d.id}
+                    className={`inline-flex items-center gap-1.5 pl-2.5 pr-1.5 py-1 rounded-lg text-xs transition-colors ${
+                      isActive
+                        ? 'bg-white text-slate-900 font-semibold'
+                        : 'bg-white/10 text-slate-200 hover:bg-white/20'
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setActiveDocId(d.id)}
+                      className="inline-flex items-center gap-1.5 max-w-[220px] truncate"
+                    >
+                      {d.fileBlob && <Paperclip className="w-3 h-3 shrink-0 opacity-70" />}
+                      <span className="truncate">
+                        {d.note.documentNumber || d.fileName}
+                      </span>
+                      <span className="opacity-70 tabular-nums">({docItemsCount})</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => removeQueuedDoc(d.id)}
+                      title="Odebrat z fronty"
+                      className={`p-0.5 rounded ${
+                        isActive ? 'hover:bg-slate-200' : 'hover:bg-white/20'
+                      }`}
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Optional raw extracted text preview for local PDF / OCR inspection */}
-      {rawExtractedText && (
+      {activeDoc?.rawText && mode !== 'ARCHIVE' && (
         <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
           <button
             type="button"
@@ -890,23 +1493,21 @@ export function SmartStockInView() {
           >
             <span className="inline-flex items-center gap-1.5">
               <Eye className="w-3.5 h-3.5 text-slate-400" />
-              Rozpoznaný text z dokladu
-              {lastMethod && (
-                <span className="font-mono text-[11px] text-slate-400">({lastMethod})</span>
-              )}
+              Rozpoznaný text z dokladu ({activeDoc.fileName})
+              <span className="font-mono text-[11px] text-slate-400">({activeDoc.method})</span>
             </span>
             <span className="text-slate-500">{showRawText ? 'Skrýt' : 'Zobrazit'}</span>
           </button>
           {showRawText && (
             <pre className="px-4 py-3 text-[11px] font-mono text-slate-700 bg-slate-50 border-t border-slate-100 max-h-60 overflow-auto whitespace-pre-wrap">
-              {rawExtractedText}
+              {activeDoc.rawText}
             </pre>
           )}
         </div>
       )}
 
       {/* Review & Commit table */}
-      {note && (
+      {note && mode !== 'ARCHIVE' && (
         <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
           <div className="p-5 border-b border-slate-100 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 flex-1">
@@ -987,8 +1588,8 @@ export function SmartStockInView() {
               </button>
               <button
                 type="button"
-                onClick={handleCommit}
-                disabled={committing || selectedCount === 0}
+                onClick={handleCommitActive}
+                disabled={committing || committingAll || selectedCount === 0}
                 style={{ backgroundColor: palette.primary }}
                 className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white rounded-lg disabled:opacity-60 whitespace-nowrap"
               >
@@ -997,7 +1598,8 @@ export function SmartStockInView() {
                 ) : (
                   <Check className="w-4 h-4" />
                 )}
-                Naskladnit ({selectedCount}) · {formatCzk(totalPurchase)}
+                {queuedDocs.length > 1 ? 'Naskladnit tento' : 'Naskladnit'} ({selectedCount}) ·{' '}
+                {formatCzk(totalPurchase)}
               </button>
             </div>
           </div>
@@ -1079,7 +1681,7 @@ export function SmartStockInView() {
                 <tr className="border-b border-slate-200 bg-slate-50/70 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
                   <th className="py-2.5 px-3 w-10"></th>
                   <th className="py-2.5 px-3">SKU</th>
-                  <th className="py-2.5 px-3">Název & párování na sklad</th>
+                  <th className="py-2.5 px-3">Název, párování & kategorie</th>
                   <th className="py-2.5 px-3 w-24 text-right">Množství</th>
                   <th className="py-2.5 px-3 w-20">MJ</th>
                   {isForeignCurrency && (
@@ -1108,11 +1710,12 @@ export function SmartStockInView() {
                       <input
                         type="text"
                         value={line.sku}
+                        placeholder="Auto unikátní"
                         onChange={(e) => updateLine(line.id, { sku: e.target.value })}
                         className="w-28 px-2 py-1 text-xs font-mono border border-slate-200 rounded-md"
                       />
                     </td>
-                    <td className="py-2 px-3 min-w-[240px]">
+                    <td className="py-2 px-3 min-w-[260px]">
                       <input
                         type="text"
                         value={line.name}
@@ -1244,6 +1847,24 @@ export function SmartStockInView() {
             </table>
           </div>
         </div>
+      )}
+
+      {/* Document Archive Viewer Modal */}
+      {viewingDocRef && workspace && (
+        <StockInDocumentModal
+          workspace={workspace}
+          documentRef={viewingDocRef}
+          archivedDoc={
+            mergedArchiveEntries.find((e) => e.documentRef === viewingDocRef)?.archivedDoc || null
+          }
+          movements={movements}
+          inventory={inventory}
+          warehouses={warehouses}
+          accentColor={palette.primary}
+          onClose={() => setViewingDocRef(null)}
+          onArchiveChanged={() => setArchiveTick((t) => t + 1)}
+          onNotify={notify}
+        />
       )}
     </div>
   );

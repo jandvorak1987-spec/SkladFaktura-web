@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   ArrowDownLeft,
@@ -10,14 +10,17 @@ import {
   Copy,
   Download,
   Edit3,
+  FileText,
   Folder,
   FolderTree,
+  GitBranch,
   Globe,
   History,
   Layers,
   List,
   Minus,
   Package,
+  Paperclip,
   Percent,
   Plus,
   RotateCcw,
@@ -32,15 +35,23 @@ import { InventoryAuditPanel } from './InventoryAuditPanel';
 import { InventoryBulkModals, type BulkActionModalType } from './InventoryBulkModals';
 import { NerxCategorizeModal } from './NerxCategorizeModal';
 import { QtyInput } from './QtyInput';
+import { StockInDocumentModal } from './StockInDocumentModal';
 import { useApp } from '../context/AppContext';
+import { areNamesCompatible } from '../lib/bankParser';
 import {
   adjustInventoryStock,
   bulkEditInventoryFields,
+  bulkRestoreOrphanMovements,
   deleteInventoryItem,
   restoreOrphanMovementToInventory,
   saveInventoryItem,
+  splitMislinkedMovements,
   updateMinQuantity,
 } from '../lib/firestoreService';
+import {
+  listArchivedStockInDocuments,
+  type ArchivedStockInDocument,
+} from '../lib/stockInArchive';
 import {
   exportInventoryToCsv,
   formatCzk,
@@ -79,6 +90,7 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
   const {
     workspace,
     activeCompany,
+    warehouses,
     accessibleWarehouses,
     inventory,
     movements,
@@ -96,6 +108,12 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
   const [renamingCategory, setRenamingCategory] = useState<string | null>(null);
   const [renamingCategoryVal, setRenamingCategoryVal] = useState('');
   const [restoringMovId, setRestoringMovId] = useState<string | null>(null);
+  const [splittingMovId, setSplittingMovId] = useState<string | null>(null);
+  const [bulkRepairing, setBulkRepairing] = useState<'MISLINKED' | 'ORPHAN' | null>(null);
+  const [movementFilter, setMovementFilter] = useState<'ALL' | 'MISLINKED' | 'ORPHAN'>('ALL');
+  const [archivedDocs, setArchivedDocs] = useState<ArchivedStockInDocument[]>([]);
+  const [archiveTick, setArchiveTick] = useState(0);
+  const [viewingDocRef, setViewingDocRef] = useState<string | null>(null);
   const [onlyLowStock, setOnlyLowStock] = useState(false);
 
   const [editingItem, setEditingItem] = useState<ItemFormState | null>(null);
@@ -115,6 +133,26 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
   const [bulkModal, setBulkModal] = useState<BulkActionModalType>(null);
   const [nerxTargetItems, setNerxTargetItems] = useState<InventoryItem[] | null>(null);
 
+  useEffect(() => {
+    if (!workspace?.id) return;
+    let active = true;
+    listArchivedStockInDocuments(workspace.id).then((docs) => {
+      if (active) setArchivedDocs(docs);
+    });
+    return () => {
+      active = false;
+    };
+  }, [workspace?.id, archiveTick]);
+
+  const archivedByRef = useMemo(() => {
+    const map = new Map<string, ArchivedStockInDocument>();
+    for (const d of archivedDocs) {
+      const key = (d.documentNumber || '').trim();
+      if (key && !map.has(key)) map.set(key, d);
+    }
+    return map;
+  }, [archivedDocs]);
+
   const whMap = useMemo(
     () => new Map(accessibleWarehouses.map((w) => [w.id, w])),
     [accessibleWarehouses]
@@ -124,8 +162,12 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
 
   const accessibleItems = useMemo(() => {
     const allowed = new Set(accessibleWarehouses.map((w) => w.id));
-    return inventory.filter((i) => allowed.has(i.warehouseId));
-  }, [inventory, accessibleWarehouses]);
+    const knownWhIds = new Set(warehouses.map((w) => w.id));
+    // Never hide cards with an empty/unknown warehouseId
+    return inventory.filter(
+      (i) => !i.warehouseId || allowed.has(i.warehouseId) || !knownWhIds.has(i.warehouseId)
+    );
+  }, [inventory, accessibleWarehouses, warehouses]);
 
   const warehouseScopedItems = useMemo(() => {
     if (selectedWarehouseId === 'ALL') return accessibleItems;
@@ -206,19 +248,64 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
 
   const filteredMovements = useMemo(() => {
     const allowed = new Set(accessibleWarehouses.map((w) => w.id));
+    const knownWhIds = new Set(warehouses.map((w) => w.id));
     const q = search.trim().toLowerCase();
     return movements.filter((m) => {
-      if (!allowed.has(m.warehouseId)) return false;
+      if (m.warehouseId && !allowed.has(m.warehouseId) && knownWhIds.has(m.warehouseId)) {
+        return false;
+      }
       if (selectedWarehouseId !== 'ALL' && m.warehouseId !== selectedWarehouseId) return false;
       if (!q) return true;
+      const linked = m.itemId ? inventoryById.get(m.itemId) : undefined;
       return (
         m.itemName.toLowerCase().includes(q) ||
         m.itemSku.toLowerCase().includes(q) ||
         m.documentRef.toLowerCase().includes(q) ||
-        m.note.toLowerCase().includes(q)
+        m.note.toLowerCase().includes(q) ||
+        (linked ? linked.name.toLowerCase().includes(q) : false)
       );
     });
-  }, [movements, accessibleWarehouses, selectedWarehouseId, search]);
+  }, [movements, accessibleWarehouses, warehouses, selectedWarehouseId, search, inventoryById]);
+
+  const mislinkedMovementPairs = useMemo(() => {
+    const pairs: Array<{ movement: StockMovement; wrongCard: InventoryItem }> = [];
+    for (const mov of filteredMovements) {
+      if (mov.quantityDelta <= 0) continue;
+      const card = mov.itemId ? inventoryById.get(mov.itemId) : undefined;
+      if (card && !areNamesCompatible(mov.itemName, card.name)) {
+        pairs.push({ movement: mov, wrongCard: card });
+      }
+    }
+    return pairs;
+  }, [filteredMovements, inventoryById]);
+
+  const mislinkedIdSet = useMemo(
+    () => new Set(mislinkedMovementPairs.map((p) => p.movement.id)),
+    [mislinkedMovementPairs]
+  );
+
+  const orphanReceiptMovements = useMemo(
+    () =>
+      filteredMovements.filter(
+        (m) => m.quantityDelta > 0 && !(m.itemId && inventoryById.has(m.itemId))
+      ),
+    [filteredMovements, inventoryById]
+  );
+
+  const orphanIdSet = useMemo(
+    () => new Set(orphanReceiptMovements.map((m) => m.id)),
+    [orphanReceiptMovements]
+  );
+
+  const visibleMovements = useMemo(() => {
+    if (movementFilter === 'MISLINKED') {
+      return filteredMovements.filter((m) => mislinkedIdSet.has(m.id));
+    }
+    if (movementFilter === 'ORPHAN') {
+      return filteredMovements.filter((m) => orphanIdSet.has(m.id));
+    }
+    return filteredMovements;
+  }, [filteredMovements, movementFilter, mislinkedIdSet, orphanIdSet]);
 
   const totalFilteredValue = useMemo(
     () =>
@@ -469,6 +556,7 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
       await restoreOrphanMovementToInventory({
         workspace,
         movement: mov,
+        existingInventory: inventory,
       });
       notify(
         `Karta „${mov.itemName}“ (+${formatQty(mov.quantityDelta)} ${mov.unit}) byla zapsána na sklad.`
@@ -477,6 +565,60 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
       notify(err instanceof Error ? err.message : 'Obnovení karty na sklad selhalo.', 'error');
     } finally {
       setRestoringMovId(null);
+    }
+  };
+
+  const handleBulkRestoreOrphans = async () => {
+    if (!workspace || orphanReceiptMovements.length === 0) return;
+    setBulkRepairing('ORPHAN');
+    try {
+      const count = await bulkRestoreOrphanMovements({
+        workspace,
+        movements: orphanReceiptMovements,
+        existingInventory: inventory,
+      });
+      notify(`Zapsáno ${count} chybějících příjmů zpět na sklad (synchronizováno s Androidem).`);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Hromadné zapsání na sklad selhalo.', 'error');
+    } finally {
+      setBulkRepairing(null);
+    }
+  };
+
+  const handleSplitMislinkedSingle = async (mov: StockMovement, wrongCard: InventoryItem) => {
+    if (!workspace) return;
+    setSplittingMovId(mov.id);
+    try {
+      await splitMislinkedMovements({
+        workspace,
+        pairs: [{ movement: mov, wrongCard }],
+        allInventory: inventory,
+      });
+      notify(
+        `Odděleno: −${formatQty(mov.quantityDelta)} ${mov.unit} z „${wrongCard.name}“ → samostatná karta „${mov.itemName}“.`
+      );
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Oddělení položky selhalo.', 'error');
+    } finally {
+      setSplittingMovId(null);
+    }
+  };
+
+  const handleBulkSplitMislinked = async () => {
+    if (!workspace || mislinkedMovementPairs.length === 0) return;
+    setBulkRepairing('MISLINKED');
+    try {
+      const count = await splitMislinkedMovements({
+        workspace,
+        pairs: mislinkedMovementPairs,
+        allInventory: inventory,
+      });
+      notify(`Úspěšně odděleno ${count} chybně sloučených položek na jejich vlastní skladové karty.`);
+      setMovementFilter('ALL');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Hromadné oddělení karet selhalo.', 'error');
+    } finally {
+      setBulkRepairing(null);
     }
   };
 
@@ -1137,102 +1279,281 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
           onNotify={notify}
         />
       ) : (
-        <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-          {filteredMovements.length === 0 ? (
-            <div className="p-12 text-center text-sm text-slate-500">
-              Žádné skladové pohyby neodpovídají filtru.
+        <div className="space-y-3">
+          {/* Repair banners for mis-linked & orphaned receipts */}
+          {mislinkedMovementPairs.length > 0 && (
+            <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5">
+                <AlertTriangle className="w-4 h-4 text-amber-700 mt-0.5 shrink-0" />
+                <div className="text-xs text-amber-950">
+                  <p className="font-semibold">
+                    Nalezeno {mislinkedMovementPairs.length} příjmů připojených pod jiný název karty (kolize SKU)
+                  </p>
+                  <p className="mt-0.5 text-amber-800">
+                    Kusy se dříve přičetly k jiné položce (např. kvůli stejnému automatickému SKU-008). Kliknutím na „Oddělit vše“ je aplikace atomicky odečte z chybných karet a založí/přičte na správné vlastní karty.
+                  </p>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setMovementFilter('MISLINKED')}
+                  className="px-3 py-1.5 text-xs font-medium text-amber-900 bg-white border border-amber-300 hover:bg-amber-100 rounded-lg whitespace-nowrap"
+                >
+                  Zobrazit ({mislinkedMovementPairs.length})
+                </button>
+                <button
+                  type="button"
+                  disabled={bulkRepairing === 'MISLINKED'}
+                  onClick={handleBulkSplitMislinked}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-amber-700 hover:bg-amber-800 rounded-lg whitespace-nowrap disabled:opacity-60"
+                >
+                  <GitBranch className="w-3.5 h-3.5" />
+                  {bulkRepairing === 'MISLINKED'
+                    ? 'Odděluji…'
+                    : `Oddělit vše na vlastní karty (${mislinkedMovementPairs.length})`}
+                </button>
+              </div>
             </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-left border-collapse">
-                <thead>
-                  <tr className="border-b border-slate-200 bg-slate-50/70 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
-                    <th className="py-3 px-4">Datum</th>
-                    <th className="py-3 px-4">Typ</th>
-                    <th className="py-3 px-4">Položka</th>
-                    <th className="py-3 px-4">Sklad & Doklad</th>
-                    <th className="py-3 px-4 text-right">Množství</th>
-                    <th className="py-3 px-4 text-right">Hodnota</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100 text-sm">
-                  {filteredMovements.map((mov) => {
-                    const isReceipt = mov.quantityDelta > 0;
-                    const linkedItem = mov.itemId ? inventoryById.get(mov.itemId) : undefined;
-                    return (
-                      <tr key={mov.id} className="hover:bg-slate-50/60">
-                        <td className="py-3 px-4 text-xs text-slate-500 tabular-nums whitespace-nowrap">
-                          {formatTimestampCz(mov.createdAt)}
-                        </td>
-                        <td className="py-3 px-4 whitespace-nowrap">
-                          <span
-                            className={`inline-flex items-center gap-1 text-xs font-medium ${
-                              isReceipt ? 'text-emerald-700' : 'text-amber-700'
-                            }`}
-                          >
-                            {isReceipt ? (
-                              <ArrowDownLeft className="w-3.5 h-3.5" />
+          )}
+
+          {orphanReceiptMovements.length > 0 && (
+            <div className="bg-red-50 border border-red-200 rounded-xl p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5">
+                <AlertTriangle className="w-4 h-4 text-red-700 mt-0.5 shrink-0" />
+                <div className="text-xs text-red-950">
+                  <p className="font-semibold">
+                    Nalezeno {orphanReceiptMovements.length} příjmů bez skladové karty
+                  </p>
+                  <p className="mt-0.5 text-red-800">
+                    Pohyb je v deníku, ale odpovídající skladová karta neexistuje. Jedním kliknutím je zapíšete zpět na sklad.
+                  </p>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setMovementFilter('ORPHAN')}
+                  className="px-3 py-1.5 text-xs font-medium text-red-900 bg-white border border-red-300 hover:bg-red-100 rounded-lg whitespace-nowrap"
+                >
+                  Zobrazit ({orphanReceiptMovements.length})
+                </button>
+                <button
+                  type="button"
+                  disabled={bulkRepairing === 'ORPHAN'}
+                  onClick={handleBulkRestoreOrphans}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg whitespace-nowrap disabled:opacity-60"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  {bulkRepairing === 'ORPHAN'
+                    ? 'Zapisuji…'
+                    : `Zapsat vše na sklad (${orphanReceiptMovements.length})`}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Movement filter strip */}
+          <div className="flex flex-wrap items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => setMovementFilter('ALL')}
+              className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors tabular-nums ${
+                movementFilter === 'ALL'
+                  ? 'bg-slate-900 text-white border-slate-900'
+                  : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              Všechny pohyby ({filteredMovements.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setMovementFilter('MISLINKED')}
+              className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors tabular-nums ${
+                movementFilter === 'MISLINKED'
+                  ? 'bg-amber-700 text-white border-amber-700'
+                  : mislinkedMovementPairs.length > 0
+                    ? 'bg-amber-50 text-amber-900 border-amber-200 hover:bg-amber-100'
+                    : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              Jiná karta ({mislinkedMovementPairs.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setMovementFilter('ORPHAN')}
+              className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors tabular-nums ${
+                movementFilter === 'ORPHAN'
+                  ? 'bg-red-700 text-white border-red-700'
+                  : orphanReceiptMovements.length > 0
+                    ? 'bg-red-50 text-red-900 border-red-200 hover:bg-red-100'
+                    : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              Chybí ve skladu ({orphanReceiptMovements.length})
+            </button>
+          </div>
+
+          <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+            {visibleMovements.length === 0 ? (
+              <div className="p-12 text-center text-sm text-slate-500">
+                Žádné skladové pohyby neodpovídají filtru.
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse">
+                  <thead>
+                    <tr className="border-b border-slate-200 bg-slate-50/70 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+                      <th className="py-3 px-4">Datum</th>
+                      <th className="py-3 px-4">Typ</th>
+                      <th className="py-3 px-4">Položka & Připojená karta</th>
+                      <th className="py-3 px-4">Sklad & Doklad</th>
+                      <th className="py-3 px-4 text-right">Množství</th>
+                      <th className="py-3 px-4 text-right">Hodnota</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 text-sm">
+                    {visibleMovements.map((mov) => {
+                      const isReceipt = mov.quantityDelta > 0;
+                      const linkedItem = mov.itemId ? inventoryById.get(mov.itemId) : undefined;
+                      const isMislinked = Boolean(
+                        isReceipt && linkedItem && !areNamesCompatible(mov.itemName, linkedItem.name)
+                      );
+                      const docRefClean = (mov.documentRef || '').trim();
+                      const hasArchivedFile = Boolean(
+                        docRefClean && archivedByRef.get(docRefClean)?.fileBlob
+                      );
+
+                      return (
+                        <tr
+                          key={mov.id}
+                          className={
+                            isMislinked
+                              ? 'bg-amber-50/50 hover:bg-amber-50/80'
+                              : !linkedItem && isReceipt
+                                ? 'bg-red-50/40 hover:bg-red-50/70'
+                                : 'hover:bg-slate-50/60'
+                          }
+                        >
+                          <td className="py-3 px-4 text-xs text-slate-500 tabular-nums whitespace-nowrap">
+                            {formatTimestampCz(mov.createdAt)}
+                          </td>
+                          <td className="py-3 px-4 whitespace-nowrap">
+                            <span
+                              className={`inline-flex items-center gap-1 text-xs font-medium ${
+                                isReceipt ? 'text-emerald-700' : 'text-amber-700'
+                              }`}
+                            >
+                              {isReceipt ? (
+                                <ArrowDownLeft className="w-3.5 h-3.5" />
+                              ) : (
+                                <ArrowUpRight className="w-3.5 h-3.5" />
+                              )}
+                              {isReceipt ? 'Příjem' : 'Výdej'}
+                            </span>
+                          </td>
+                          <td className="py-3 px-4">
+                            <p className="font-medium text-slate-900">{mov.itemName}</p>
+                            <p className="text-xs font-mono text-slate-500">{mov.itemSku}</p>
+                            {linkedItem ? (
+                              isMislinked ? (
+                                <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                                  <span className="inline-flex items-center gap-1 text-[11px] font-medium text-amber-900">
+                                    <AlertTriangle className="w-3 h-3 shrink-0" />
+                                    Připojeno k jiné kartě: <strong>{linkedItem.name}</strong> (
+                                    {formatQty(linkedItem.quantity)} {linkedItem.unit})
+                                  </span>
+                                  <button
+                                    type="button"
+                                    disabled={splittingMovId === mov.id}
+                                    onClick={() => handleSplitMislinkedSingle(mov, linkedItem)}
+                                    className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium text-amber-950 bg-amber-100 hover:bg-amber-200 border border-amber-300 rounded transition-colors disabled:opacity-50"
+                                  >
+                                    <GitBranch className="w-3 h-3" />
+                                    {splittingMovId === mov.id
+                                      ? 'Odděluji…'
+                                      : 'Oddělit na vlastní kartu'}
+                                  </button>
+                                </div>
+                              ) : (
+                                <p className="text-[11px] text-slate-500 mt-0.5 tabular-nums">
+                                  Karta: <span className="text-slate-700">{linkedItem.name}</span> · Na
+                                  skladě:{' '}
+                                  <strong className="text-emerald-700">
+                                    {formatQty(linkedItem.quantity)} {linkedItem.unit}
+                                  </strong>
+                                  {linkedItem.category ? ` · ${linkedItem.category}` : ''}
+                                </p>
+                              )
                             ) : (
-                              <ArrowUpRight className="w-3.5 h-3.5" />
+                              <div className="mt-1 flex flex-wrap items-center gap-2">
+                                <span className="inline-flex items-center gap-1 text-[11px] font-medium text-red-800">
+                                  <AlertTriangle className="w-3 h-3" />
+                                  Karta ve skladu neexistuje
+                                </span>
+                                {isReceipt && (
+                                  <button
+                                    type="button"
+                                    disabled={restoringMovId === mov.id}
+                                    onClick={() => handleRestoreOrphanMovement(mov)}
+                                    className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded transition-colors disabled:opacity-50"
+                                  >
+                                    <RotateCcw className="w-3 h-3" />
+                                    {restoringMovId === mov.id ? 'Ukládám…' : 'Zapsat na sklad'}
+                                  </button>
+                                )}
+                              </div>
                             )}
-                            {isReceipt ? 'Příjem' : 'Výdej'}
-                          </span>
-                        </td>
-                        <td className="py-3 px-4">
-                          <p className="font-medium text-slate-900">{mov.itemName}</p>
-                          <p className="text-xs font-mono text-slate-500">{mov.itemSku}</p>
-                          {linkedItem ? (
-                            <p className="text-[11px] text-slate-500 mt-0.5 tabular-nums">
-                              Na skladě: <strong className="text-slate-700">{formatQty(linkedItem.quantity)} {linkedItem.unit}</strong>
-                              {linkedItem.category ? ` · ${linkedItem.category}` : ''}
+                          </td>
+                          <td className="py-3 px-4 text-xs text-slate-600">
+                            <p className="font-medium text-slate-800">
+                              {whMap.get(mov.warehouseId)?.name || mov.warehouseId}
                             </p>
-                          ) : (
-                            <div className="mt-1 flex flex-wrap items-center gap-2">
-                              <span className="inline-flex items-center gap-1 text-[11px] font-medium text-amber-800">
-                                <AlertTriangle className="w-3 h-3" />
-                                Karta ve skladu neexistuje
+                            <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-slate-500">
+                              <span>
+                                {mov.documentRef}
+                                {mov.note ? ` · ${mov.note}` : ''}
                               </span>
-                              {isReceipt && (
+                              {isReceipt && docRefClean && (
                                 <button
                                   type="button"
-                                  disabled={restoringMovId === mov.id}
-                                  onClick={() => handleRestoreOrphanMovement(mov)}
-                                  className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded transition-colors disabled:opacity-50"
+                                  onClick={() => setViewingDocRef(docRefClean)}
+                                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 text-[11px] font-medium rounded border transition-colors ${
+                                    hasArchivedFile
+                                      ? 'text-emerald-800 bg-emerald-50 border-emerald-200 hover:bg-emerald-100'
+                                      : 'text-slate-600 bg-slate-50 border-slate-200 hover:bg-slate-100'
+                                  }`}
+                                  title="Otevřít doklad příjemky a všechny jeho položky"
                                 >
-                                  <RotateCcw className="w-3 h-3" />
-                                  {restoringMovId === mov.id ? 'Ukládám…' : 'Zapsat na sklad'}
+                                  {hasArchivedFile ? (
+                                    <Paperclip className="w-3 h-3" />
+                                  ) : (
+                                    <FileText className="w-3 h-3" />
+                                  )}
+                                  Doklad
                                 </button>
                               )}
                             </div>
-                          )}
-                        </td>
-                        <td className="py-3 px-4 text-xs text-slate-600">
-                          <p className="font-medium text-slate-800">
-                            {whMap.get(mov.warehouseId)?.name || mov.warehouseId}
-                          </p>
-                          <p className="text-slate-500">
-                            {mov.documentRef}
-                            {mov.note ? ` · ${mov.note}` : ''}
-                          </p>
-                        </td>
-                        <td
-                          className={`py-3 px-4 text-right font-semibold tabular-nums whitespace-nowrap ${
-                            isReceipt ? 'text-emerald-700' : 'text-amber-700'
-                          }`}
-                        >
-                          {isReceipt ? '+' : ''}
-                          {formatQty(mov.quantityDelta)} {mov.unit}
-                        </td>
-                        <td className="py-3 px-4 text-right text-slate-700 tabular-nums whitespace-nowrap">
-                          {formatCzk(Math.abs(mov.quantityDelta) * (mov.unitPrice || 0))}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
+                          </td>
+                          <td
+                            className={`py-3 px-4 text-right font-semibold tabular-nums whitespace-nowrap ${
+                              isReceipt ? 'text-emerald-700' : 'text-amber-700'
+                            }`}
+                          >
+                            {isReceipt ? '+' : ''}
+                            {formatQty(mov.quantityDelta)} {mov.unit}
+                          </td>
+                          <td className="py-3 px-4 text-right text-slate-700 tabular-nums whitespace-nowrap">
+                            {formatCzk(Math.abs(mov.quantityDelta) * (mov.unitPrice || 0))}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
         </div>
       )}
 
@@ -1579,6 +1900,21 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
             setSelectedIds(new Set());
           }}
           onError={(msg) => notify(msg, 'error')}
+        />
+      )}
+      {/* Stock-In Document Viewer & Repair Modal */}
+      {viewingDocRef && workspace && (
+        <StockInDocumentModal
+          workspace={workspace}
+          documentRef={viewingDocRef}
+          archivedDoc={archivedByRef.get(viewingDocRef) || null}
+          movements={movements}
+          inventory={inventory}
+          warehouses={warehouses}
+          accentColor={palette.primary}
+          onClose={() => setViewingDocRef(null)}
+          onArchiveChanged={() => setArchiveTick((t) => t + 1)}
+          onNotify={notify}
         />
       )}
     </div>

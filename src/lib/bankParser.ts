@@ -369,6 +369,42 @@ export function normalizeSkuKey(value: string): string {
     .replace(/[\s\-_./]+/g, '');
 }
 
+export function isSyntheticSku(sku: string): boolean {
+  const s = (sku || '').trim();
+  if (!s) return true;
+  return /^(sku|ai|imp|isdoc|poh|loc|item|pol)[-_ ]?\d{1,6}$/i.test(s);
+}
+
+export function areNamesCompatible(nameA: string, nameB: string): boolean {
+  const a = normalizeMatchKey(nameA);
+  const b = normalizeMatchKey(nameB);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  return tokensEqualSet(a, b);
+}
+
+export function generateUniqueSku(name: string, takenSkus: Set<string>): string {
+  const norm = normalizeMatchKey(name);
+  const words = norm.split(' ').filter(Boolean);
+  const prefix =
+    words
+      .slice(0, 3)
+      .map((w) => w.slice(0, 3).toUpperCase())
+      .join('-') || 'POL';
+  const baseStamp = (Date.now() % 100000).toString(36).toUpperCase();
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const suffix = attempt === 0 ? baseStamp : `${baseStamp}${attempt}`;
+    const candidate = `${prefix}-${suffix}`.slice(0, 48);
+    if (!takenSkus.has(normalizeSkuKey(candidate))) {
+      takenSkus.add(normalizeSkuKey(candidate));
+      return candidate;
+    }
+  }
+  const fallback = `POL-${Date.now()}-${Math.floor(Math.random() * 1000)}`.slice(0, 48);
+  takenSkus.add(normalizeSkuKey(fallback));
+  return fallback;
+}
+
 function tokensEqualSet(a: string, b: string): boolean {
   const ta = a.split(' ').filter((w) => w.length >= 1);
   const tb = b.split(' ').filter((w) => w.length >= 1);
@@ -392,10 +428,16 @@ export function findMatchingInventoryItem(
     if (byEan) return byEan;
   }
 
-  // Ignore auto-generated placeholder SKUs like SKU-001, AI-1234, IMP-1 when matching by SKU
-  const isSyntheticSku = /^(sku|ai|imp|isdoc|poh|loc)[-_]?\d+$/i.test((line.sku || '').trim());
-  if (skuKey.length >= 2 && !isSyntheticSku) {
-    const bySku = candidates.find((i) => normalizeSkuKey(i.sku) === skuKey);
+  // Never match by auto-generated placeholder SKUs like SKU-001..SKU-008, AI-1234, IMP-1
+  if (skuKey.length >= 2 && !isSyntheticSku(line.sku)) {
+    const bySku = candidates.find((i) => {
+      if (isSyntheticSku(i.sku) || normalizeSkuKey(i.sku) !== skuKey) return false;
+      // Extra guard: if both have names, ensure we didn't match two totally different products
+      if (nameKey.length >= 2 && normalizeMatchKey(i.name).length >= 2) {
+        return areNamesCompatible(i.name, line.name);
+      }
+      return true;
+    });
     if (bySku) return bySku;
   }
 
