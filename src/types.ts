@@ -233,6 +233,7 @@ export interface ExtractedLineItem {
   sku: string;
   name: string;
   ean: string;
+  category?: string;
   quantity: number;
   unit: string;
   originalPurchasePrice?: number;
@@ -242,6 +243,8 @@ export interface ExtractedLineItem {
   selected: boolean;
   matchedInventoryId?: string | null;
   matchedItemName?: string | null;
+  matchedOtherWarehouseId?: string | null;
+  manualMatchLock?: boolean;
 }
 
 export interface ExtractedDeliveryNote {

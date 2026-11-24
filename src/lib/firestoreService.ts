@@ -946,6 +946,33 @@ export async function bulkEditInventoryFields(params: {
   return items.length;
 }
 
+export async function bulkAssignItemCategories(params: {
+  workspace: Workspace;
+  assignments: Array<{ itemId: string; category: string }>;
+}): Promise<number> {
+  const { workspace, assignments } = params;
+  const valid = assignments.filter((a) => a.itemId && a.category.trim().length > 0);
+  if (valid.length === 0) return 0;
+
+  const root = wsRoot(workspace.id);
+  for (let i = 0; i < valid.length; i += 350) {
+    const chunk = valid.slice(i, i + 350);
+    const batch = writeBatch(db);
+    for (const { itemId, category } of chunk) {
+      batch.update(doc(root, 'inventory', itemId), {
+        category: category.trim().slice(0, 80),
+        updatedAt: serverTimestamp(),
+      });
+    }
+    try {
+      await batch.commit();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `workspaces/${workspace.id}/inventory`);
+    }
+  }
+  return valid.length;
+}
+
 export async function bulkDuplicateInventoryItems(params: {
   workspace: Workspace;
   items: InventoryItem[];
@@ -1106,6 +1133,8 @@ export async function commitInventoryAudit(params: {
 
 /**
  * Bulk stock-in commit for Smart Stock In (AI Příjemka / CSV Import).
+ * Safely accumulates quantities if multiple rows target the same inventory card,
+ * deduplicates identical new items within the same batch, and preserves exact warehouse alignment.
  */
 export async function commitBulkStockIn(params: {
   workspace: Workspace;
@@ -1113,6 +1142,7 @@ export async function commitBulkStockIn(params: {
   companyId: string;
   supplierName: string;
   documentNumber: string;
+  defaultCategory?: string;
   currency?: string;
   exchangeRate?: number;
   items: ExtractedLineItem[];
@@ -1124,6 +1154,7 @@ export async function commitBulkStockIn(params: {
     companyId,
     supplierName,
     documentNumber,
+    defaultCategory = '',
     currency,
     exchangeRate,
     items,
@@ -1137,57 +1168,112 @@ export async function commitBulkStockIn(params: {
   const safeWh = warehouseId || 'shared_main';
   const safeCompany = companyId || 'company_1';
   const docRefLabel = (documentNumber || 'AI Příjemka').slice(0, 100);
+  const cleanDefaultCategory = defaultCategory.trim().slice(0, 80);
   const fxTag =
     currency && currency !== 'CZK' && exchangeRate && exchangeRate > 0
       ? ` (${currency}, kurz ${exchangeRate} Kč)`
       : '';
+
+  const normalizeKey = (s: string) =>
+    (s || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim();
+
+  // Track running quantity across the entire commit so duplicate rows for the same card accumulate
+  const runningQty = new Map<string, number>();
+  const createdInRunByKey = new Map<string, { id: string; warehouseId: string; qty: number }>();
 
   for (let i = 0; i < selected.length; i += 180) {
     const chunk = selected.slice(i, i + 180);
     const batch = writeBatch(db);
 
     for (const line of chunk) {
-      const existing = line.matchedInventoryId ? invMap.get(line.matchedInventoryId) : undefined;
-      const qty = Math.max(0.01, round2(line.quantity));
-      const purchasePrice = Math.max(0, round2(line.purchasePrice));
-      const salePrice = Math.max(0, round2(line.suggestedSalePrice));
-      const vatRate = line.vatRate === 0 || line.vatRate === 12 || line.vatRate === 21 ? line.vatRate : 21;
+      let existing = line.matchedInventoryId ? invMap.get(line.matchedInventoryId) : undefined;
+      const qty = Math.max(0.01, round2(Number(line.quantity || 0)));
+      const purchasePrice = Math.max(0, round2(Number(line.purchasePrice || 0)));
+      const salePrice = Math.max(0, round2(Number(line.suggestedSalePrice || 0)));
+      const vatRate =
+        line.vatRate === 0 || line.vatRate === 12 || line.vatRate === 21 ? line.vatRate : 21;
       const unit = (line.unit || 'ks').trim().slice(0, 20) || 'ks';
       const sku = (line.sku || `AI-${Date.now() % 10000}`).trim().slice(0, 64);
       const name = line.name.trim().slice(0, 200);
+      const ean = (line.ean || '').trim().slice(0, 40);
+      const lineCategory = (line.category ?? '').trim().slice(0, 80) || cleanDefaultCategory;
+
+      // Fallback exact match in target warehouse if user did not explicitly force "new card"
+      if (!existing && !line.manualMatchLock) {
+        const nameKey = normalizeKey(name);
+        existing = existingInventory.find(
+          (inv) =>
+            inv.warehouseId === safeWh &&
+            ((ean.length >= 8 && inv.ean === ean) ||
+              (nameKey.length >= 2 && normalizeKey(inv.name) === nameKey))
+        );
+      }
 
       let itemId: string;
+      let movementWh = safeWh;
+
       if (existing) {
         itemId = existing.id;
-        batch.update(doc(root, 'inventory', existing.id), {
-          quantity: round2(existing.quantity + qty),
-          purchasePrice: purchasePrice > 0 ? purchasePrice : existing.purchasePrice,
-          salePrice: salePrice > 0 ? salePrice : existing.salePrice,
-          supplierName: (supplierName || existing.supplierName).slice(0, 160),
+        movementWh = existing.warehouseId || safeWh;
+        const baseQty = runningQty.has(existing.id)
+          ? runningQty.get(existing.id)!
+          : Number(existing.quantity || 0);
+        const nextQty = round2(baseQty + qty);
+        runningQty.set(existing.id, nextQty);
+
+        const updatePatch: Record<string, unknown> = {
+          quantity: nextQty,
+          purchasePrice: purchasePrice > 0 ? purchasePrice : Number(existing.purchasePrice || 0),
+          salePrice: salePrice > 0 ? salePrice : Number(existing.salePrice || 0),
+          supplierName: (supplierName || existing.supplierName || '').slice(0, 160),
           updatedAt: serverTimestamp(),
-        });
+        };
+        if (lineCategory && !existing.category) {
+          updatePatch.category = lineCategory;
+        }
+        batch.update(doc(root, 'inventory', existing.id), updatePatch);
       } else {
-        const newRef = doc(collection(root, 'inventory'));
-        itemId = newRef.id;
-        batch.set(newRef, {
-          workspaceId: workspace.id,
-          memberEmails: workspace.memberEmails,
-          sku,
-          name,
-          ean: (line.ean || '').trim().slice(0, 40),
-          category: 'Naskladněno AI',
-          unit,
-          quantity: qty,
-          minQuantity: 0,
-          purchasePrice,
-          salePrice,
-          vatRate,
-          warehouseId: safeWh,
-          supplierName: supplierName.trim().slice(0, 160),
-          notes: `Naskladněno z dokladu ${docRefLabel}${fxTag}`.slice(0, 500),
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        const dedupKey = `${safeWh}::${normalizeKey(name)}`;
+        const alreadyCreated = createdInRunByKey.get(dedupKey);
+        if (alreadyCreated) {
+          itemId = alreadyCreated.id;
+          movementWh = alreadyCreated.warehouseId;
+          alreadyCreated.qty = round2(alreadyCreated.qty + qty);
+          batch.update(doc(root, 'inventory', itemId), {
+            quantity: alreadyCreated.qty,
+            updatedAt: serverTimestamp(),
+          });
+        } else {
+          const newRef = doc(collection(root, 'inventory'));
+          itemId = newRef.id;
+          movementWh = safeWh;
+          createdInRunByKey.set(dedupKey, { id: itemId, warehouseId: safeWh, qty });
+
+          batch.set(newRef, {
+            workspaceId: workspace.id,
+            memberEmails: workspace.memberEmails,
+            sku,
+            name,
+            ean,
+            category: lineCategory,
+            unit,
+            quantity: qty,
+            minQuantity: 0,
+            purchasePrice,
+            salePrice,
+            vatRate,
+            warehouseId: safeWh,
+            supplierName: supplierName.trim().slice(0, 160),
+            notes: `Naskladněno z dokladu ${docRefLabel}${fxTag}`.slice(0, 500),
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
       }
 
       batch.set(doc(collection(root, 'stockMovements')), {
@@ -1196,14 +1282,14 @@ export async function commitBulkStockIn(params: {
         itemId,
         itemName: name,
         itemSku: sku,
-        warehouseId: safeWh,
+        warehouseId: movementWh,
         companyId: safeCompany,
         movementType: 'RECEIPT',
         quantityDelta: qty,
         unit,
         unitPrice: purchasePrice,
         documentRef: docRefLabel,
-        note: `AI Příjemka${supplierName ? ` – ${supplierName}` : ''}${fxTag}`.slice(0, 300),
+        note: `Příjemka${supplierName ? ` – ${supplierName}` : ''}${fxTag}`.slice(0, 300),
         createdAt: serverTimestamp(),
       });
     }
@@ -1216,6 +1302,56 @@ export async function commitBulkStockIn(params: {
   }
 
   return selected.length;
+}
+
+/**
+ * Restores an orphaned stock receipt movement into inventory (without creating a duplicate movement)
+ * when a movement exists in `stockMovements` whose `itemId` is missing from `inventory`.
+ */
+export async function restoreOrphanMovementToInventory(params: {
+  workspace: Workspace;
+  movement: {
+    itemId: string;
+    itemName: string;
+    itemSku: string;
+    warehouseId: string;
+    quantityDelta: number;
+    unit: string;
+    unitPrice: number;
+    documentRef: string;
+  };
+  category?: string;
+}): Promise<void> {
+  const { workspace, movement, category = '' } = params;
+  const root = wsRoot(workspace.id);
+  const targetId = movement.itemId?.trim() || doc(collection(root, 'inventory')).id;
+  const ref = doc(root, 'inventory', targetId);
+  const qty = Math.max(0, round2(Number(movement.quantityDelta || 0)));
+  const purchasePrice = Math.max(0, round2(Number(movement.unitPrice || 0)));
+
+  try {
+    await setDoc(ref, {
+      workspaceId: workspace.id,
+      memberEmails: workspace.memberEmails,
+      sku: (movement.itemSku || `SKU-${Date.now() % 10000}`).trim().slice(0, 64),
+      name: (movement.itemName || 'Obnovená položka').trim().slice(0, 200),
+      ean: '',
+      category: category.trim().slice(0, 80),
+      unit: (movement.unit || 'ks').trim().slice(0, 20) || 'ks',
+      quantity: qty,
+      minQuantity: 0,
+      purchasePrice,
+      salePrice: purchasePrice > 0 ? round2(purchasePrice * 1.25) : 0,
+      vatRate: 21,
+      warehouseId: (movement.warehouseId || 'shared_main').trim().slice(0, 64),
+      supplierName: '',
+      notes: `Obnoveno z pohybu ${movement.documentRef || ''}`.trim().slice(0, 500),
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, ref.path);
+  }
 }
 
 // =============================================================================

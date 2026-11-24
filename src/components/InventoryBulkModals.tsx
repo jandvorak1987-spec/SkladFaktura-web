@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Copy, Layers, Loader2, Percent, SlidersHorizontal, Trash2, X } from 'lucide-react';
+import { QtyInput } from './QtyInput';
 import {
   bulkAdjustInventoryQuantity,
   bulkDeleteInventoryItems,
@@ -16,6 +17,7 @@ interface InventoryBulkModalsProps {
   modal: BulkActionModalType;
   selectedItems: InventoryItem[];
   warehouses: Warehouse[];
+  existingCategories?: string[];
   workspace: Workspace;
   activeCompanyId: string;
   accentColor: string;
@@ -28,6 +30,7 @@ export function InventoryBulkModals({
   modal,
   selectedItems,
   warehouses,
+  existingCategories = [],
   workspace,
   activeCompanyId,
   accentColor,
@@ -371,13 +374,12 @@ export function InventoryBulkModals({
             <label className="block text-xs font-medium text-slate-700 mb-1">
               {qtyMode === 'SET' ? 'Nový skladový stav pro všechny vybrané karty' : 'Množství'}
             </label>
-            <input
-              type="number"
-              step="any"
-              min={qtyMode === 'SET' ? undefined : '0.01'}
+            <QtyInput
               required
+              allowNegative={qtyMode === 'SET'}
               value={qtyValue}
-              onChange={(e) => setQtyValue(e.target.value)}
+              onValueChange={setQtyValue}
+              placeholder="Zadejte číslo"
               className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg tabular-nums"
             />
           </div>
@@ -497,12 +499,18 @@ export function InventoryBulkModals({
                 <label className="block text-xs font-medium text-slate-700 mb-1">Kategorie</label>
                 <input
                   type="text"
+                  list="bulk-categories-list"
                   disabled={!editCategory}
                   value={categoryVal}
                   onChange={(e) => setCategoryVal(e.target.value)}
-                  placeholder="Např. Elektroinstalace"
+                  placeholder="Vyberte existující nebo napište novou…"
                   className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg disabled:bg-slate-50"
                 />
+                <datalist id="bulk-categories-list">
+                  {existingCategories.map((cat) => (
+                    <option key={cat} value={cat} />
+                  ))}
+                </datalist>
               </div>
             </div>
 
@@ -557,13 +565,10 @@ export function InventoryBulkModals({
                 />
                 <div className="flex-1">
                   <label className="block text-xs font-medium text-slate-700 mb-1">Min. zásoba</label>
-                  <input
-                    type="number"
-                    step="any"
-                    min="0"
+                  <QtyInput
                     disabled={!editMinQty}
                     value={minQtyVal}
-                    onChange={(e) => setMinQtyVal(e.target.value)}
+                    onValueChange={setMinQtyVal}
                     className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg tabular-nums disabled:bg-slate-50"
                   />
                 </div>

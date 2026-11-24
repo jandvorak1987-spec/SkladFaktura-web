@@ -1,5 +1,6 @@
 import React, { useMemo, useRef, useState } from 'react';
 import { Check, ClipboardCheck, Download, Loader2, RotateCcw, ScanBarcode } from 'lucide-react';
+import { QtyInput, parseQtyNumber } from './QtyInput';
 import { commitInventoryAudit } from '../lib/firestoreService';
 import { downloadTextFile, formatCzk, formatQty, round2, toIsoDate } from '../lib/format';
 import type { InventoryItem, Warehouse, Workspace } from '../types';
@@ -318,14 +319,12 @@ export function InventoryAuditPanel({
                     </td>
                     <td className="py-2.5 px-4 text-right">
                       <div className="inline-flex items-center gap-1 justify-end">
-                        <input
-                          type="number"
-                          step="any"
+                        <QtyInput
                           value={counted}
-                          onChange={(e) =>
+                          onValueChange={(cleaned) =>
                             setCounts((prev) => ({
                               ...prev,
-                              [item.id]: Number(e.target.value) || 0,
+                              [item.id]: parseQtyNumber(cleaned),
                             }))
                           }
                           className="w-24 px-2 py-1 text-sm text-right border border-slate-200 rounded-md tabular-nums bg-white"

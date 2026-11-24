@@ -353,25 +353,104 @@ export function parseQuickStockCsv(rawCsv: string): ExtractedDeliveryNote {
   };
 }
 
+export function normalizeMatchKey(value: string): string {
+  return (value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+export function normalizeSkuKey(value: string): string {
+  return (value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s\-_./]+/g, '');
+}
+
+function tokensEqualSet(a: string, b: string): boolean {
+  const ta = a.split(' ').filter((w) => w.length >= 1);
+  const tb = b.split(' ').filter((w) => w.length >= 1);
+  if (ta.length < 2 || ta.length !== tb.length) return false;
+  // Require identical token multiset (every word & variant digit must match 1:1)
+  const sortedA = [...ta].sort();
+  const sortedB = [...tb].sort();
+  return sortedA.every((w, idx) => w === sortedB[idx]);
+}
+
+export function findMatchingInventoryItem(
+  line: Pick<ExtractedLineItem, 'ean' | 'sku' | 'name'>,
+  candidates: InventoryItem[]
+): InventoryItem | null {
+  const eanClean = (line.ean || '').replace(/\D/g, '');
+  const skuKey = normalizeSkuKey(line.sku);
+  const nameKey = normalizeMatchKey(line.name);
+
+  if (eanClean.length >= 8) {
+    const byEan = candidates.find((i) => (i.ean || '').replace(/\D/g, '') === eanClean);
+    if (byEan) return byEan;
+  }
+
+  // Ignore auto-generated placeholder SKUs like SKU-001, AI-1234, IMP-1 when matching by SKU
+  const isSyntheticSku = /^(sku|ai|imp|isdoc|poh|loc)[-_]?\d+$/i.test((line.sku || '').trim());
+  if (skuKey.length >= 2 && !isSyntheticSku) {
+    const bySku = candidates.find((i) => normalizeSkuKey(i.sku) === skuKey);
+    if (bySku) return bySku;
+  }
+
+  if (nameKey.length >= 2) {
+    const byExactName = candidates.find((i) => normalizeMatchKey(i.name) === nameKey);
+    if (byExactName) return byExactName;
+
+    const byTokens = candidates.find((i) => tokensEqualSet(normalizeMatchKey(i.name), nameKey));
+    if (byTokens) return byTokens;
+  }
+
+  return null;
+}
+
 export function matchExtractedToInventory(
   note: ExtractedDeliveryNote,
   inventory: InventoryItem[],
   warehouseId: string
 ): ExtractedDeliveryNote {
   const whItems = inventory.filter((i) => i.warehouseId === warehouseId);
+  const otherWhItems = inventory.filter((i) => i.warehouseId !== warehouseId);
+
   return {
     ...note,
     items: note.items.map((line) => {
-      const matched =
-        whItems.find((i) => line.ean && i.ean && i.ean === line.ean) ||
-        whItems.find((i) => line.sku && i.sku.toLowerCase() === line.sku.toLowerCase()) ||
-        whItems.find((i) => i.name.toLowerCase() === line.name.toLowerCase()) ||
-        null;
+      if (line.manualMatchLock) {
+        const pinned = line.matchedInventoryId
+          ? inventory.find((i) => i.id === line.matchedInventoryId) || null
+          : null;
+        return {
+          ...line,
+          matchedInventoryId: pinned?.id || null,
+          matchedItemName: pinned?.name || null,
+          matchedOtherWarehouseId: null,
+        };
+      }
+
+      const matched = findMatchingInventoryItem(line, whItems);
+      if (matched) {
+        return {
+          ...line,
+          matchedInventoryId: matched.id,
+          matchedItemName: matched.name,
+          matchedOtherWarehouseId: null,
+        };
+      }
+
+      const otherMatch = findMatchingInventoryItem(line, otherWhItems);
       return {
         ...line,
-        matchedInventoryId: matched?.id || null,
-        matchedItemName: matched?.name || null,
+        matchedInventoryId: null,
+        matchedItemName: null,
+        matchedOtherWarehouseId: otherMatch?.warehouseId || null,
       };
     }),
   };
 }
+

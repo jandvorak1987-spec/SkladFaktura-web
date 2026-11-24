@@ -598,6 +598,19 @@ async function startServer() {
   });
 
   // =========================================================================
+  // 4. Live Product Categorization via Nerx.cz (reuses Vercel handler)
+  // =========================================================================
+  app.post('/api/nerx-categorize', async (req, res) => {
+    try {
+      const mod = await import('./api/nerx-categorize.js');
+      await mod.default(req, res);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'neznámá chyba';
+      res.status(500).json({ error: `Kategorizace přes Nerx.cz selhala: ${message}` });
+    }
+  });
+
+  // =========================================================================
   // Static / Vite Dev Middleware
   // =========================================================================
   if (process.env.NODE_ENV !== 'production') {

@@ -1,29 +1,43 @@
 import React, { useMemo, useState } from 'react';
 import {
+  AlertTriangle,
   ArrowDownLeft,
   ArrowUpRight,
+  Check,
+  ChevronDown,
+  ChevronRight,
   ClipboardCheck,
   Copy,
   Download,
   Edit3,
+  Folder,
+  FolderTree,
+  Globe,
   History,
   Layers,
+  List,
   Minus,
   Package,
   Percent,
   Plus,
+  RotateCcw,
   Search,
   SlidersHorizontal,
   Sparkles,
+  Tag,
   Trash2,
   X,
 } from 'lucide-react';
 import { InventoryAuditPanel } from './InventoryAuditPanel';
 import { InventoryBulkModals, type BulkActionModalType } from './InventoryBulkModals';
+import { NerxCategorizeModal } from './NerxCategorizeModal';
+import { QtyInput } from './QtyInput';
 import { useApp } from '../context/AppContext';
 import {
   adjustInventoryStock,
+  bulkEditInventoryFields,
   deleteInventoryItem,
+  restoreOrphanMovementToInventory,
   saveInventoryItem,
   updateMinQuantity,
 } from '../lib/firestoreService';
@@ -36,7 +50,7 @@ import {
   needsRestockAlert,
   round2,
 } from '../lib/format';
-import type { AppSection, InventoryItem } from '../types';
+import type { AppSection, InventoryItem, StockMovement } from '../types';
 
 interface InventoryViewProps {
   onNavigate: (section: AppSection) => void;
@@ -76,6 +90,12 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
   const [tab, setTab] = useState<InventoryTab>('ITEMS');
   const [search, setSearch] = useState('');
   const [selectedWarehouseId, setSelectedWarehouseId] = useState<string>('ALL');
+  const [selectedCategory, setSelectedCategory] = useState<string>('ALL');
+  const [groupByCategory, setGroupByCategory] = useState<boolean>(true);
+  const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set());
+  const [renamingCategory, setRenamingCategory] = useState<string | null>(null);
+  const [renamingCategoryVal, setRenamingCategoryVal] = useState('');
+  const [restoringMovId, setRestoringMovId] = useState<string | null>(null);
   const [onlyLowStock, setOnlyLowStock] = useState(false);
 
   const [editingItem, setEditingItem] = useState<ItemFormState | null>(null);
@@ -93,21 +113,56 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
   // Bulk selection & actions
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkModal, setBulkModal] = useState<BulkActionModalType>(null);
+  const [nerxTargetItems, setNerxTargetItems] = useState<InventoryItem[] | null>(null);
 
   const whMap = useMemo(
     () => new Map(accessibleWarehouses.map((w) => [w.id, w])),
     [accessibleWarehouses]
   );
 
+  const inventoryById = useMemo(() => new Map(inventory.map((i) => [i.id, i])), [inventory]);
+
   const accessibleItems = useMemo(() => {
     const allowed = new Set(accessibleWarehouses.map((w) => w.id));
     return inventory.filter((i) => allowed.has(i.warehouseId));
   }, [inventory, accessibleWarehouses]);
 
+  const warehouseScopedItems = useMemo(() => {
+    if (selectedWarehouseId === 'ALL') return accessibleItems;
+    return accessibleItems.filter((i) => i.warehouseId === selectedWarehouseId);
+  }, [accessibleItems, selectedWarehouseId]);
+
+  const categorySummary = useMemo(() => {
+    const counts = new Map<string, number>();
+    let uncategorized = 0;
+    for (const item of warehouseScopedItems) {
+      const cat = (item.category || '').trim();
+      if (!cat) uncategorized++;
+      else counts.set(cat, (counts.get(cat) || 0) + 1);
+    }
+    const list = Array.from(counts.entries())
+      .sort((a, b) => a[0].localeCompare(b[0], 'cs'))
+      .map(([name, count]) => ({ name, count }));
+    return { list, uncategorized };
+  }, [warehouseScopedItems]);
+
+  const allWorkspaceCategories = useMemo(() => {
+    const set = new Set<string>();
+    for (const item of inventory) {
+      const cat = (item.category || '').trim();
+      if (cat) set.add(cat);
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b, 'cs'));
+  }, [inventory]);
+
   const filteredItems = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return accessibleItems.filter((item) => {
-      if (selectedWarehouseId !== 'ALL' && item.warehouseId !== selectedWarehouseId) return false;
+    return warehouseScopedItems.filter((item) => {
+      const cat = (item.category || '').trim();
+      if (selectedCategory === '__NONE__' && cat !== '') return false;
+      if (selectedCategory !== 'ALL' && selectedCategory !== '__NONE__' && cat !== selectedCategory) {
+        return false;
+      }
       if (onlyLowStock && !needsRestockAlert(item)) return false;
       if (!q) return true;
       return (
@@ -118,7 +173,36 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
         item.supplierName.toLowerCase().includes(q)
       );
     });
-  }, [accessibleItems, selectedWarehouseId, onlyLowStock, search]);
+  }, [warehouseScopedItems, selectedCategory, onlyLowStock, search]);
+
+  const groupedByCategory = useMemo(() => {
+    const map = new Map<string, InventoryItem[]>();
+    for (const item of filteredItems) {
+      const key = (item.category || '').trim() || '__NONE__';
+      const arr = map.get(key) || [];
+      arr.push(item);
+      map.set(key, arr);
+    }
+    const entries = Array.from(map.entries()).sort((a, b) => {
+      if (a[0] === '__NONE__') return 1;
+      if (b[0] === '__NONE__') return -1;
+      return a[0].localeCompare(b[0], 'cs');
+    });
+    return entries.map(([key, items]) => {
+      const totalValue = round2(
+        items.reduce((s, i) => s + Math.max(0, i.quantity) * Math.max(0, i.purchasePrice), 0)
+      );
+      const totalQty = round2(items.reduce((s, i) => s + Math.max(0, i.quantity), 0));
+      return {
+        key,
+        label: key === '__NONE__' ? 'Bez kategorie' : key,
+        isUncategorized: key === '__NONE__',
+        items,
+        totalValue,
+        totalQty,
+      };
+    });
+  }, [filteredItems]);
 
   const filteredMovements = useMemo(() => {
     const allowed = new Set(accessibleWarehouses.map((w) => w.id));
@@ -147,21 +231,27 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
     [filteredItems]
   );
 
-  const openNewItem = () => {
+  const openNewItem = (presetCategory?: string) => {
     const defaultWh =
       selectedWarehouseId !== 'ALL'
         ? selectedWarehouseId
         : accessibleWarehouses[0]?.id || 'shared_main';
+    const defaultCat =
+      presetCategory !== undefined
+        ? presetCategory
+        : selectedCategory !== 'ALL' && selectedCategory !== '__NONE__'
+          ? selectedCategory
+          : '';
     setEditingItem({
       sku: '',
       name: '',
       ean: '',
-      category: '',
+      category: defaultCat,
       unit: 'ks',
-      quantity: '0',
+      quantity: '',
       minQuantity: '5',
-      purchasePrice: '0',
-      salePrice: '0',
+      purchasePrice: '',
+      salePrice: '',
       vatRate: 21,
       warehouseId: defaultWh,
       supplierName: '',
@@ -224,7 +314,7 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
       ean: '',
       category: item.category,
       unit: item.unit,
-      quantity: '0',
+      quantity: '',
       minQuantity: String(item.minQuantity),
       purchasePrice: String(item.purchasePrice),
       salePrice: String(item.salePrice),
@@ -324,6 +414,72 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
     }
   };
 
+  const toggleCategoryCollapse = (catKey: string) => {
+    setCollapsedCategories((prev) => {
+      const next = new Set(prev);
+      if (next.has(catKey)) next.delete(catKey);
+      else next.add(catKey);
+      return next;
+    });
+  };
+
+  const toggleSelectCategoryItems = (itemsInCat: InventoryItem[]) => {
+    const allSelected = itemsInCat.length > 0 && itemsInCat.every((i) => selectedIds.has(i.id));
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      for (const item of itemsInCat) {
+        if (allSelected) next.delete(item.id);
+        else next.add(item.id);
+      }
+      return next;
+    });
+  };
+
+  const handleRenameCategorySubmit = async (oldCatName: string) => {
+    if (!workspace) return;
+    const newName = renamingCategoryVal.trim().slice(0, 80);
+    if (!newName || newName === oldCatName) {
+      setRenamingCategory(null);
+      return;
+    }
+    const itemsToUpdate = inventory.filter((i) => (i.category || '').trim() === oldCatName);
+    if (itemsToUpdate.length === 0) {
+      setRenamingCategory(null);
+      return;
+    }
+    try {
+      await bulkEditInventoryFields({
+        workspace,
+        items: itemsToUpdate,
+        patch: { category: newName },
+      });
+      if (selectedCategory === oldCatName) setSelectedCategory(newName);
+      notify(`Kategorie „${oldCatName}“ byla přejmenována na „${newName}“ (${itemsToUpdate.length} karet).`);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Přejmenování kategorie selhalo.', 'error');
+    } finally {
+      setRenamingCategory(null);
+    }
+  };
+
+  const handleRestoreOrphanMovement = async (mov: StockMovement) => {
+    if (!workspace) return;
+    setRestoringMovId(mov.id);
+    try {
+      await restoreOrphanMovementToInventory({
+        workspace,
+        movement: mov,
+      });
+      notify(
+        `Karta „${mov.itemName}“ (+${formatQty(mov.quantityDelta)} ${mov.unit}) byla zapsána na sklad.`
+      );
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Obnovení karty na sklad selhalo.', 'error');
+    } finally {
+      setRestoringMovId(null);
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -355,6 +511,22 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
           </button>
           <button
             type="button"
+            onClick={() => {
+              const uncat = filteredItems.filter((i) => !(i.category || '').trim());
+              const targets = uncat.length > 0 ? uncat : filteredItems;
+              if (targets.length === 0) {
+                notify('Ve filtru nejsou žádné položky ke kategorizaci.', 'info');
+                return;
+              }
+              setNerxTargetItems(targets);
+            }}
+            className="inline-flex items-center gap-2 px-3.5 py-2 text-sm font-medium text-emerald-800 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 rounded-lg transition-colors whitespace-nowrap"
+          >
+            <Globe className="w-4 h-4" />
+            Kategorizovat (Nerx.cz)
+          </button>
+          <button
+            type="button"
             onClick={() => onNavigate('smart-stock-in')}
             className="inline-flex items-center gap-2 px-3.5 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
           >
@@ -363,7 +535,7 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
           </button>
           <button
             type="button"
-            onClick={openNewItem}
+            onClick={() => openNewItem()}
             style={{ backgroundColor: palette.primary }}
             className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white hover:opacity-95 rounded-lg transition-opacity whitespace-nowrap"
           >
@@ -428,17 +600,46 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
             </div>
 
             {tab === 'ITEMS' && (
-              <button
-                type="button"
-                onClick={() => setOnlyLowStock((v) => !v)}
-                className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap ${
-                  onlyLowStock
-                    ? 'bg-amber-50 border-amber-300 text-amber-900'
-                    : 'bg-white border-slate-200 text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                Pouze pod minimem
-              </button>
+              <>
+                <div className="inline-flex items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200">
+                  <button
+                    type="button"
+                    onClick={() => setGroupByCategory(true)}
+                    className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+                      groupByCategory
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <FolderTree className="w-3.5 h-3.5" />
+                    Dle kategorií
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setGroupByCategory(false)}
+                    className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+                      !groupByCategory
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <List className="w-3.5 h-3.5" />
+                    Seznam
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setOnlyLowStock((v) => !v)}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap ${
+                    onlyLowStock
+                      ? 'bg-amber-50 border-amber-300 text-amber-900'
+                      : 'bg-white border-slate-200 text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Pouze pod minimem
+                </button>
+              </>
             )}
           </div>
         </div>
@@ -472,6 +673,54 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
             </button>
           ))}
         </div>
+
+        {/* Category filter bar */}
+        {tab === 'ITEMS' && (categorySummary.list.length > 0 || categorySummary.uncategorized > 0) && (
+          <div className="flex flex-wrap items-center gap-1.5 pt-2 border-t border-slate-100">
+            <span className="inline-flex items-center gap-1 text-[11px] font-medium uppercase tracking-wider text-slate-400 mr-1">
+              <Tag className="w-3 h-3" />
+              Kategorie:
+            </span>
+            <button
+              type="button"
+              onClick={() => setSelectedCategory('ALL')}
+              className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap tabular-nums ${
+                selectedCategory === 'ALL'
+                  ? 'bg-slate-900 text-white'
+                  : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              Vše ({warehouseScopedItems.length})
+            </button>
+            {categorySummary.list.map((cat) => (
+              <button
+                key={cat.name}
+                type="button"
+                onClick={() => setSelectedCategory(cat.name)}
+                className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap tabular-nums ${
+                  selectedCategory === cat.name
+                    ? 'bg-slate-900 text-white'
+                    : 'text-slate-600 hover:bg-slate-100'
+                }`}
+              >
+                {cat.name} ({cat.count})
+              </button>
+            ))}
+            {categorySummary.uncategorized > 0 && (
+              <button
+                type="button"
+                onClick={() => setSelectedCategory('__NONE__')}
+                className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap tabular-nums ${
+                  selectedCategory === '__NONE__'
+                    ? 'bg-slate-900 text-white'
+                    : 'text-slate-500 hover:bg-slate-100'
+                }`}
+              >
+                Bez kategorie ({categorySummary.uncategorized})
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Main Content */}
@@ -514,6 +763,14 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                 >
                   <Layers className="w-3.5 h-3.5" />
                   Množství
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setNerxTargetItems(selectedItems)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-emerald-600/90 hover:bg-emerald-600 rounded-lg transition-colors whitespace-nowrap"
+                >
+                  <Globe className="w-3.5 h-3.5" />
+                  Kategorie (Nerx.cz)
                 </button>
                 <button
                   type="button"
@@ -575,159 +832,293 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-sm">
-                  {filteredItems.map((item) => {
-                    const low = needsRestockAlert(item);
-                    const wh = whMap.get(item.warehouseId);
-                    const isSelected = selectedIds.has(item.id);
+                  {(groupByCategory
+                    ? groupedByCategory
+                    : [
+                        {
+                          key: '__FLAT__',
+                          label: '',
+                          isUncategorized: false,
+                          items: filteredItems,
+                          totalValue: totalFilteredValue,
+                          totalQty: 0,
+                        },
+                      ]
+                  ).map((group) => {
+                    const isCollapsed =
+                      groupByCategory && collapsedCategories.has(group.key);
+                    const allGroupSelected =
+                      group.items.length > 0 &&
+                      group.items.every((i) => selectedIds.has(i.id));
+
                     return (
-                      <tr
-                        key={item.id}
-                        className={`transition-colors ${
-                          isSelected ? 'bg-slate-50' : 'hover:bg-slate-50/60'
-                        }`}
-                      >
-                        <td className="py-3 pl-4 pr-2">
-                          <input
-                            type="checkbox"
-                            checked={isSelected}
-                            onChange={() => toggleSelectItem(item.id)}
-                            className="rounded border-slate-300 cursor-pointer"
-                          />
-                        </td>
-                        <td className="py-3 px-4">
-                          <p className="font-medium text-slate-900">{item.name}</p>
-                          <p className="text-xs text-slate-500 mt-0.5 tabular-nums">
-                            <span className="font-mono text-slate-700">{item.sku}</span>
-                            {item.ean && ` · EAN ${item.ean}`}
-                            {item.category && ` · ${item.category}`}
-                          </p>
-                        </td>
-                        <td className="py-3 px-4 text-xs text-slate-600">
-                          <p className="font-medium text-slate-800">{wh?.name || item.warehouseId}</p>
-                          <p className="text-slate-400">
-                            {wh?.shared ? 'Sdílený sklad' : 'Oddělený sklad'}
-                          </p>
-                        </td>
-                        <td className="py-3 px-4 text-right tabular-nums">
-                          <span
-                            className={`font-semibold ${
-                              item.quantity <= 0
-                                ? 'text-red-700'
-                                : low
-                                  ? 'text-amber-700'
-                                  : 'text-slate-900'
-                            }`}
-                          >
-                            {formatQty(item.quantity)} {item.unit}
-                          </span>
-                          {low && (
-                            <p className="text-[11px] text-amber-700 font-medium">
-                              {item.quantity <= 0 ? 'Vyprodáno' : 'Pod minimem'}
-                            </p>
-                          )}
-                        </td>
-                        <td className="py-3 px-4 text-right tabular-nums">
-                          {editingMinId === item.id ? (
-                            <div className="inline-flex items-center gap-1 justify-end">
+                      <React.Fragment key={group.key}>
+                        {groupByCategory && (
+                          <tr className="bg-slate-50 border-t border-b border-slate-200">
+                            <td className="py-2.5 pl-4 pr-2">
                               <input
-                                type="number"
-                                step="any"
-                                min="0"
-                                value={editingMinVal}
-                                onChange={(e) => setEditingMinVal(e.target.value)}
-                                className="w-16 px-2 py-1 text-xs text-right border border-slate-300 rounded-md"
-                                autoFocus
+                                type="checkbox"
+                                checked={allGroupSelected}
+                                onChange={() => toggleSelectCategoryItems(group.items)}
+                                title={`Vybrat všechny položky v kategorii ${group.label}`}
+                                className="rounded border-slate-300 cursor-pointer"
                               />
+                            </td>
+                            <td colSpan={4} className="py-2.5 px-4">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => toggleCategoryCollapse(group.key)}
+                                  className="inline-flex items-center gap-1.5 text-sm font-semibold text-slate-900 hover:text-slate-700"
+                                >
+                                  {isCollapsed ? (
+                                    <ChevronRight className="w-4 h-4 text-slate-400" />
+                                  ) : (
+                                    <ChevronDown className="w-4 h-4 text-slate-400" />
+                                  )}
+                                  <Folder className="w-4 h-4 text-slate-500" />
+                                  <span
+                                    className={
+                                      group.isUncategorized ? 'italic text-slate-500 font-medium' : ''
+                                    }
+                                  >
+                                    {group.label}
+                                  </span>
+                                </button>
+
+                                <span className="text-xs text-slate-500 tabular-nums">
+                                  ({group.items.length}{' '}
+                                  {group.items.length === 1
+                                    ? 'karta'
+                                    : group.items.length < 5
+                                      ? 'karty'
+                                      : 'karet'}{' '}
+                                  · {formatQty(group.totalQty)} ks)
+                                </span>
+
+                                {!group.isUncategorized &&
+                                  (renamingCategory === group.key ? (
+                                    <div className="inline-flex items-center gap-1 ml-1">
+                                      <input
+                                        type="text"
+                                        value={renamingCategoryVal}
+                                        onChange={(e) => setRenamingCategoryVal(e.target.value)}
+                                        onKeyDown={(e) => {
+                                          if (e.key === 'Enter') {
+                                            e.preventDefault();
+                                            handleRenameCategorySubmit(group.key);
+                                          } else if (e.key === 'Escape') {
+                                            setRenamingCategory(null);
+                                          }
+                                        }}
+                                        className="px-2 py-0.5 text-xs bg-white border border-slate-300 rounded-md w-40"
+                                        autoFocus
+                                      />
+                                      <button
+                                        type="button"
+                                        onClick={() => handleRenameCategorySubmit(group.key)}
+                                        className="p-1 text-emerald-700 hover:bg-emerald-100 rounded"
+                                        title="Uložit nový název kategorie"
+                                      >
+                                        <Check className="w-3.5 h-3.5" />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => setRenamingCategory(null)}
+                                        className="p-1 text-slate-400 hover:text-slate-700 rounded"
+                                      >
+                                        <X className="w-3.5 h-3.5" />
+                                      </button>
+                                    </div>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setRenamingCategory(group.key);
+                                        setRenamingCategoryVal(group.key);
+                                      }}
+                                      title="Přejmenovat tuto kategorii u všech položek"
+                                      className="p-1 text-slate-400 hover:text-slate-700 rounded transition-colors"
+                                    >
+                                      <Edit3 className="w-3.5 h-3.5" />
+                                    </button>
+                                  ))}
+                              </div>
+                            </td>
+                            <td className="py-2.5 px-4 text-right text-xs font-semibold text-slate-700 tabular-nums whitespace-nowrap">
+                              {formatCzk(group.totalValue)}
+                            </td>
+                            <td className="py-2.5 px-4 text-right">
                               <button
                                 type="button"
-                                onClick={() => handleSaveMinQty(item)}
-                                className="px-2 py-1 text-xs font-medium text-white bg-slate-900 rounded-md"
+                                onClick={() =>
+                                  openNewItem(group.isUncategorized ? '' : group.key)
+                                }
+                                className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-200/70 rounded-md transition-colors whitespace-nowrap"
                               >
-                                OK
+                                <Plus className="w-3.5 h-3.5" />
+                                Přidat
                               </button>
-                              <button
-                                type="button"
-                                onClick={() => setEditingMinId(null)}
-                                className="p-1 text-slate-400 hover:text-slate-700"
+                            </td>
+                          </tr>
+                        )}
+
+                        {!isCollapsed &&
+                          group.items.map((item) => {
+                            const low = needsRestockAlert(item);
+                            const wh = whMap.get(item.warehouseId);
+                            const isSelected = selectedIds.has(item.id);
+                            return (
+                              <tr
+                                key={item.id}
+                                className={`transition-colors ${
+                                  isSelected ? 'bg-slate-50' : 'hover:bg-slate-50/60'
+                                }`}
                               >
-                                <X className="w-3.5 h-3.5" />
-                              </button>
-                            </div>
-                          ) : (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setEditingMinId(item.id);
-                                setEditingMinVal(String(item.minQuantity));
-                              }}
-                              className="text-xs text-slate-600 hover:text-slate-900 underline decoration-dotted underline-offset-4"
-                              title="Kliknutím upravíte minimální zásobu"
-                            >
-                              {formatQty(item.minQuantity)} {item.unit}
-                            </button>
-                          )}
-                        </td>
-                        <td className="py-3 px-4 text-right tabular-nums">
-                          <p className="text-sm font-medium text-slate-900">
-                            {formatCzk(item.salePrice)}
-                          </p>
-                          <p className="text-xs text-slate-500">
-                            Nákup {formatCzk(item.purchasePrice)} · DPH {item.vatRate} %
-                          </p>
-                        </td>
-                        <td className="py-3 px-4 text-right">
-                          <div className="inline-flex items-center gap-1 justify-end">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setAdjustTarget(item);
-                                setAdjustMode('RECEIPT');
-                                setAdjustQty('1');
-                              }}
-                              title="Rychlý příjem"
-                              className="p-1.5 text-emerald-700 hover:bg-emerald-50 rounded-md transition-colors"
-                            >
-                              <Plus className="w-4 h-4" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setAdjustTarget(item);
-                                setAdjustMode('ISSUE');
-                                setAdjustQty('1');
-                              }}
-                              title="Rychlý výdej"
-                              className="p-1.5 text-amber-700 hover:bg-amber-50 rounded-md transition-colors"
-                            >
-                              <Minus className="w-4 h-4" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => openEditItem(item)}
-                              title="Upravit kartu"
-                              className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md transition-colors"
-                            >
-                              <Edit3 className="w-4 h-4" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => openDuplicateItem(item)}
-                              title="Kopírovat položku"
-                              className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md transition-colors"
-                            >
-                              <Copy className="w-4 h-4" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleDelete(item)}
-                              title="Smazat položku"
-                              className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors"
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
+                                <td className="py-3 pl-4 pr-2">
+                                  <input
+                                    type="checkbox"
+                                    checked={isSelected}
+                                    onChange={() => toggleSelectItem(item.id)}
+                                    className="rounded border-slate-300 cursor-pointer"
+                                  />
+                                </td>
+                                <td className="py-3 px-4">
+                                  <p className="font-medium text-slate-900">{item.name}</p>
+                                  <p className="text-xs text-slate-500 mt-0.5 tabular-nums">
+                                    <span className="font-mono text-slate-700">{item.sku}</span>
+                                    {item.ean && ` · EAN ${item.ean}`}
+                                    {!groupByCategory && item.category && ` · ${item.category}`}
+                                  </p>
+                                </td>
+                                <td className="py-3 px-4 text-xs text-slate-600">
+                                  <p className="font-medium text-slate-800">
+                                    {wh?.name || item.warehouseId}
+                                  </p>
+                                  <p className="text-slate-400">
+                                    {wh?.shared ? 'Sdílený sklad' : 'Oddělený sklad'}
+                                  </p>
+                                </td>
+                                <td className="py-3 px-4 text-right tabular-nums">
+                                  <span
+                                    className={`font-semibold ${
+                                      item.quantity <= 0
+                                        ? 'text-red-700'
+                                        : low
+                                          ? 'text-amber-700'
+                                          : 'text-slate-900'
+                                    }`}
+                                  >
+                                    {formatQty(item.quantity)} {item.unit}
+                                  </span>
+                                  {low && (
+                                    <p className="text-[11px] text-amber-700 font-medium">
+                                      {item.quantity <= 0 ? 'Vyprodáno' : 'Pod minimem'}
+                                    </p>
+                                  )}
+                                </td>
+                                <td className="py-3 px-4 text-right tabular-nums">
+                                  {editingMinId === item.id ? (
+                                    <div className="inline-flex items-center gap-1 justify-end">
+                                      <QtyInput
+                                        value={editingMinVal}
+                                        onValueChange={(val) => setEditingMinVal(val)}
+                                        className="w-16 px-2 py-1 text-xs text-right border border-slate-300 rounded-md tabular-nums"
+                                        autoFocus
+                                      />
+                                      <button
+                                        type="button"
+                                        onClick={() => handleSaveMinQty(item)}
+                                        className="px-2 py-1 text-xs font-medium text-white bg-slate-900 rounded-md"
+                                      >
+                                        OK
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => setEditingMinId(null)}
+                                        className="p-1 text-slate-400 hover:text-slate-700"
+                                      >
+                                        <X className="w-3.5 h-3.5" />
+                                      </button>
+                                    </div>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setEditingMinId(item.id);
+                                        setEditingMinVal(String(item.minQuantity));
+                                      }}
+                                      className="text-xs text-slate-600 hover:text-slate-900 underline decoration-dotted underline-offset-4"
+                                      title="Kliknutím upravíte minimální zásobu"
+                                    >
+                                      {formatQty(item.minQuantity)} {item.unit}
+                                    </button>
+                                  )}
+                                </td>
+                                <td className="py-3 px-4 text-right tabular-nums">
+                                  <p className="text-sm font-medium text-slate-900">
+                                    {formatCzk(item.salePrice)}
+                                  </p>
+                                  <p className="text-xs text-slate-500">
+                                    Nákup {formatCzk(item.purchasePrice)} · DPH {item.vatRate} %
+                                  </p>
+                                </td>
+                                <td className="py-3 px-4 text-right">
+                                  <div className="inline-flex items-center gap-1 justify-end">
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setAdjustTarget(item);
+                                        setAdjustMode('RECEIPT');
+                                        setAdjustQty('1');
+                                      }}
+                                      title="Rychlý příjem"
+                                      className="p-1.5 text-emerald-700 hover:bg-emerald-50 rounded-md transition-colors"
+                                    >
+                                      <Plus className="w-4 h-4" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setAdjustTarget(item);
+                                        setAdjustMode('ISSUE');
+                                        setAdjustQty('1');
+                                      }}
+                                      title="Rychlý výdej"
+                                      className="p-1.5 text-amber-700 hover:bg-amber-50 rounded-md transition-colors"
+                                    >
+                                      <Minus className="w-4 h-4" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => openEditItem(item)}
+                                      title="Upravit kartu"
+                                      className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md transition-colors"
+                                    >
+                                      <Edit3 className="w-4 h-4" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => openDuplicateItem(item)}
+                                      title="Kopírovat položku"
+                                      className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md transition-colors"
+                                    >
+                                      <Copy className="w-4 h-4" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDelete(item)}
+                                      title="Smazat položku"
+                                      className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors"
+                                    >
+                                      <Trash2 className="w-4 h-4" />
+                                    </button>
+                                  </div>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                      </React.Fragment>
                     );
                   })}
                 </tbody>
@@ -767,6 +1158,7 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                 <tbody className="divide-y divide-slate-100 text-sm">
                   {filteredMovements.map((mov) => {
                     const isReceipt = mov.quantityDelta > 0;
+                    const linkedItem = mov.itemId ? inventoryById.get(mov.itemId) : undefined;
                     return (
                       <tr key={mov.id} className="hover:bg-slate-50/60">
                         <td className="py-3 px-4 text-xs text-slate-500 tabular-nums whitespace-nowrap">
@@ -789,6 +1181,30 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                         <td className="py-3 px-4">
                           <p className="font-medium text-slate-900">{mov.itemName}</p>
                           <p className="text-xs font-mono text-slate-500">{mov.itemSku}</p>
+                          {linkedItem ? (
+                            <p className="text-[11px] text-slate-500 mt-0.5 tabular-nums">
+                              Na skladě: <strong className="text-slate-700">{formatQty(linkedItem.quantity)} {linkedItem.unit}</strong>
+                              {linkedItem.category ? ` · ${linkedItem.category}` : ''}
+                            </p>
+                          ) : (
+                            <div className="mt-1 flex flex-wrap items-center gap-2">
+                              <span className="inline-flex items-center gap-1 text-[11px] font-medium text-amber-800">
+                                <AlertTriangle className="w-3 h-3" />
+                                Karta ve skladu neexistuje
+                              </span>
+                              {isReceipt && (
+                                <button
+                                  type="button"
+                                  disabled={restoringMovId === mov.id}
+                                  onClick={() => handleRestoreOrphanMovement(mov)}
+                                  className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded transition-colors disabled:opacity-50"
+                                >
+                                  <RotateCcw className="w-3 h-3" />
+                                  {restoringMovId === mov.id ? 'Ukládám…' : 'Zapsat na sklad'}
+                                </button>
+                              )}
+                            </div>
+                          )}
                         </td>
                         <td className="py-3 px-4 text-xs text-slate-600">
                           <p className="font-medium text-slate-800">
@@ -875,13 +1291,11 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
               <label className="block text-xs font-medium text-slate-700 mb-1">
                 Množství ({adjustTarget.unit})
               </label>
-              <input
-                type="number"
-                step="any"
-                min="0.01"
+              <QtyInput
                 required
                 value={adjustQty}
-                onChange={(e) => setAdjustQty(e.target.value)}
+                onValueChange={(val) => setAdjustQty(val)}
+                placeholder="Zadejte počet kusů"
                 className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg tabular-nums"
               />
             </div>
@@ -1005,20 +1419,26 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                 <label className="block text-xs font-medium text-slate-700 mb-1">Kategorie</label>
                 <input
                   type="text"
+                  list="inventory-categories-list"
                   value={editingItem.category}
                   onChange={(e) => setEditingItem({ ...editingItem, category: e.target.value })}
+                  placeholder="Vyberte nebo zadejte novou…"
                   className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
                 />
+                <datalist id="inventory-categories-list">
+                  {allWorkspaceCategories.map((cat) => (
+                    <option key={cat} value={cat} />
+                  ))}
+                </datalist>
               </div>
 
               <div className="grid grid-cols-3 gap-2 sm:col-span-2">
                 <div>
                   <label className="block text-xs font-medium text-slate-700 mb-1">Množství</label>
-                  <input
-                    type="number"
-                    step="any"
+                  <QtyInput
+                    allowNegative
                     value={editingItem.quantity}
-                    onChange={(e) => setEditingItem({ ...editingItem, quantity: e.target.value })}
+                    onValueChange={(val) => setEditingItem({ ...editingItem, quantity: val })}
                     className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg tabular-nums"
                   />
                 </div>
@@ -1026,13 +1446,10 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                   <label className="block text-xs font-medium text-slate-700 mb-1">
                     Min. zásoba
                   </label>
-                  <input
-                    type="number"
-                    step="any"
-                    min="0"
+                  <QtyInput
                     value={editingItem.minQuantity}
-                    onChange={(e) =>
-                      setEditingItem({ ...editingItem, minQuantity: e.target.value })
+                    onValueChange={(val) =>
+                      setEditingItem({ ...editingItem, minQuantity: val })
                     }
                     className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg tabular-nums"
                   />
@@ -1053,13 +1470,10 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                   <label className="block text-xs font-medium text-slate-700 mb-1">
                     Nákupní cena bez DPH
                   </label>
-                  <input
-                    type="number"
-                    step="any"
-                    min="0"
+                  <QtyInput
                     value={editingItem.purchasePrice}
-                    onChange={(e) =>
-                      setEditingItem({ ...editingItem, purchasePrice: e.target.value })
+                    onValueChange={(val) =>
+                      setEditingItem({ ...editingItem, purchasePrice: val })
                     }
                     className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg tabular-nums"
                   />
@@ -1068,12 +1482,9 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                   <label className="block text-xs font-medium text-slate-700 mb-1">
                     Prodejní cena bez DPH
                   </label>
-                  <input
-                    type="number"
-                    step="any"
-                    min="0"
+                  <QtyInput
                     value={editingItem.salePrice}
-                    onChange={(e) => setEditingItem({ ...editingItem, salePrice: e.target.value })}
+                    onValueChange={(val) => setEditingItem({ ...editingItem, salePrice: val })}
                     className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg tabular-nums"
                   />
                 </div>
@@ -1141,6 +1552,7 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
           modal={bulkModal}
           selectedItems={selectedItems}
           warehouses={accessibleWarehouses}
+          existingCategories={allWorkspaceCategories}
           workspace={workspace}
           activeCompanyId={activeCompany?.id || 'company_1'}
           accentColor={palette.primary}
@@ -1149,6 +1561,22 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
             notify(msg);
             setBulkModal(null);
             if (clearSel) setSelectedIds(new Set());
+          }}
+          onError={(msg) => notify(msg, 'error')}
+        />
+      )}
+      {/* Nerx.cz Auto-Categorization Modal */}
+      {nerxTargetItems && workspace && (
+        <NerxCategorizeModal
+          items={nerxTargetItems}
+          existingCategories={allWorkspaceCategories}
+          workspace={workspace}
+          accentColor={palette.primary}
+          onClose={() => setNerxTargetItems(null)}
+          onCompleted={(msg) => {
+            notify(msg);
+            setNerxTargetItems(null);
+            setSelectedIds(new Set());
           }}
           onError={(msg) => notify(msg, 'error')}
         />

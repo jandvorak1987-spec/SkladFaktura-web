@@ -25,6 +25,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
+import { QtyInput, parseQtyNumber } from './QtyInput';
 import {
   cancelInvoice,
   deleteCancelledInvoice,
@@ -2054,12 +2055,11 @@ export function InvoicesView({
                       )}
                     </td>
                     <td className="py-2 px-2">
-                      <input
-                        type="number"
-                        step="any"
-                        min="0.01"
+                      <QtyInput
                         value={line.quantity}
-                        onChange={(e) => updateLine(idx, { quantity: Number(e.target.value) || 0 })}
+                        onValueChange={(cleaned) =>
+                          updateLine(idx, { quantity: parseQtyNumber(cleaned) })
+                        }
                         className="w-20 px-2 py-1.5 text-sm text-right border border-slate-200 rounded-md tabular-nums"
                       />
                     </td>
@@ -2072,26 +2072,21 @@ export function InvoicesView({
                       />
                     </td>
                     <td className="py-2 px-2">
-                      <input
-                        type="number"
-                        step="any"
-                        min="0"
+                      <QtyInput
                         value={line.unitPrice}
-                        onChange={(e) =>
-                          updateLine(idx, { unitPrice: Number(e.target.value) || 0 })
+                        onValueChange={(cleaned) =>
+                          updateLine(idx, { unitPrice: parseQtyNumber(cleaned) })
                         }
                         className="w-28 px-2 py-1.5 text-sm text-right border border-slate-200 rounded-md tabular-nums"
                       />
                     </td>
                     <td className="py-2 px-2">
-                      <input
-                        type="number"
-                        step="any"
-                        min="0"
-                        max="100"
+                      <QtyInput
                         value={line.discountPercent}
-                        onChange={(e) =>
-                          updateLine(idx, { discountPercent: Number(e.target.value) || 0 })
+                        onValueChange={(cleaned) =>
+                          updateLine(idx, {
+                            discountPercent: Math.min(100, Math.max(0, parseQtyNumber(cleaned))),
+                          })
                         }
                         className="w-16 px-2 py-1.5 text-sm text-right border border-slate-200 rounded-md tabular-nums"
                       />

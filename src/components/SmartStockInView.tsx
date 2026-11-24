@@ -5,6 +5,7 @@ import {
   Eye,
   FileSpreadsheet,
   FileText,
+  Globe,
   Image as ImageIcon,
   Loader2,
   Plus,
@@ -13,15 +14,21 @@ import {
   Trash2,
   Upload,
 } from 'lucide-react';
+import { QtyInput, parseQtyNumber } from './QtyInput';
 import { useApp } from '../context/AppContext';
-import { matchExtractedToInventory, parseQuickStockCsv } from '../lib/bankParser';
+import {
+  findMatchingInventoryItem,
+  matchExtractedToInventory,
+  parseQuickStockCsv,
+} from '../lib/bankParser';
 import { commitBulkStockIn } from '../lib/firestoreService';
-import { formatCzk, getCompanyPalette, round2 } from '../lib/format';
+import { formatCzk, formatQty, getCompanyPalette, round2 } from '../lib/format';
 import {
   extractFileLocally,
   extractTextLocally,
   type LocalExtractionMethod,
 } from '../lib/localDocumentReader';
+import { categorizeItemsViaNerx } from '../lib/nerxCategorizer';
 import type { ExtractedDeliveryNote, ExtractedLineItem } from '../types';
 
 type InputMode = 'FILE' | 'TEXT' | 'CSV';
@@ -70,11 +77,35 @@ export function SmartStockInView() {
   const [lastMethod, setLastMethod] = useState<LocalExtractionMethod | 'GEMINI' | null>(null);
 
   const [note, setNote] = useState<ExtractedDeliveryNote | null>(null);
+  const [defaultCategory, setDefaultCategory] = useState('');
+  const [categorizingNerx, setCategorizingNerx] = useState(false);
 
   const effectiveWarehouseId = useMemo(() => {
     if (accessibleWarehouses.some((w) => w.id === targetWarehouseId)) return targetWarehouseId;
     return accessibleWarehouses[0]?.id || 'shared_main';
   }, [accessibleWarehouses, targetWarehouseId]);
+
+  const whNameMap = useMemo(
+    () => new Map(accessibleWarehouses.map((w) => [w.id, w.name])),
+    [accessibleWarehouses]
+  );
+
+  const targetWhInventory = useMemo(
+    () =>
+      inventory
+        .filter((i) => i.warehouseId === effectiveWarehouseId)
+        .sort((a, b) => a.name.localeCompare(b.name, 'cs')),
+    [inventory, effectiveWarehouseId]
+  );
+
+  const existingCategories = useMemo(() => {
+    const set = new Set<string>();
+    for (const item of inventory) {
+      const cat = (item.category || '').trim();
+      if (cat) set.add(cat);
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b, 'cs'));
+  }, [inventory]);
 
   const applyExtractedNote = (raw: ExtractedDeliveryNote, whId: string) => {
     const currency = (raw.currency || 'CZK').toUpperCase();
@@ -246,7 +277,7 @@ export function SmartStockInView() {
                   sku: 'SKU-001',
                   name: '',
                   ean: '',
-                  quantity: 1,
+                  quantity: 0,
                   unit: 'ks',
                   originalPurchasePrice: 0,
                   purchasePrice: 0,
@@ -417,9 +448,51 @@ export function SmartStockInView() {
 
   const updateLine = (id: string, patch: Partial<ExtractedLineItem>) => {
     if (!note) return;
+    const shouldRematch =
+      (patch.sku !== undefined || patch.name !== undefined || patch.ean !== undefined) &&
+      patch.matchedInventoryId === undefined;
+    const otherWhInventory = shouldRematch
+      ? inventory.filter((i) => i.warehouseId !== effectiveWarehouseId)
+      : [];
+
     setNote({
       ...note,
-      items: note.items.map((line) => (line.id === id ? { ...line, ...patch } : line)),
+      items: note.items.map((line) => {
+        if (line.id !== id) return line;
+        const updated = { ...line, ...patch };
+        if (shouldRematch && !updated.manualMatchLock) {
+          const matched = findMatchingInventoryItem(updated, targetWhInventory);
+          if (matched) {
+            return {
+              ...updated,
+              matchedInventoryId: matched.id,
+              matchedItemName: matched.name,
+              matchedOtherWarehouseId: null,
+            };
+          }
+          const otherMatch = findMatchingInventoryItem(updated, otherWhInventory);
+          return {
+            ...updated,
+            matchedInventoryId: null,
+            matchedItemName: null,
+            matchedOtherWarehouseId: otherMatch?.warehouseId || null,
+          };
+        }
+        return updated;
+      }),
+    });
+  };
+
+  const handleManualMatchChange = (lineId: string, selectedInventoryId: string) => {
+    if (!note) return;
+    const chosen = selectedInventoryId
+      ? inventory.find((i) => i.id === selectedInventoryId) || null
+      : null;
+    updateLine(lineId, {
+      matchedInventoryId: chosen?.id || null,
+      matchedItemName: chosen?.name || null,
+      matchedOtherWarehouseId: null,
+      manualMatchLock: true,
     });
   };
 
@@ -435,7 +508,8 @@ export function SmartStockInView() {
       sku: `SKU-${Date.now() % 10000}`,
       name: '',
       ean: '',
-      quantity: 1,
+      category: '',
+      quantity: 0,
       unit: 'ks',
       originalPurchasePrice: 0,
       purchasePrice: 0,
@@ -444,8 +518,50 @@ export function SmartStockInView() {
       selected: true,
       matchedInventoryId: null,
       matchedItemName: null,
+      matchedOtherWarehouseId: null,
     };
     setNote({ ...note, items: [...note.items, newLine] });
+  };
+
+  const handleCategorizeNoteViaNerx = async () => {
+    if (!note || note.items.length === 0 || categorizingNerx) return;
+    setCategorizingNerx(true);
+    try {
+      const matches = await categorizeItemsViaNerx(
+        note.items.map((line) => ({
+          id: line.id,
+          name: line.name,
+          sku: line.sku,
+          ean: line.ean,
+        }))
+      );
+      const matchMap = new Map(matches.map((m) => [m.id, m]));
+      let nerxMatched = 0;
+      let ruleMatched = 0;
+      setNote((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          items: prev.items.map((line) => {
+            const m = matchMap.get(line.id);
+            if (!m || !m.category) return line;
+            if (m.source === 'NERX') nerxMatched++;
+            else if (m.source === 'RULE') ruleMatched++;
+            return { ...line, category: m.category };
+          }),
+        };
+      });
+      notify(
+        `Kategorie určeny: ${nerxMatched}× přímo z Nerx.cz${ruleMatched > 0 ? `, ${ruleMatched}× podle pravidla` : ''}.`
+      );
+    } catch (err) {
+      notify(
+        err instanceof Error ? err.message : 'Porovnání s katalogem Nerx.cz selhalo.',
+        'error'
+      );
+    } finally {
+      setCategorizingNerx(false);
+    }
   };
 
   const handleCommit = async () => {
@@ -463,6 +579,7 @@ export function SmartStockInView() {
         companyId: activeCompany?.id || 'company_1',
         supplierName: note.supplierName,
         documentNumber: note.documentNumber,
+        defaultCategory,
         currency: note.currency || 'CZK',
         exchangeRate: note.exchangeRate || 1,
         items: note.items,
@@ -792,7 +909,7 @@ export function SmartStockInView() {
       {note && (
         <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
           <div className="p-5 border-b border-slate-100 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 flex-1">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 flex-1">
               <div>
                 <label className="block text-[11px] font-medium uppercase text-slate-500 mb-1">
                   Dodavatel
@@ -826,13 +943,44 @@ export function SmartStockInView() {
                   className="w-full px-3 py-1.5 text-sm font-mono border border-slate-200 rounded-lg"
                 />
               </div>
+              <div>
+                <label className="block text-[11px] font-medium uppercase text-slate-500 mb-1">
+                  Kategorie nových karet
+                </label>
+                <input
+                  type="text"
+                  list="smart-stock-categories"
+                  value={defaultCategory}
+                  onChange={(e) => setDefaultCategory(e.target.value)}
+                  placeholder="Volitelná kategorie…"
+                  className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg"
+                />
+                <datalist id="smart-stock-categories">
+                  {existingCategories.map((cat) => (
+                    <option key={cat} value={cat} />
+                  ))}
+                </datalist>
+              </div>
             </div>
 
-            <div className="flex items-center gap-2 shrink-0">
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={handleCategorizeNoteViaNerx}
+                disabled={categorizingNerx || note.items.length === 0}
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-emerald-800 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 rounded-lg disabled:opacity-60 whitespace-nowrap"
+              >
+                {categorizingNerx ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Globe className="w-3.5 h-3.5" />
+                )}
+                {categorizingNerx ? 'Porovnávám s Nerx.cz…' : 'Určit kategorie (Nerx.cz)'}
+              </button>
               <button
                 type="button"
                 onClick={addEmptyLine}
-                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg"
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg whitespace-nowrap"
               >
                 <Plus className="w-3.5 h-3.5" />
                 Přidat řádek
@@ -964,31 +1112,54 @@ export function SmartStockInView() {
                         className="w-28 px-2 py-1 text-xs font-mono border border-slate-200 rounded-md"
                       />
                     </td>
-                    <td className="py-2 px-3 min-w-[220px]">
+                    <td className="py-2 px-3 min-w-[240px]">
                       <input
                         type="text"
                         value={line.name}
                         onChange={(e) => updateLine(line.id, { name: e.target.value })}
                         className="w-full px-2 py-1 text-sm border border-slate-200 rounded-md"
                       />
-                      <p className="mt-1 text-[11px]">
-                        {line.matchedInventoryId ? (
-                          <span className="text-emerald-700 font-medium">
-                            Přičte se k existující kartě: {line.matchedItemName}
-                          </span>
-                        ) : (
-                          <span className="text-slate-500">Založí se jako nová skladová karta</span>
+                      <div className="mt-1.5 grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                        <select
+                          value={line.matchedInventoryId || ''}
+                          onChange={(e) => handleManualMatchChange(line.id, e.target.value)}
+                          className={`w-full px-2 py-1 text-[11px] rounded-md border bg-white ${
+                            line.matchedInventoryId
+                              ? 'border-emerald-300 text-emerald-800 font-medium bg-emerald-50/40'
+                              : 'border-slate-200 text-slate-600'
+                          }`}
+                        >
+                          <option value="">+ Založit jako novou skladovou kartu</option>
+                          {targetWhInventory.map((inv) => (
+                            <option key={inv.id} value={inv.id}>
+                              Přičíst k: {inv.name} ({inv.sku} · {formatQty(inv.quantity)}{' '}
+                              {inv.unit})
+                            </option>
+                          ))}
+                        </select>
+                        <input
+                          type="text"
+                          list="smart-stock-categories"
+                          value={line.category || ''}
+                          onChange={(e) => updateLine(line.id, { category: e.target.value })}
+                          placeholder="Kategorie (nebo dle hlavičky)…"
+                          className="w-full px-2 py-1 text-[11px] border border-slate-200 rounded-md bg-white text-slate-700"
+                        />
+                        {!line.matchedInventoryId && line.matchedOtherWarehouseId && (
+                          <p className="sm:col-span-2 text-[11px] text-amber-700">
+                            Pozor: karta existuje ve skladu „
+                            {whNameMap.get(line.matchedOtherWarehouseId) ||
+                              line.matchedOtherWarehouseId}
+                            “ — přepněte cílový sklad nahoře.
+                          </p>
                         )}
-                      </p>
+                      </div>
                     </td>
                     <td className="py-2 px-3">
-                      <input
-                        type="number"
-                        step="any"
-                        min="0.01"
+                      <QtyInput
                         value={line.quantity}
-                        onChange={(e) =>
-                          updateLine(line.id, { quantity: Number(e.target.value) || 0 })
+                        onValueChange={(cleaned) =>
+                          updateLine(line.id, { quantity: parseQtyNumber(cleaned) })
                         }
                         className="w-20 px-2 py-1 text-sm text-right border border-slate-200 rounded-md tabular-nums"
                       />
@@ -1003,17 +1174,14 @@ export function SmartStockInView() {
                     </td>
                     {isForeignCurrency && (
                       <td className="py-2 px-3">
-                        <input
-                          type="number"
-                          step="any"
-                          min="0"
+                        <QtyInput
                           value={
                             line.originalPurchasePrice !== undefined
                               ? line.originalPurchasePrice
                               : line.purchasePrice
                           }
-                          onChange={(e) => {
-                            const orig = Number(e.target.value) || 0;
+                          onValueChange={(cleaned) => {
+                            const orig = parseQtyNumber(cleaned);
                             const czk = round2(Math.max(0, orig) * Math.max(0, docRate));
                             updateLine(line.id, {
                               originalPurchasePrice: orig,
@@ -1026,13 +1194,10 @@ export function SmartStockInView() {
                       </td>
                     )}
                     <td className="py-2 px-3">
-                      <input
-                        type="number"
-                        step="any"
-                        min="0"
+                      <QtyInput
                         value={line.purchasePrice}
-                        onChange={(e) => {
-                          const czk = Number(e.target.value) || 0;
+                        onValueChange={(cleaned) => {
+                          const czk = parseQtyNumber(cleaned);
                           updateLine(line.id, {
                             purchasePrice: czk,
                             originalPurchasePrice:
@@ -1043,13 +1208,10 @@ export function SmartStockInView() {
                       />
                     </td>
                     <td className="py-2 px-3">
-                      <input
-                        type="number"
-                        step="any"
-                        min="0"
+                      <QtyInput
                         value={line.suggestedSalePrice}
-                        onChange={(e) =>
-                          updateLine(line.id, { suggestedSalePrice: Number(e.target.value) || 0 })
+                        onValueChange={(cleaned) =>
+                          updateLine(line.id, { suggestedSalePrice: parseQtyNumber(cleaned) })
                         }
                         className="w-24 px-2 py-1 text-sm text-right border border-slate-200 rounded-md tabular-nums"
                       />

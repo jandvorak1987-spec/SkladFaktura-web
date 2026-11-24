@@ -23,6 +23,18 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* Remove native browser +/- number spinners globally */
+input[type='number']::-webkit-outer-spin-button,
+input[type='number']::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+input[type='number'] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
 /* Print Styles for Czech A4 Invoice */
 @media print {
   @page {

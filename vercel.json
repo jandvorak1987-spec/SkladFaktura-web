@@ -5,6 +5,9 @@
   "functions": {
     "api/ai-stock-import.js": {
       "maxDuration": 60
+    },
+    "api/nerx-categorize.js": {
+      "maxDuration": 60
     }
   },
   "rewrites": [

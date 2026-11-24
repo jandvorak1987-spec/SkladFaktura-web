@@ -8,6 +8,7 @@ import {
   Plus,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
+import { QtyInput } from './QtyInput';
 import { adjustInventoryStock, markInvoicePaid, updateMinQuantity } from '../lib/firestoreService';
 import {
   daysUntilDue,
@@ -190,13 +191,10 @@ export function AlertsCenterView({ onNavigate }: AlertsCenterViewProps) {
                     <div className="flex flex-wrap items-center gap-3 shrink-0">
                       <div className="flex items-center gap-1.5">
                         <span className="text-xs text-slate-500">Min:</span>
-                        <input
-                          type="number"
-                          min="0"
-                          step="any"
+                        <QtyInput
                           value={minVal}
-                          onChange={(e) =>
-                            setMinEditMap((prev) => ({ ...prev, [item.id]: e.target.value }))
+                          onValueChange={(cleaned) =>
+                            setMinEditMap((prev) => ({ ...prev, [item.id]: cleaned }))
                           }
                           className="w-16 px-2 py-1 text-xs text-right border border-slate-200 rounded-md tabular-nums"
                         />
@@ -211,13 +209,10 @@ export function AlertsCenterView({ onNavigate }: AlertsCenterViewProps) {
                       </div>
 
                       <div className="flex items-center gap-1.5">
-                        <input
-                          type="number"
-                          min="0.01"
-                          step="any"
+                        <QtyInput
                           value={restockVal}
-                          onChange={(e) =>
-                            setRestockQtyMap((prev) => ({ ...prev, [item.id]: e.target.value }))
+                          onValueChange={(cleaned) =>
+                            setRestockQtyMap((prev) => ({ ...prev, [item.id]: cleaned }))
                           }
                           className="w-16 px-2 py-1 text-xs text-right border border-slate-200 rounded-md tabular-nums"
                         />
