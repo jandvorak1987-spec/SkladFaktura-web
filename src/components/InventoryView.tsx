@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   ArrowDownLeft,
   ArrowUpRight,
+  Calculator,
   Check,
   ChevronDown,
   ChevronRight,
@@ -31,6 +32,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
+import { BulkPriceEditorModal } from './BulkPriceEditorModal';
 import { InventoryAuditPanel } from './InventoryAuditPanel';
 import { InventoryBulkModals, type BulkActionModalType } from './InventoryBulkModals';
 import { NerxCategorizeModal } from './NerxCategorizeModal';
@@ -38,6 +40,11 @@ import { QtyInput } from './QtyInput';
 import { StockInDocumentModal } from './StockInDocumentModal';
 import { useApp } from '../context/AppContext';
 import { areNamesCompatible } from '../lib/bankParser';
+import {
+  composeNotesWithPriceBreakdown,
+  matchesNameQuery,
+  parsePriceBreakdown,
+} from '../lib/priceBreakdown';
 import {
   adjustInventoryStock,
   bulkEditInventoryFields,
@@ -78,6 +85,8 @@ interface ItemFormState {
   unit: string;
   quantity: string;
   minQuantity: string;
+  goodsPrice: string;
+  exciseTaxPrice: string;
   purchasePrice: string;
   salePrice: string;
   vatRate: number;
@@ -131,6 +140,8 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
   // Bulk selection & actions
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkModal, setBulkModal] = useState<BulkActionModalType>(null);
+  const [priceEditorOpen, setPriceEditorOpen] = useState(false);
+  const [priceEditorTab, setPriceEditorTab] = useState<'BUILDER' | 'AI_COMMAND'>('BUILDER');
   const [nerxTargetItems, setNerxTargetItems] = useState<InventoryItem[] | null>(null);
 
   useEffect(() => {
@@ -198,7 +209,7 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
   }, [inventory]);
 
   const filteredItems = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = search.trim();
     return warehouseScopedItems.filter((item) => {
       const cat = (item.category || '').trim();
       if (selectedCategory === '__NONE__' && cat !== '') return false;
@@ -207,13 +218,7 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
       }
       if (onlyLowStock && !needsRestockAlert(item)) return false;
       if (!q) return true;
-      return (
-        item.name.toLowerCase().includes(q) ||
-        item.sku.toLowerCase().includes(q) ||
-        item.ean.toLowerCase().includes(q) ||
-        item.category.toLowerCase().includes(q) ||
-        item.supplierName.toLowerCase().includes(q)
-      );
+      return matchesNameQuery(item, q);
     });
   }, [warehouseScopedItems, selectedCategory, onlyLowStock, search]);
 
@@ -337,6 +342,8 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
       unit: 'ks',
       quantity: '',
       minQuantity: '5',
+      goodsPrice: '',
+      exciseTaxPrice: '',
       purchasePrice: '',
       salePrice: '',
       vatRate: 21,
@@ -376,6 +383,7 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
   };
 
   const openEditItem = (item: InventoryItem) => {
+    const parsed = parsePriceBreakdown(item.notes);
     setEditingItem({
       id: item.id,
       sku: item.sku,
@@ -385,16 +393,19 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
       unit: item.unit,
       quantity: String(item.quantity),
       minQuantity: String(item.minQuantity),
+      goodsPrice: parsed.goodsPrice !== null ? String(parsed.goodsPrice) : '',
+      exciseTaxPrice: parsed.exciseTaxPrice !== null ? String(parsed.exciseTaxPrice) : '',
       purchasePrice: String(item.purchasePrice),
       salePrice: String(item.salePrice),
       vatRate: item.vatRate,
       warehouseId: item.warehouseId,
       supplierName: item.supplierName,
-      notes: item.notes,
+      notes: parsed.cleanNotes,
     });
   };
 
   const openDuplicateItem = (item: InventoryItem) => {
+    const parsed = parsePriceBreakdown(item.notes);
     setEditingItem({
       sku: `${item.sku}-KOP`.slice(0, 64),
       name: `${item.name} (kopie)`.slice(0, 200),
@@ -403,12 +414,14 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
       unit: item.unit,
       quantity: '',
       minQuantity: String(item.minQuantity),
+      goodsPrice: parsed.goodsPrice !== null ? String(parsed.goodsPrice) : '',
+      exciseTaxPrice: parsed.exciseTaxPrice !== null ? String(parsed.exciseTaxPrice) : '',
       purchasePrice: String(item.purchasePrice),
       salePrice: String(item.salePrice),
       vatRate: item.vatRate,
       warehouseId: item.warehouseId,
       supplierName: item.supplierName,
-      notes: item.notes,
+      notes: parsed.cleanNotes,
     });
   };
 
@@ -417,6 +430,16 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
     if (!workspace || !editingItem) return;
     setSaving(true);
     try {
+      const parseOpt = (raw: string): number | null => {
+        const t = raw.trim();
+        if (!t) return null;
+        const n = Number(t.replace(',', '.'));
+        return Number.isFinite(n) && n >= 0 ? round2(n) : null;
+      };
+      const goodsNum = parseOpt(editingItem.goodsPrice);
+      const exciseNum = parseOpt(editingItem.exciseTaxPrice);
+      const finalNotes = composeNotesWithPriceBreakdown(editingItem.notes, goodsNum, exciseNum);
+
       await saveInventoryItem({
         workspace,
         activeCompanyId: activeCompany?.id || 'company_1',
@@ -434,7 +457,7 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
           vatRate: editingItem.vatRate,
           warehouseId: editingItem.warehouseId,
           supplierName: editingItem.supplierName,
-          notes: editingItem.notes,
+          notes: finalNotes,
         },
       });
       notify(editingItem.id ? 'Skladová karta uložena.' : 'Nová položka byla přidána na sklad.');
@@ -654,6 +677,17 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
           <button
             type="button"
             onClick={() => {
+              setPriceEditorTab('BUILDER');
+              setPriceEditorOpen(true);
+            }}
+            className="inline-flex items-center gap-2 px-3.5 py-2 text-sm font-medium text-slate-800 bg-white border border-slate-300 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
+          >
+            <Calculator className="w-4 h-4" />
+            Hromadné přecenění
+          </button>
+          <button
+            type="button"
+            onClick={() => {
               const uncat = filteredItems.filter((i) => !(i.category || '').trim());
               const targets = uncat.length > 0 ? uncat : filteredItems;
               if (targets.length === 0) {
@@ -730,13 +764,13 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
           </div>
 
           <div className="flex flex-wrap items-center gap-2 flex-1 lg:justify-end">
-            <div className="relative flex-1 sm:flex-initial sm:w-64">
+            <div className="relative flex-1 sm:flex-initial sm:w-72">
               <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
               <input
                 type="text"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                placeholder="Hledat název, SKU, EAN, doklad…"
+                placeholder="Hledat (i více čárkou: elfliq, venix nex)…"
                 className="w-full pl-9 pr-3 py-1.5 text-sm bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:bg-white focus:border-slate-400"
               />
             </div>
@@ -892,11 +926,14 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
               <div className="flex flex-wrap items-center gap-1.5">
                 <button
                   type="button"
-                  onClick={() => setBulkModal('PRICES')}
+                  onClick={() => {
+                    setPriceEditorTab('BUILDER');
+                    setPriceEditorOpen(true);
+                  }}
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-white/10 hover:bg-white/20 rounded-lg transition-colors whitespace-nowrap"
                 >
                   <Percent className="w-3.5 h-3.5" />
-                  Ceny
+                  Ceny / Kolek
                 </button>
                 <button
                   type="button"
@@ -1204,6 +1241,18 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                                   <p className="text-xs text-slate-500">
                                     Nákup {formatCzk(item.purchasePrice)} · DPH {item.vatRate} %
                                   </p>
+                                  {(() => {
+                                    const bd = parsePriceBreakdown(item.notes);
+                                    if (bd.goodsPrice === null && bd.exciseTaxPrice === null) {
+                                      return null;
+                                    }
+                                    return (
+                                      <p className="text-[11px] text-emerald-700 mt-0.5">
+                                        Zboží {formatCzk(bd.goodsPrice ?? 0)} + kolek{' '}
+                                        {formatCzk(bd.exciseTaxPrice ?? 0)}
+                                      </p>
+                                    );
+                                  })()}
                                 </td>
                                 <td className="py-3 px-4 text-right">
                                   <div className="inline-flex items-center gap-1 justify-end">
@@ -1786,10 +1835,79 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                 </div>
               </div>
 
+              <div className="sm:col-span-2 rounded-lg border border-slate-200 bg-slate-50/70 p-3 space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs font-semibold text-slate-800">
+                    Rozpis nákupní ceny (volitelné: Zboží + Kolek = Výsledný nákup)
+                  </p>
+                  {(editingItem.goodsPrice || editingItem.exciseTaxPrice) && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setEditingItem({ ...editingItem, goodsPrice: '', exciseTaxPrice: '' })
+                      }
+                      className="text-[11px] text-slate-500 hover:text-red-600"
+                    >
+                      Smazat rozpis
+                    </button>
+                  )}
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                      Cena zboží (bez DPH)
+                    </label>
+                    <QtyInput
+                      value={editingItem.goodsPrice}
+                      onValueChange={(val) => {
+                        const g = Number(val.replace(',', '.')) || 0;
+                        const ex = Number(editingItem.exciseTaxPrice.replace(',', '.')) || 0;
+                        const hasAny = val.trim() !== '' || editingItem.exciseTaxPrice.trim() !== '';
+                        setEditingItem({
+                          ...editingItem,
+                          goodsPrice: val,
+                          purchasePrice: hasAny ? String(round2(g + ex)) : editingItem.purchasePrice,
+                        });
+                      }}
+                      placeholder="např. 55"
+                      className="w-full px-3 py-1.5 text-sm bg-white border border-slate-200 rounded-lg tabular-nums"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                      Cena kolku / spotř. daň
+                    </label>
+                    <QtyInput
+                      value={editingItem.exciseTaxPrice}
+                      onValueChange={(val) => {
+                        const g = Number(editingItem.goodsPrice.replace(',', '.')) || 0;
+                        const ex = Number(val.replace(',', '.')) || 0;
+                        const hasAny = editingItem.goodsPrice.trim() !== '' || val.trim() !== '';
+                        setEditingItem({
+                          ...editingItem,
+                          exciseTaxPrice: val,
+                          purchasePrice: hasAny ? String(round2(g + ex)) : editingItem.purchasePrice,
+                        });
+                      }}
+                      placeholder="např. 35"
+                      className="w-full px-3 py-1.5 text-sm bg-white border border-slate-200 rounded-lg tabular-nums"
+                    />
+                  </div>
+                  <div className="col-span-2 sm:col-span-1 flex flex-col justify-end">
+                    <div className="px-3 py-1.5 rounded-lg bg-white border border-slate-200 text-xs tabular-nums flex items-center justify-between">
+                      <span className="text-slate-500">Součet:</span>
+                      <strong className="text-slate-900">
+                        {formatCzk(Number(editingItem.purchasePrice.replace(',', '.')) || 0)}
+                      </strong>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div className="grid grid-cols-3 gap-2 sm:col-span-2">
                 <div>
                   <label className="block text-xs font-medium text-slate-700 mb-1">
-                    Nákupní cena bez DPH
+                    Výsledný nákup bez DPH
                   </label>
                   <QtyInput
                     value={editingItem.purchasePrice}
@@ -1808,6 +1926,19 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                     onValueChange={(val) => setEditingItem({ ...editingItem, salePrice: val })}
                     className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg tabular-nums"
                   />
+                  {(() => {
+                    const p = Number(editingItem.purchasePrice.replace(',', '.')) || 0;
+                    const s = Number(editingItem.salePrice.replace(',', '.')) || 0;
+                    if (s <= 0) return null;
+                    const withVat = round2(s * (1 + (editingItem.vatRate || 0) / 100));
+                    const markup = p > 0 ? round2(((s - p) / p) * 100) : null;
+                    return (
+                      <p className="text-[11px] text-slate-500 mt-1 tabular-nums">
+                        S DPH: <strong>{formatCzk(withVat)}</strong>
+                        {markup !== null ? ` · Přirážka ${markup > 0 ? '+' : ''}${markup} %` : ''}
+                      </p>
+                    );
+                  })()}
                 </div>
                 <div>
                   <label className="block text-xs font-medium text-slate-700 mb-1">Sazba DPH</label>
@@ -1867,6 +1998,25 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
         </div>
       )}
 
+      {/* Advanced Bulk Price & Goods+Excise Editor Modal */}
+      {priceEditorOpen && workspace && (
+        <BulkPriceEditorModal
+          allItems={accessibleItems}
+          preselectedItems={selectedItems}
+          warehouses={accessibleWarehouses}
+          existingCategories={allWorkspaceCategories}
+          workspace={workspace}
+          accentColor={palette.primary}
+          initialTab={priceEditorTab}
+          onClose={() => setPriceEditorOpen(false)}
+          onCompleted={(msg, clearSel) => {
+            notify(msg);
+            setPriceEditorOpen(false);
+            if (clearSel) setSelectedIds(new Set());
+          }}
+          onError={(msg) => notify(msg, 'error')}
+        />
+      )}
       {/* Bulk Action Modals */}
       {workspace && (
         <InventoryBulkModals

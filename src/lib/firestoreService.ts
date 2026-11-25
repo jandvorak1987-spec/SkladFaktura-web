@@ -817,6 +817,45 @@ export async function bulkUpdateInventoryPrices(params: {
   return items.length;
 }
 
+export async function bulkApplyItemPriceChanges(params: {
+  workspace: Workspace;
+  changes: Array<{
+    itemId: string;
+    purchasePrice?: number;
+    salePrice?: number;
+    notes?: string;
+  }>;
+}): Promise<number> {
+  const { workspace, changes } = params;
+  const valid = changes.filter((c) => c.itemId);
+  if (valid.length === 0) return 0;
+
+  const root = wsRoot(workspace.id);
+  for (let i = 0; i < valid.length; i += 350) {
+    const chunk = valid.slice(i, i + 350);
+    const batch = writeBatch(db);
+    for (const c of chunk) {
+      const patch: Record<string, unknown> = { updatedAt: serverTimestamp() };
+      if (c.purchasePrice !== undefined && Number.isFinite(c.purchasePrice)) {
+        patch.purchasePrice = Math.max(0, round2(c.purchasePrice));
+      }
+      if (c.salePrice !== undefined && Number.isFinite(c.salePrice)) {
+        patch.salePrice = Math.max(0, round2(c.salePrice));
+      }
+      if (c.notes !== undefined) {
+        patch.notes = c.notes.trim().slice(0, 500);
+      }
+      batch.update(doc(root, 'inventory', c.itemId), patch);
+    }
+    try {
+      await batch.commit();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `workspaces/${workspace.id}/inventory`);
+    }
+  }
+  return valid.length;
+}
+
 export async function bulkAdjustInventoryQuantity(params: {
   workspace: Workspace;
   items: InventoryItem[];
