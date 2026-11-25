@@ -2,6 +2,7 @@ import React, { useMemo, useState } from 'react';
 import { BarChart3, Download, Percent, Receipt, TrendingUp, Users } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import {
+  calculateInvoiceTotals,
   downloadTextFile,
   formatCzk,
   formatQty,
@@ -131,21 +132,24 @@ export function ReportsVatView() {
       clientStats.set(clientKey, cStat);
 
       const isVatDoc = inv.totalVat > 0 || (activeCompany?.vatPayer ?? true);
+      if (inv.reverseCharge) {
+        const rcBaseCzk = round2(inv.totalWithoutVat * fx * sign);
+        vatBuckets.RC.base = round2(vatBuckets.RC.base + rcBaseCzk);
+        vatBuckets.RC.total = round2(vatBuckets.RC.total + rcBaseCzk);
+      } else {
+        const invBreakdown = calculateInvoiceTotals(inv.items || [], isVatDoc).breakdown;
+        for (const row of invBreakdown) {
+          const bucketKey = row.rate === 21 ? '21' : row.rate === 12 ? '12' : '0';
+          const baseCzk = round2(row.base * fx * sign);
+          const vatCzk = isVatDoc && row.rate > 0 ? round2(baseCzk * (row.rate / 100)) : 0;
+          vatBuckets[bucketKey].base = round2(vatBuckets[bucketKey].base + baseCzk);
+          vatBuckets[bucketKey].vat = round2(vatBuckets[bucketKey].vat + vatCzk);
+          vatBuckets[bucketKey].total = round2(vatBuckets[bucketKey].total + baseCzk + vatCzk);
+        }
+      }
+
       for (const line of inv.items || []) {
         const lineNetCzk = round2(lineTotalWithoutVat(line) * fx * sign);
-        const rate = inv.reverseCharge ? 0 : line.vatRate || 0;
-        const lineVatCzk = isVatDoc && !inv.reverseCharge ? round2(lineNetCzk * (rate / 100)) : 0;
-
-        const bucketKey = inv.reverseCharge
-          ? 'RC'
-          : rate === 21
-            ? '21'
-            : rate === 12
-              ? '12'
-              : '0';
-        vatBuckets[bucketKey].base = round2(vatBuckets[bucketKey].base + lineNetCzk);
-        vatBuckets[bucketKey].vat = round2(vatBuckets[bucketKey].vat + lineVatCzk);
-        vatBuckets[bucketKey].total = round2(vatBuckets[bucketKey].total + lineNetCzk + lineVatCzk);
 
         const stockCard =
           (line.inventoryItemId ? inventoryById.get(line.inventoryItemId) : undefined) ||

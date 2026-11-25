@@ -1809,7 +1809,7 @@ export async function issueInvoice(params: {
       : '')
   )
     .trim()
-    .slice(0, 400);
+    .slice(0, 1500);
 
   const shouldMoveStock = Boolean(payload.deductFromStock) && docType !== 'QUOTE' && docType !== 'PROFORMA';
 
@@ -1940,6 +1940,9 @@ export async function editInvoice(params: {
   }
 
   const { company } = payload;
+  const docType: InvoiceDocumentType =
+    payload.documentType || originalInvoice.documentType || 'INVOICE';
+  const isReverseCharge = Boolean(payload.reverseCharge);
   const cleanItems = payload.items
     .filter((i) => i.name.trim().length > 0 && i.quantity > 0)
     .slice(0, 100)
@@ -1951,7 +1954,11 @@ export async function editInvoice(params: {
       quantity: round2(i.quantity),
       unit: (i.unit || 'ks').trim().slice(0, 20),
       unitPrice: Math.max(0, round2(i.unitPrice)),
-      vatRate: i.vatRate === 0 || i.vatRate === 12 || i.vatRate === 21 ? i.vatRate : 21,
+      vatRate: isReverseCharge
+        ? 0
+        : i.vatRate === 0 || i.vatRate === 12 || i.vatRate === 21
+          ? i.vatRate
+          : 21,
       discountPercent: Math.min(100, Math.max(0, round2(i.discountPercent || 0))),
     }));
 
@@ -1959,7 +1966,6 @@ export async function editInvoice(params: {
     throw new Error('Faktura musí obsahovat alespoň jednu položku.');
   }
 
-  const totals = calculateInvoiceTotals(cleanItems, company.vatPayer);
   const root = wsRoot(workspace.id);
   const invNum = payload.invoiceNumber.trim().slice(0, 40);
   const vs = (payload.variableSymbol.trim() || invNum.replace(/\D/g, '')).slice(0, 20);
@@ -2025,9 +2031,6 @@ export async function editInvoice(params: {
     }
   };
 
-  const docType: InvoiceDocumentType =
-    payload.documentType || originalInvoice.documentType || 'INVOICE';
-  const isReverseCharge = Boolean(payload.reverseCharge);
   const currency =
     (payload.currency || originalInvoice.currency || 'CZK').trim().toUpperCase().slice(0, 3) || 'CZK';
   const exchangeRate =
@@ -2043,7 +2046,7 @@ export async function editInvoice(params: {
       : '')
   )
     .trim()
-    .slice(0, 400);
+    .slice(0, 1500);
 
   const editableFields = {
     invoiceNumber: invNum,

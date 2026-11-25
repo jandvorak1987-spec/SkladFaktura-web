@@ -13,8 +13,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 3000);
-const PRIMARY_GEMINI_MODEL = 'gemini-4-hydrogen';
-const FALLBACK_GEMINI_MODEL = 'gemini-3.1-flash-lite';
+const PRIMARY_GEMINI_MODEL = 'gemini-2.5-flash';
+const FALLBACK_GEMINI_MODEL = 'gemini-2.5-flash-lite';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

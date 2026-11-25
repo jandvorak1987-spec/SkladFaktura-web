@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import {
+  AlertTriangle,
   ArrowLeft,
   ArrowRightLeft,
   Ban,
@@ -22,6 +23,7 @@ import {
   Printer,
   RefreshCw,
   Search,
+  ShieldCheck,
   Trash2,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
@@ -51,7 +53,6 @@ import {
   getRecurringLabel,
   isInvoiceOverdue,
   lineTotalWithoutVat,
-  lineTotalWithVat,
   previewNextInvoiceNumber,
   round2,
   toIsoDate,
@@ -81,6 +82,89 @@ type StatusFilter = 'ALL' | InvoiceStatus | 'OVERDUE' | 'RECURRING' | 'NON_TAX';
 const SUPPORTED_CURRENCIES = ['CZK', 'EUR', 'USD', 'PLN', 'GBP', 'CHF'] as const;
 const REVERSE_CHARGE_LEGAL_TEXT =
   'Daň odvede zákazník (§ 92a zákona č. 235/2004 Sb., o DPH – režim přenesené daňové povinnosti).';
+
+interface StatutoryClauseOption {
+  id: string;
+  label: string;
+  hint: string;
+  text: string;
+  requiresVatPayer?: boolean;
+  requiresNonVatPayer?: boolean;
+  isReverseCharge?: boolean;
+}
+
+const STATUTORY_CLAUSES: StatutoryClauseOption[] = [
+  {
+    id: 'recycling',
+    label: 'Recyklační poplatek (elektrozařízení a baterie)',
+    hint: 'Zákon č. 542/2020 Sb. – zpětný odběr elektrozařízení a baterií',
+    text: 'V ceně elektrozařízení a baterií je zahrnut recyklační příspěvek dle zákona č. 542/2020 Sb., o výrobcích s ukončenou životností (zpětný odběr zajištěn v kolektivním systému).',
+  },
+  {
+    id: 'age18',
+    label: 'Uložení / výdej výhradně osobám nad 18 let',
+    hint: 'Zákon č. 65/2017 Sb. – věkové omezení a ověření věku při předání',
+    text: 'Zboží podléhá věkovému omezení 18+ dle zákona č. 65/2017 Sb. Prodej, uložení i výdej zásilky je možný výhradně osobě starší 18 let po ověření věku.',
+  },
+  {
+    id: 'excise',
+    label: 'Spotřební daň z náplní do e-cigaret',
+    hint: 'Zákon č. 353/2003 Sb. – volný daňový oběh a tabákové nálepky',
+    text: 'Náplně do elektronických cigaret jsou uvedeny do volného daňového oběhu v ČR a řádně zdaněny spotřební daní dle zákona č. 353/2003 Sb.',
+  },
+  {
+    id: 'packaging',
+    label: 'Zpětný odběr obalů (EKO-KOM)',
+    hint: 'Zákon č. 477/2001 Sb., o obalech',
+    text: 'Povinnost zpětného odběru a využití odpadu z obalů dle zákona č. 477/2001 Sb. je splněna zapojením do systému sdruženého plnění EKO-KOM.',
+  },
+  {
+    id: 'eu_exempt',
+    label: 'Dodání zboží do EU osvobozené od DPH (§ 64)',
+    hint: '§ 64 zákona č. 235/2004 Sb., o DPH',
+    text: 'Dodání zboží do jiného členského státu EU je osvobozeno od DPH dle § 64 zákona č. 235/2004 Sb., o DPH.',
+    requiresVatPayer: true,
+  },
+  {
+    id: 'reverse_charge',
+    label: 'Přenesená daňová povinnost (Reverse Charge)',
+    hint: '§ 92a zákona č. 235/2004 Sb., o DPH – daň odvede zákazník',
+    text: REVERSE_CHARGE_LEGAL_TEXT,
+    requiresVatPayer: true,
+    isReverseCharge: true,
+  },
+  {
+    id: 'non_vat_payer',
+    label: 'Nejsme plátci DPH',
+    hint: 'Povinné označení neplátce DPH na dokladu',
+    text: 'Dodavatel není plátcem DPH.',
+    requiresNonVatPayer: true,
+  },
+];
+
+function hasLegalClause(notice: string, clauseText: string): boolean {
+  const needle = clauseText.trim();
+  if (!needle) return false;
+  return notice
+    .split('\n')
+    .map((line) => line.trim())
+    .some((line) => line === needle);
+}
+
+function toggleLegalClause(notice: string, clauseText: string, enabled: boolean): string {
+  const needle = clauseText.trim();
+  const lines = notice
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (enabled) {
+    if (!lines.includes(needle)) {
+      lines.push(needle);
+    }
+    return lines.join('\n');
+  }
+  return lines.filter((line) => line !== needle).join('\n');
+}
 
 function paymentMethodLabel(method: PaymentMethod): string {
   if (method === 'CASH') return 'Hotově';
@@ -466,7 +550,9 @@ function InvoiceDocumentPreview({
               <th className="py-2 px-2 text-right">Cena / MJ</th>
               <th className="py-2 px-2 text-right">Sleva</th>
               {showVatColumns && <th className="py-2 px-2 text-right">DPH</th>}
-              <th className="py-2 pl-2 text-right">Celkem</th>
+              <th className="py-2 pl-2 text-right">
+                {showVatColumns ? 'Celkem bez DPH' : 'Celkem'}
+              </th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
@@ -492,11 +578,7 @@ function InvoiceDocumentPreview({
                   </td>
                 )}
                 <td className="py-2.5 pl-2 text-right font-semibold tabular-nums whitespace-nowrap">
-                  {formatCzk(
-                    amountSign *
-                      (showVatColumns ? lineTotalWithVat(item, true) : lineTotalWithoutVat(item)),
-                    currency
-                  )}
+                  {formatCzk(amountSign * lineTotalWithoutVat(item), currency)}
                 </td>
               </tr>
             ))}
@@ -504,24 +586,48 @@ function InvoiceDocumentPreview({
         </table>
       </div>
 
-      {/* Reverse charge / Legal notice */}
-      {(isReverseCharge || invoice.legalNotice) && (
-        <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-2.5 text-xs text-slate-700">
-          <strong className="text-slate-900">Zákonná doložka: </strong>
-          {invoice.legalNotice || REVERSE_CHARGE_LEGAL_TEXT}
-        </div>
-      )}
+      {/* Statutory obligations & legal notices */}
+      {(() => {
+        const rawNotice = (
+          invoice.legalNotice || (isReverseCharge ? REVERSE_CHARGE_LEGAL_TEXT : '')
+        ).trim();
+        if (!rawNotice) return null;
+        const noticeLines = rawNotice
+          .split('\n')
+          .map((l) => l.trim())
+          .filter(Boolean);
+        return (
+          <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-2.5 text-xs text-slate-700 space-y-1">
+            {noticeLines.length === 1 ? (
+              <p>
+                <strong className="text-slate-900">Zákonná doložka: </strong>
+                {noticeLines[0]}
+              </p>
+            ) : (
+              <>
+                <p className="font-semibold text-slate-900">Zákonné doložky a povinnosti:</p>
+                <ul className="list-disc pl-4 space-y-0.5 text-slate-700">
+                  {noticeLines.map((line, i) => (
+                    <li key={i}>{line}</li>
+                  ))}
+                </ul>
+              </>
+            )}
+          </div>
+        );
+      })()}
 
       {/* VAT Summary + Grand total */}
       <div className="flex flex-col sm:flex-row justify-between gap-6 pt-4 border-t border-slate-200">
         <div className="flex-1 text-xs text-slate-600 space-y-3">
           {showVatColumns && totals.breakdown.length > 0 && (
-            <table className="w-full max-w-xs text-left border-collapse">
+            <table className="w-full max-w-sm text-left border-collapse">
               <thead>
                 <tr className="text-[10px] uppercase text-slate-400 border-b border-slate-100">
                   <th className="py-1">Sazba</th>
                   <th className="py-1 text-right">Základ</th>
                   <th className="py-1 text-right">DPH</th>
+                  <th className="py-1 text-right">Celkem s DPH</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-50 tabular-nums">
@@ -533,6 +639,9 @@ function InvoiceDocumentPreview({
                     </td>
                     <td className="py-1 text-right">
                       {formatCzk(amountSign * row.vat, currency)}
+                    </td>
+                    <td className="py-1 text-right font-medium text-slate-800">
+                      {formatCzk(amountSign * row.total, currency)}
                     </td>
                   </tr>
                 ))}
@@ -687,6 +796,7 @@ export function InvoicesView({
   const [saving, setSaving] = useState(false);
   const [deleteConfirmInvoice, setDeleteConfirmInvoice] = useState<Invoice | null>(null);
   const [deletingInvoice, setDeletingInvoice] = useState(false);
+  const [fixingVatRounding, setFixingVatRounding] = useState(false);
 
   const accessibleItems = useMemo(() => {
     const whIds = new Set(accessibleWarehouses.map((w) => w.id));
@@ -1112,7 +1222,9 @@ export function InvoicesView({
         currency,
         exchangeRate: parsedFx,
         reverseCharge,
-        legalNotice: legalNotice.trim() || (reverseCharge ? REVERSE_CHARGE_LEGAL_TEXT : ''),
+        legalNotice: reverseCharge
+          ? toggleLegalClause(legalNotice, REVERSE_CHARGE_LEGAL_TEXT, true)
+          : legalNotice.trim(),
         relatedInvoiceNumber: relatedInvoiceNumber.trim(),
         recurringInterval,
         clientId,
@@ -1330,6 +1442,53 @@ export function InvoicesView({
     }
   };
 
+  const handleFixVatRounding = async (inv: Invoice) => {
+    if (!workspace || !activeCompany || inv.status === 'CANCELLED') return;
+    setFixingVatRounding(true);
+    try {
+      const updatedId = await editInvoice({
+        workspace,
+        originalInvoice: inv,
+        inventory,
+        isAdmin: isCurrentUserAdmin,
+        payload: {
+          company: activeCompany,
+          documentType: inv.documentType || 'INVOICE',
+          invoiceNumber: inv.invoiceNumber,
+          variableSymbol: inv.variableSymbol,
+          issueDate: inv.issueDate,
+          taxDate: inv.taxDate || inv.issueDate,
+          dueDate: inv.dueDate,
+          paymentMethod: inv.paymentMethod || 'BANK_TRANSFER',
+          currency: inv.currency || 'CZK',
+          exchangeRate: inv.exchangeRate && inv.exchangeRate > 0 ? inv.exchangeRate : 1,
+          reverseCharge: Boolean(inv.reverseCharge),
+          legalNotice: inv.legalNotice || '',
+          relatedInvoiceNumber: inv.relatedInvoiceNumber || '',
+          recurringInterval: inv.recurringInterval || 'NONE',
+          clientId: inv.clientId || '',
+          clientName: inv.clientName || '',
+          clientIco: inv.clientIco || '',
+          clientDic: inv.clientDic || '',
+          clientStreet: inv.clientStreet || '',
+          clientCity: inv.clientCity || '',
+          clientZip: inv.clientZip || '',
+          clientEmail: inv.clientEmail || '',
+          note: inv.note || '',
+          deductFromStock: Boolean(inv.deductedFromStock),
+          invoiceTemplate: inv.invoiceTemplate || activeCompany.invoiceTemplate || 'CLASSIC',
+          items: inv.items,
+        },
+      });
+      setSelectedInvoiceId(updatedId);
+      notify(`Zaokrouhlení DPH na dokladu ${inv.invoiceNumber} bylo přepočítáno dle § 37 ZDPH.`);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Přepočet DPH se nezdařil.', 'error');
+    } finally {
+      setFixingVatRounding(false);
+    }
+  };
+
   // DETAIL VIEW
   if (mode === 'DETAIL' && selectedInvoice) {
     const isVatPayer = selectedInvoice.totalVat > 0 || (activeCompany?.vatPayer ?? true);
@@ -1532,6 +1691,44 @@ export function InvoicesView({
             </div>
           )}
         </div>
+
+        {(() => {
+          const effectiveDetailVat =
+            isVatPayer && !selectedInvoice.reverseCharge && selDocType !== 'QUOTE';
+          const statutoryTotals = calculateInvoiceTotals(selectedInvoice.items, effectiveDetailVat);
+          const vatDiff = round2(statutoryTotals.totalVat - selectedInvoice.totalVat);
+          if (Math.abs(vatDiff) < 0.01 || selectedInvoice.status === 'CANCELLED') return null;
+          const curr = (selectedInvoice.currency || 'CZK').toUpperCase();
+          return (
+            <div className="no-print bg-amber-50 border border-amber-300 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5 text-xs text-amber-950">
+                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                <div>
+                  <p className="font-semibold">
+                    Zjištěn rozdíl v zaokrouhlení DPH (
+                    {vatDiff > 0 ? '+' : ''}
+                    {formatCzk(vatDiff, curr)}) oproti výpočtu dle § 37 zák. o DPH
+                  </p>
+                  <p className="text-amber-800 mt-0.5">
+                    Doklad byl dříve uložen s řádkovým zaokrouhlením DPH ({formatCzk(selectedInvoice.totalVat, curr)}).
+                    Dle § 37 odst. 1 písm. a) ZDPH a POHODY činí DPH ze součtu základu za sazbu{' '}
+                    <strong>{formatCzk(statutoryTotals.totalVat, curr)}</strong> (celkem{' '}
+                    <strong>{formatCzk(statutoryTotals.totalWithVat, curr)}</strong>).
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={fixingVatRounding}
+                onClick={() => handleFixVatRounding(selectedInvoice)}
+                className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-amber-600 hover:bg-amber-700 rounded-lg whitespace-nowrap shrink-0 disabled:opacity-60"
+              >
+                {fixingVatRounding && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                Opravit zaokrouhlení DPH
+              </button>
+            </div>
+          );
+        })()}
 
         <InvoiceDocumentPreview
           invoice={selectedInvoice}
@@ -1830,11 +2027,9 @@ export function InvoicesView({
                       onChange={(e) => {
                         const checked = e.target.checked;
                         setReverseCharge(checked);
-                        if (checked && !legalNotice.trim()) {
-                          setLegalNotice(REVERSE_CHARGE_LEGAL_TEXT);
-                        } else if (!checked && legalNotice === REVERSE_CHARGE_LEGAL_TEXT) {
-                          setLegalNotice('');
-                        }
+                        setLegalNotice((prev) =>
+                          toggleLegalClause(prev, REVERSE_CHARGE_LEGAL_TEXT, checked)
+                        );
                       }}
                       className="rounded border-slate-300"
                     />
@@ -1842,20 +2037,6 @@ export function InvoicesView({
                   </label>
                 )}
               </div>
-
-              {reverseCharge && (
-                <div className="col-span-2">
-                  <label className="block text-xs font-medium text-slate-700 mb-1">
-                    Zákonná doložka na dokladu
-                  </label>
-                  <input
-                    type="text"
-                    value={legalNotice}
-                    onChange={(e) => setLegalNotice(e.target.value)}
-                    className="w-full px-3 py-2 text-xs border border-slate-200 rounded-lg bg-slate-50"
-                  />
-                </div>
-              )}
             </div>
           </div>
 
@@ -1971,6 +2152,106 @@ export function InvoicesView({
           </div>
         </div>
 
+        {/* Statutory obligations & legal clauses */}
+        {(() => {
+          const isVatCompany = Boolean(activeCompany?.vatPayer);
+          const visibleClauses = STATUTORY_CLAUSES.filter((c) => {
+            if (c.requiresVatPayer && !isVatCompany) return false;
+            if (c.requiresNonVatPayer && isVatCompany) return false;
+            return true;
+          });
+          const activeCount = visibleClauses.filter((c) =>
+            c.isReverseCharge ? reverseCharge : hasLegalClause(legalNotice, c.text)
+          ).length;
+
+          return (
+            <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-slate-600" />
+                  <div>
+                    <h2 className="text-sm font-semibold text-slate-900">
+                      Zákonné povinnosti a doložky na faktuře
+                    </h2>
+                    <p className="text-xs text-slate-500">
+                      Zaškrtnuté povinnosti se automaticky propíšou na vystavený doklad a PDF.
+                    </p>
+                  </div>
+                </div>
+                <span className="text-xs font-medium text-slate-600 self-start sm:self-auto">
+                  {activeCount > 0 ? `Vybráno: ${activeCount}` : 'Žádná nevybrána'}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2.5">
+                {visibleClauses.map((clause) => {
+                  const checked = clause.isReverseCharge
+                    ? reverseCharge
+                    : hasLegalClause(legalNotice, clause.text);
+                  return (
+                    <label
+                      key={clause.id}
+                      className={`flex items-start gap-2.5 p-3 rounded-lg border cursor-pointer transition-colors ${
+                        checked
+                          ? 'bg-emerald-50/70 border-emerald-300'
+                          : 'bg-slate-50/60 border-slate-200 hover:bg-slate-100/70'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={(e) => {
+                          const next = e.target.checked;
+                          if (clause.isReverseCharge) {
+                            setReverseCharge(next);
+                          }
+                          setLegalNotice((prev) => toggleLegalClause(prev, clause.text, next));
+                        }}
+                        className="mt-0.5 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                      />
+                      <div className="min-w-0">
+                        <p className="text-xs font-semibold text-slate-900 leading-snug">
+                          {clause.label}
+                        </p>
+                        <p className="text-[11px] text-slate-500 mt-0.5 leading-snug">
+                          {clause.hint}
+                        </p>
+                      </div>
+                    </label>
+                  );
+                })}
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-medium text-slate-700">
+                    Text zákonných doložek propsaný na fakturu (lze libovolně upravit nebo doplnit)
+                  </label>
+                  {legalNotice.trim() && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setLegalNotice('');
+                        if (reverseCharge) setReverseCharge(false);
+                      }}
+                      className="text-[11px] font-medium text-slate-500 hover:text-red-600"
+                    >
+                      Vymazat vše
+                    </button>
+                  )}
+                </div>
+                <textarea
+                  rows={legalNotice.includes('\n') ? 3 : 2}
+                  value={legalNotice}
+                  onChange={(e) => setLegalNotice(e.target.value)}
+                  placeholder="Zaškrtněte povinnosti výše nebo napište vlastní zákonnou doložku…"
+                  className="w-full px-3 py-2 text-xs border border-slate-200 rounded-lg bg-slate-50 focus:bg-white"
+                />
+              </div>
+            </div>
+          );
+        })()}
+
         {/* Line items */}
         <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -2032,7 +2313,9 @@ export function InvoicesView({
                   <th className="py-2 px-2 w-32 text-right">Cena bez DPH</th>
                   <th className="py-2 px-2 w-20 text-right">Sleva %</th>
                   {effectiveDraftVatPayer && <th className="py-2 px-2 w-20">DPH</th>}
-                  <th className="py-2 pl-2 w-32 text-right">Celkem</th>
+                  <th className="py-2 pl-2 w-32 text-right">
+                    {effectiveDraftVatPayer ? 'Celkem bez DPH' : 'Celkem'}
+                  </th>
                   <th className="py-2 pl-2 w-8"></th>
                 </tr>
               </thead>
@@ -2105,12 +2388,7 @@ export function InvoicesView({
                       </td>
                     )}
                     <td className="py-2 pl-2 text-right font-semibold tabular-nums whitespace-nowrap">
-                      {formatCzk(
-                        effectiveDraftVatPayer
-                          ? lineTotalWithVat(line, true)
-                          : lineTotalWithoutVat(line),
-                        currency
-                      )}
+                      {formatCzk(lineTotalWithoutVat(line), currency)}
                     </td>
                     <td className="py-2 pl-2 text-right">
                       <button
@@ -2141,14 +2419,25 @@ export function InvoicesView({
               />
             </div>
 
-            <div className="sm:w-72 space-y-1 text-sm tabular-nums">
+            <div className="sm:w-80 space-y-1 text-sm tabular-nums">
               <div className="flex justify-between text-slate-600">
                 <span>Celkem bez DPH</span>
                 <span>{formatCzk(draftTotals.totalWithoutVat, currency)}</span>
               </div>
+              {effectiveDraftVatPayer &&
+                draftTotals.breakdown
+                  .filter((r) => r.rate > 0)
+                  .map((r) => (
+                    <div key={r.rate} className="flex justify-between text-xs text-slate-500">
+                      <span>
+                        DPH {r.rate} % (ze základu {formatCzk(r.base, currency)})
+                      </span>
+                      <span>{formatCzk(r.vat, currency)}</span>
+                    </div>
+                  ))}
               {effectiveDraftVatPayer && (
                 <div className="flex justify-between text-slate-600">
-                  <span>DPH</span>
+                  <span>DPH celkem (dle § 37 ZDPH)</span>
                   <span>{formatCzk(draftTotals.totalVat, currency)}</span>
                 </div>
               )}

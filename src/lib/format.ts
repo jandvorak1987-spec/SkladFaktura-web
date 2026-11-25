@@ -25,7 +25,8 @@ const qtyFormatter = new Intl.NumberFormat('cs-CZ', {
 
 export function round2(value: number): number {
   if (!Number.isFinite(value)) return 0;
-  return Math.round(value * 100) / 100;
+  const sign = value < 0 ? -1 : 1;
+  return (sign * Math.round((Math.abs(value) + 1e-10) * 100)) / 100;
 }
 
 export function formatCzk(amount: number, currency = 'CZK'): string {
@@ -192,24 +193,25 @@ export function calculateInvoiceTotals(
   totalWithVat: number;
   breakdown: VatBreakdownRow[];
 } {
-  const byRate = new Map<number, { base: number; vat: number }>();
+  // Součet základů daně za každou sazbu DPH a výpočet DPH z celkového základu sazby
+  // dle § 37 odst. 1 písm. a) zákona č. 235/2004 Sb., o DPH (shodné s POHODA / Money S3 / Fakturoid).
+  const baseByRate = new Map<number, number>();
   for (const item of items) {
     const rate = vatPayer ? item.vatRate || 0 : 0;
     const base = lineTotalWithoutVat(item);
-    const vat = lineVatAmount(item, vatPayer);
-    const curr = byRate.get(rate) || { base: 0, vat: 0 };
-    curr.base = round2(curr.base + base);
-    curr.vat = round2(curr.vat + vat);
-    byRate.set(rate, curr);
+    baseByRate.set(rate, round2((baseByRate.get(rate) || 0) + base));
   }
-  const breakdown: VatBreakdownRow[] = Array.from(byRate.entries())
+  const breakdown: VatBreakdownRow[] = Array.from(baseByRate.entries())
     .sort((a, b) => b[0] - a[0])
-    .map(([rate, v]) => ({
-      rate,
-      base: v.base,
-      vat: v.vat,
-      total: round2(v.base + v.vat),
-    }));
+    .map(([rate, base]) => {
+      const vat = vatPayer && rate > 0 ? round2(base * (rate / 100)) : 0;
+      return {
+        rate,
+        base,
+        vat,
+        total: round2(base + vat),
+      };
+    });
 
   const totalWithoutVat = round2(breakdown.reduce((s, r) => s + r.base, 0));
   const totalVat = round2(breakdown.reduce((s, r) => s + r.vat, 0));
@@ -386,23 +388,43 @@ export function generatePohodaDataPackXml(params: {
       lines.push('        </typ:address></inv:partnerIdentity>');
       if (inv.note) lines.push(`        <inv:note>${escXml(inv.note)}</inv:note>`);
       lines.push('      </inv:invoiceHeader>');
+      const isRc = Boolean(inv.reverseCharge);
       lines.push('      <inv:invoiceDetail>');
       for (const line of inv.items) {
         lines.push('        <inv:invoiceItem>');
         lines.push(`          <inv:text>${escXml(line.name)}</inv:text>`);
         lines.push(`          <inv:quantity>${line.quantity.toFixed(2)}</inv:quantity>`);
         lines.push(`          <inv:unit>${escXml(line.unit)}</inv:unit>`);
-        lines.push(`          <inv:rateVAT>${mapPohodaVat(line.vatRate)}</inv:rateVAT>`);
+        lines.push(`          <inv:rateVAT>${isRc ? 'none' : mapPohodaVat(line.vatRate)}</inv:rateVAT>`);
         lines.push(`          <inv:homeCurrency><typ:unitPrice>${line.unitPrice.toFixed(2)}</typ:unitPrice></inv:homeCurrency>`);
         if (line.sku) lines.push(`          <inv:code>${escXml(line.sku)}</inv:code>`);
         lines.push('        </inv:invoiceItem>');
       }
       lines.push('      </inv:invoiceDetail>');
+      const priceNone = round2(
+        inv.items
+          .filter((i) => isRc || i.vatRate === 0)
+          .reduce((s, i) => s + lineTotalWithoutVat(i), 0)
+      );
+      const priceLow = isRc
+        ? 0
+        : round2(
+            inv.items
+              .filter((i) => i.vatRate === 12)
+              .reduce((s, i) => s + lineTotalWithoutVat(i), 0)
+          );
+      const priceHigh = isRc
+        ? 0
+        : round2(
+            inv.items
+              .filter((i) => i.vatRate === 21)
+              .reduce((s, i) => s + lineTotalWithoutVat(i), 0)
+          );
       lines.push('      <inv:invoiceSummary>');
       lines.push('        <inv:homeCurrency>');
-      lines.push(`          <typ:priceNone>${inv.items.filter((i) => i.vatRate === 0).reduce((s, i) => s + lineTotalWithoutVat(i), 0).toFixed(2)}</typ:priceNone>`);
-      lines.push(`          <typ:priceLow>${inv.items.filter((i) => i.vatRate === 12).reduce((s, i) => s + lineTotalWithoutVat(i), 0).toFixed(2)}</typ:priceLow>`);
-      lines.push(`          <typ:priceHigh>${inv.items.filter((i) => i.vatRate === 21).reduce((s, i) => s + lineTotalWithoutVat(i), 0).toFixed(2)}</typ:priceHigh>`);
+      lines.push(`          <typ:priceNone>${priceNone.toFixed(2)}</typ:priceNone>`);
+      lines.push(`          <typ:priceLow>${priceLow.toFixed(2)}</typ:priceLow>`);
+      lines.push(`          <typ:priceHigh>${priceHigh.toFixed(2)}</typ:priceHigh>`);
       lines.push('        </inv:homeCurrency>');
       lines.push('      </inv:invoiceSummary>');
       lines.push('    </inv:invoice>');
