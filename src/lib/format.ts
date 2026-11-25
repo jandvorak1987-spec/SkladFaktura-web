@@ -9,6 +9,7 @@ import {
   type InvoiceLineItem,
   type PohodaExportScope,
   type RecurringInterval,
+  type TeamMember,
   type Warehouse,
   type Workspace,
 } from '../types';
@@ -75,6 +76,8 @@ export function getDocumentTypeTitle(docType?: InvoiceDocumentType, vatPayer = t
       return 'CENOVÁ NABÍDKA';
     case 'CREDIT_NOTE':
       return vatPayer ? 'OPRAVNÝ DAŇOVÝ DOKLAD (DOBROPIS)' : 'DOBROPIS';
+    case 'SIMPLIFIED':
+      return vatPayer ? 'ZJEDNODUŠENÝ DAŇOVÝ DOKLAD' : 'PRODEJKA';
     default:
       return vatPayer ? 'FAKTURA – DAŇOVÝ DOKLAD' : 'FAKTURA';
   }
@@ -88,6 +91,8 @@ export function getDocumentTypeShortLabel(docType?: InvoiceDocumentType): string
       return 'Nabídka';
     case 'CREDIT_NOTE':
       return 'Dobropis';
+    case 'SIMPLIFIED':
+      return 'Prodejka';
     default:
       return 'Faktura';
   }
@@ -152,6 +157,185 @@ export function hasAdminRights(workspace: Workspace | null, email?: string | nul
     workspace.ownerEmail.toLowerCase() === norm ||
     (workspace.adminEmails || []).some((e) => e.toLowerCase() === norm)
   );
+}
+
+/**
+ * Recognizes the read-only Accountant ("Účetní") role whether stored directly as
+ * role === 'ACCOUNTANT' or safely tagged in displayName ("[Účetní]") for older Firestore rules.
+ */
+export function isAccountantMember(member?: Pick<TeamMember, 'role' | 'displayName'> | null): boolean {
+  if (!member) return false;
+  if (member.role === 'ACCOUNTANT') return true;
+  return /\[účetní\]/i.test(member.displayName || '');
+}
+
+export function stripAccountantTag(displayName: string): string {
+  return (displayName || '').replace(/\s*\[účetní\]\s*/gi, '').trim();
+}
+
+export function extractBrandFromProductName(name: string, category?: string): string {
+  const clean = (name || '').trim();
+  if (!clean) return category?.trim() || 'Ostatní';
+  // Recognize multi-word known brands first, otherwise first significant token
+  const lower = clean.toLowerCase();
+  const knownMulti: Array<[string, string]> = [
+    ['elf bar', 'Elf Bar'],
+    ['lost mary', 'Lost Mary'],
+    ['geek vape', 'GeekVape'],
+    ['vaporesso', 'Vaporesso'],
+    ['voopoo', 'Voopoo'],
+    ['elfliq', 'Elfliq'],
+    ['oxva', 'OXVA'],
+    ['venix', 'Venix'],
+    ['frunk', 'Frunk'],
+    ['iqos', 'IQOS'],
+    ['terea', 'TEREA'],
+    ['velo', 'VELO'],
+    ['kurwa', 'Kurwa'],
+    ['riq', 'RIQ'],
+    ['smok', 'SMOK'],
+    ['uwell', 'Uwell'],
+    ['aspire', 'Aspire'],
+    ['dotmod', 'Dotmod'],
+    ['nasty', 'Nasty'],
+    ['bar juice', 'Bar Juice'],
+    ['drifter', 'Drifter'],
+    ['riot', 'Riot'],
+    ['pablo', 'Pablo'],
+    ['killa', 'Killa'],
+    ['siberia', 'Siberia'],
+    ['zyn', 'ZYN'],
+  ];
+  for (const [needle, label] of knownMulti) {
+    if (lower.startsWith(needle) || lower.includes(` ${needle} `)) return label;
+  }
+  const firstToken = clean.split(/[\s\-_/]+/).find((t) => t.length >= 2) || clean;
+  return firstToken.charAt(0).toUpperCase() + firstToken.slice(1);
+}
+
+export interface InvoiceLineProfitInfo {
+  lineNetCzk: number;
+  effectiveUnitNetCzk: number;
+  purchaseUnitPriceCzk: number | null;
+  lineCostCzk: number;
+  lineProfitCzk: number;
+  marginPercent: number | null;
+  isBelowCost: boolean;
+  matchedItem: InventoryItem | null;
+}
+
+export interface InvoiceProfitStats {
+  revenueNetCzk: number;
+  costCzk: number;
+  profitCzk: number;
+  marginPercent: number | null;
+  hasBelowCostItems: boolean;
+  belowCostLinesCount: number;
+  matchedLinesCount: number;
+  totalLinesCount: number;
+  lineDetails: InvoiceLineProfitInfo[];
+}
+
+export function findInventoryItemForLine(
+  line: Pick<InvoiceLineItem, 'inventoryItemId' | 'sku' | 'name'>,
+  inventoryById: Map<string, InventoryItem>,
+  inventoryBySku: Map<string, InventoryItem>,
+  inventoryByName?: Map<string, InventoryItem>
+): InventoryItem | null {
+  if (line.inventoryItemId) {
+    const byId = inventoryById.get(line.inventoryItemId);
+    if (byId) return byId;
+  }
+  const skuKey = (line.sku || '').trim().toLowerCase();
+  if (skuKey && !/^sku[-_ ]?\d+$/i.test(skuKey)) {
+    const bySku = inventoryBySku.get(skuKey);
+    if (bySku) return bySku;
+  }
+  if (inventoryByName && line.name) {
+    const byName = inventoryByName.get(line.name.trim().toLowerCase());
+    if (byName) return byName;
+  }
+  return null;
+}
+
+export function computeInvoiceProfitStats(
+  invoice: Pick<Invoice, 'items' | 'currency' | 'exchangeRate' | 'documentType'>,
+  inventoryById: Map<string, InventoryItem>,
+  inventoryBySku: Map<string, InventoryItem>,
+  inventoryByName?: Map<string, InventoryItem>
+): InvoiceProfitStats {
+  const fx = invoice.currency && invoice.currency !== 'CZK' ? invoice.exchangeRate || 1 : 1;
+  const isCreditNote = invoice.documentType === 'CREDIT_NOTE';
+
+  let revenueNetCzk = 0;
+  let costCzk = 0;
+  let matchedLinesCount = 0;
+  let belowCostLinesCount = 0;
+  const lineDetails: InvoiceLineProfitInfo[] = [];
+
+  for (const item of invoice.items || []) {
+    const lineNetOrig = lineTotalWithoutVat(item);
+    const lineNetCzk = round2(lineNetOrig * fx);
+    const disc = Math.min(100, Math.max(0, item.discountPercent || 0));
+    const effectiveUnitNetCzk = round2((item.unitPrice || 0) * ((100 - disc) / 100) * fx);
+
+    const matched = findInventoryItemForLine(item, inventoryById, inventoryBySku, inventoryByName);
+    const purchaseUnitPriceCzk =
+      matched && matched.purchasePrice > 0 ? round2(matched.purchasePrice) : null;
+
+    let lineCostCzk = 0;
+    if (purchaseUnitPriceCzk !== null) {
+      matchedLinesCount += 1;
+      lineCostCzk = round2((item.quantity || 0) * purchaseUnitPriceCzk);
+    }
+
+    const lineProfitCzk = purchaseUnitPriceCzk !== null ? round2(lineNetCzk - lineCostCzk) : 0;
+    const marginPercent =
+      purchaseUnitPriceCzk !== null && Math.abs(lineNetCzk) > 0.001
+        ? round2((lineProfitCzk / Math.abs(lineNetCzk)) * 100)
+        : null;
+
+    // Below-cost check applies to normal positive sales (not credit notes or free 0-qty lines)
+    const isBelowCost =
+      !isCreditNote &&
+      purchaseUnitPriceCzk !== null &&
+      (item.quantity || 0) > 0 &&
+      effectiveUnitNetCzk + 0.001 < purchaseUnitPriceCzk;
+
+    if (isBelowCost) belowCostLinesCount += 1;
+
+    revenueNetCzk = round2(revenueNetCzk + lineNetCzk);
+    costCzk = round2(costCzk + lineCostCzk);
+
+    lineDetails.push({
+      lineNetCzk,
+      effectiveUnitNetCzk,
+      purchaseUnitPriceCzk,
+      lineCostCzk,
+      lineProfitCzk,
+      marginPercent,
+      isBelowCost,
+      matchedItem: matched,
+    });
+  }
+
+  const profitCzk = round2(revenueNetCzk - costCzk);
+  const marginPercent =
+    matchedLinesCount > 0 && Math.abs(revenueNetCzk) > 0.001
+      ? round2((profitCzk / Math.abs(revenueNetCzk)) * 100)
+      : null;
+
+  return {
+    revenueNetCzk,
+    costCzk,
+    profitCzk,
+    marginPercent,
+    hasBelowCostItems: belowCostLinesCount > 0,
+    belowCostLinesCount,
+    matchedLinesCount,
+    totalLinesCount: (invoice.items || []).length,
+    lineDetails,
+  };
 }
 
 export function formatCompanyAddress(c: Pick<Company, 'street' | 'zip' | 'city'>): string {

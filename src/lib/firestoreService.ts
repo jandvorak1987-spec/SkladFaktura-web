@@ -26,6 +26,7 @@ import type {
   PaymentMethod,
   RecurringInterval,
   TeamMember,
+  TeamRole,
   Workspace,
 } from '../types';
 import { db, handleFirestoreError, OperationType } from './firebase';
@@ -36,6 +37,7 @@ import {
   hasAdminRights,
   nowSyncLabel,
   round2,
+  stripAccountantTag,
   toIsoDate,
 } from './format';
 import {
@@ -296,33 +298,36 @@ export async function addColleague(params: {
   callerEmail: string;
   displayName: string;
   emailInput: string;
-  grantAdmin: boolean;
+  grantAdmin?: boolean;
+  role?: Exclude<TeamRole, 'OWNER'>;
 }): Promise<void> {
-  const { workspace, currentMembers, callerEmail, displayName, emailInput, grantAdmin } = params;
+  const { workspace, currentMembers, callerEmail, displayName, emailInput, grantAdmin, role } = params;
   const myEmail = callerEmail.trim().toLowerCase();
   if (!hasAdminRights(workspace, myEmail)) {
     throw new Error('Pouze administrátor může přidávat kolegy.');
   }
 
+  const targetRole: Exclude<TeamRole, 'OWNER'> = role || (grantAdmin ? 'ADMIN' : 'MEMBER');
   const cleanEmail = emailInput.trim().toLowerCase();
   if (!cleanEmail.includes('@') || !cleanEmail.includes('.')) {
     throw new Error('Zadejte platný e-mail kolegy.');
   }
   const nonOwnerCount = currentMembers.filter((m) => m.role !== 'OWNER').length;
-  if (nonOwnerCount >= 3) {
-    throw new Error('Maximální počet přidaných kolegů je 3 (celkem 4 uživatelé včetně vlastníka).');
+  if (nonOwnerCount >= 5) {
+    throw new Error('Maximální počet přidaných kolegů je 5.');
   }
   if (workspace.memberEmails.some((e) => e.toLowerCase() === cleanEmail)) {
-    throw new Error(`Kolega s e-mailem ${cleanEmail} už v týmu je.`);
+    throw new Error(`Uživatel s e-mailem ${cleanEmail} už v týmu je.`);
   }
 
-  const cleanName = (displayName.trim() || cleanEmail.split('@')[0]).slice(0, 120);
+  const baseName = stripAccountantTag(displayName.trim() || cleanEmail.split('@')[0]).slice(0, 108);
   const updatedMembers = Array.from(
     new Set([...workspace.memberEmails.map((e) => e.toLowerCase()), cleanEmail])
   );
-  const updatedAdmins = grantAdmin
-    ? Array.from(new Set([...workspace.adminEmails.map((e) => e.toLowerCase()), cleanEmail]))
-    : Array.from(new Set(workspace.adminEmails.map((e) => e.toLowerCase())));
+  const updatedAdmins =
+    targetRole === 'ADMIN'
+      ? Array.from(new Set([...workspace.adminEmails.map((e) => e.toLowerCase()), cleanEmail]))
+      : Array.from(new Set(workspace.adminEmails.map((e) => e.toLowerCase())));
 
   const root = wsRoot(workspace.id);
   try {
@@ -333,15 +338,32 @@ export async function addColleague(params: {
     });
 
     const memberRef = doc(collection(root, 'teamMembers'));
-    await setDoc(memberRef, {
-      workspaceId: workspace.id,
-      email: cleanEmail,
-      displayName: cleanName,
-      role: grantAdmin ? 'ADMIN' : 'MEMBER',
-      memberEmails: updatedMembers,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
+    try {
+      await setDoc(memberRef, {
+        workspaceId: workspace.id,
+        email: cleanEmail,
+        displayName: baseName,
+        role: targetRole,
+        memberEmails: updatedMembers,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (innerErr) {
+      // Fallback for live Firestore rules that only whitelist ['OWNER','ADMIN','MEMBER']
+      if (targetRole === 'ACCOUNTANT') {
+        await setDoc(memberRef, {
+          workspaceId: workspace.id,
+          email: cleanEmail,
+          displayName: `${baseName} [Účetní]`.slice(0, 120),
+          role: 'MEMBER',
+          memberEmails: updatedMembers,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        throw innerErr;
+      }
+    }
 
     await syncMemberEmailsAcrossWorkspace(workspace.id, myEmail, updatedMembers);
   } catch (error) {
@@ -349,13 +371,13 @@ export async function addColleague(params: {
   }
 }
 
-export async function setColleagueAdminRole(params: {
+export async function setColleagueRole(params: {
   workspace: Workspace;
   callerEmail: string;
   member: TeamMember;
-  makeAdmin: boolean;
+  newRole: Exclude<TeamRole, 'OWNER'>;
 }): Promise<void> {
-  const { workspace, callerEmail, member, makeAdmin } = params;
+  const { workspace, callerEmail, member, newRole } = params;
   const myEmail = callerEmail.trim().toLowerCase();
   if (!hasAdminRights(workspace, myEmail)) {
     throw new Error('Pouze administrátor může měnit oprávnění kolegů.');
@@ -365,6 +387,7 @@ export async function setColleagueAdminRole(params: {
   }
 
   const targetEmail = member.email.trim().toLowerCase();
+  const makeAdmin = newRole === 'ADMIN';
   const updatedAdmins = makeAdmin
     ? Array.from(new Set([...workspace.adminEmails.map((e) => e.toLowerCase()), targetEmail]))
     : Array.from(
@@ -375,23 +398,55 @@ export async function setColleagueAdminRole(params: {
         )
       );
 
+  const cleanName = stripAccountantTag(member.displayName || member.email.split('@')[0]).slice(0, 108);
   const root = wsRoot(workspace.id);
-  const batch = writeBatch(db);
-  batch.update(root, { adminEmails: updatedAdmins, updatedAt: serverTimestamp() });
-  batch.update(doc(root, 'teamMembers', member.id), {
-    role: makeAdmin ? 'ADMIN' : 'MEMBER',
-    updatedAt: serverTimestamp(),
-  });
+
+  const commitRole = async (roleValue: TeamRole, nameValue: string) => {
+    const batch = writeBatch(db);
+    batch.update(root, { adminEmails: updatedAdmins, updatedAt: serverTimestamp() });
+    batch.update(doc(root, 'teamMembers', member.id), {
+      role: roleValue,
+      displayName: nameValue,
+      updatedAt: serverTimestamp(),
+    });
+    await batch.commit();
+  };
 
   try {
-    await batch.commit();
+    await commitRole(newRole, cleanName);
   } catch (error) {
+    if (newRole === 'ACCOUNTANT') {
+      try {
+        await commitRole('MEMBER', `${cleanName} [Účetní]`.slice(0, 120));
+        return;
+      } catch (fallbackErr) {
+        handleFirestoreError(
+          fallbackErr,
+          OperationType.UPDATE,
+          `workspaces/${workspace.id}/teamMembers/${member.id}`
+        );
+      }
+    }
     handleFirestoreError(
       error,
       OperationType.UPDATE,
       `workspaces/${workspace.id}/teamMembers/${member.id}`
     );
   }
+}
+
+export async function setColleagueAdminRole(params: {
+  workspace: Workspace;
+  callerEmail: string;
+  member: TeamMember;
+  makeAdmin: boolean;
+}): Promise<void> {
+  await setColleagueRole({
+    workspace: params.workspace,
+    callerEmail: params.callerEmail,
+    member: params.member,
+    newRole: params.makeAdmin ? 'ADMIN' : 'MEMBER',
+  });
 }
 
 export async function removeColleague(params: {
@@ -1795,6 +1850,7 @@ export interface CreateInvoicePayload {
   clientZip: string;
   note: string;
   deductFromStock: boolean;
+  markPaidImmediately?: boolean;
   invoiceTemplate: InvoiceTemplateId;
   items: InvoiceLineItem[];
 }
@@ -1837,6 +1893,22 @@ export async function issueInvoice(params: {
   }
 
   const totals = calculateInvoiceTotals(cleanItems, effectiveVatPayer);
+  const isSimplified = docType === 'SIMPLIFIED';
+  const totalWithVatCzk = round2(totals.totalWithVat * exchangeRate);
+  if (isSimplified && totalWithVatCzk > 10000) {
+    throw new Error(
+      'Zjednodušený daňový doklad (prodejka) může být dle § 30a ZDPH vystaven maximálně do 10 000 Kč s DPH. Přepněte typ dokladu na běžnou fakturu.'
+    );
+  }
+
+  const resolvedClientName = (
+    payload.clientName.trim() || (isSimplified ? 'Konečný zákazník (Prodejka)' : '')
+  ).slice(0, 200);
+  if (!resolvedClientName) {
+    throw new Error('Vyplňte název odběratele.');
+  }
+
+  const paidImmediately = Boolean(payload.markPaidImmediately);
   const root = wsRoot(workspace.id);
   const invRef = doc(collection(root, 'invoices'));
   const invNum = payload.invoiceNumber.trim().slice(0, 40);
@@ -1879,9 +1951,9 @@ export async function issueInvoice(params: {
     taxDate: payload.taxDate.slice(0, 20),
     dueDate: payload.dueDate.slice(0, 20),
     paymentMethod: payload.paymentMethod,
-    status: 'ISSUED',
+    status: paidImmediately ? 'PAID' : 'ISSUED',
     clientId: payload.clientId.slice(0, 64),
-    clientName: payload.clientName.trim().slice(0, 200),
+    clientName: resolvedClientName,
     clientIco: payload.clientIco.trim().slice(0, 20),
     clientDic: payload.clientDic.trim().slice(0, 25),
     clientStreet: payload.clientStreet.trim().slice(0, 200),
@@ -1894,8 +1966,8 @@ export async function issueInvoice(params: {
     totalWithoutVat: totals.totalWithoutVat,
     totalVat: totals.totalVat,
     totalWithVat: totals.totalWithVat,
-    paidAmount: 0,
-    paidDate: '',
+    paidAmount: paidImmediately ? totals.totalWithVat : 0,
+    paidDate: paidImmediately ? payload.issueDate.slice(0, 20) : '',
     matchedTransactionId: '',
     note: payload.note.trim().slice(0, 500),
     deductedFromStock: shouldMoveStock,
@@ -1914,7 +1986,7 @@ export async function issueInvoice(params: {
     });
   }
 
-  // Deduct stock (INVOICE) or return stock (CREDIT_NOTE) atomically
+  // Deduct stock (INVOICE / SIMPLIFIED) or return stock (CREDIT_NOTE) atomically
   if (shouldMoveStock) {
     const isCreditNote = docType === 'CREDIT_NOTE';
     const invMap = new Map(inventory.map((i) => [i.id, i]));
@@ -1936,6 +2008,12 @@ export async function issueInvoice(params: {
         quantity: round2(stockItem.quantity + delta),
         updatedAt: serverTimestamp(),
       });
+      const refPrefix = isCreditNote ? 'DOB' : isSimplified ? 'PRO' : 'FA';
+      const notePrefix = isCreditNote
+        ? 'Vratka z dobropisu'
+        : isSimplified
+          ? 'Prodejka'
+          : 'Výdej k faktuře';
       batch.set(doc(collection(root, 'stockMovements')), {
         workspaceId: workspace.id,
         memberEmails: workspace.memberEmails,
@@ -1948,11 +2026,8 @@ export async function issueInvoice(params: {
         quantityDelta: delta,
         unit: stockItem.unit.slice(0, 20),
         unitPrice: stockItem.salePrice,
-        documentRef: `${isCreditNote ? 'DOB' : 'FA'} ${invNum}`.slice(0, 100),
-        note: `${isCreditNote ? 'Vratka z dobropisu' : 'Výdej k faktuře'} pro ${payload.clientName}`.slice(
-          0,
-          300
-        ),
+        documentRef: `${refPrefix} ${invNum}`.slice(0, 100),
+        note: `${notePrefix} pro ${resolvedClientName}`.slice(0, 300),
         createdAt: serverTimestamp(),
       });
     }

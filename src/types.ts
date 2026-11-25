@@ -1,6 +1,6 @@
 import type { Timestamp } from 'firebase/firestore';
 
-export type TeamRole = 'OWNER' | 'ADMIN' | 'MEMBER';
+export type TeamRole = 'OWNER' | 'ADMIN' | 'MEMBER' | 'ACCOUNTANT';
 export type MovementType = 'RECEIPT' | 'ISSUE' | 'ADJUSTMENT';
 export type PaymentMethod = 'BANK_TRANSFER' | 'CASH' | 'CARD';
 export type InvoiceStatus = 'ISSUED' | 'PAID' | 'CANCELLED';
@@ -141,7 +141,7 @@ export interface InvoiceLineItem {
   discountPercent: number;
 }
 
-export type InvoiceDocumentType = 'INVOICE' | 'PROFORMA' | 'QUOTE' | 'CREDIT_NOTE';
+export type InvoiceDocumentType = 'INVOICE' | 'PROFORMA' | 'QUOTE' | 'CREDIT_NOTE' | 'SIMPLIFIED';
 export type RecurringInterval = 'NONE' | 'MONTHLY' | 'QUARTERLY' | 'YEARLY';
 
 export interface Invoice {

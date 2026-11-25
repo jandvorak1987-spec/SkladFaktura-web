@@ -187,6 +187,36 @@ export function SmartStockInView() {
     return Array.from(set).sort((a, b) => a.localeCompare(b, 'cs'));
   }, [inventory]);
 
+  const sanitizeExtractedUnit = (rawUnit?: string): string => {
+    const trimmed = (rawUnit || '').trim();
+    const clean = trimmed.toLowerCase().replace(/[.,;:()]/g, '');
+    if (
+      !clean ||
+      clean === 'ml' ||
+      clean === 'mlt' ||
+      clean === 'cl' ||
+      clean === 'dl' ||
+      clean === 'mililitr' ||
+      clean === 'mililitru' ||
+      clean === 'mililitrů' ||
+      clean === 'mililitry' ||
+      clean === 'kus' ||
+      clean === 'kusy' ||
+      clean === 'kusu' ||
+      clean === 'kusů' ||
+      clean === 'pcs' ||
+      clean === 'pc' ||
+      clean === 'ea' ||
+      clean === 'st' ||
+      clean === 'stk' ||
+      clean === 'pce' ||
+      clean === 'h87'
+    ) {
+      return 'ks';
+    }
+    return trimmed.slice(0, 20);
+  };
+
   const normalizeAndMatchNote = (raw: ExtractedDeliveryNote, whId: string): ExtractedDeliveryNote => {
     const currency = (raw.currency || 'CZK').toUpperCase();
     const exchangeRate = currency === 'CZK' ? 1 : Number(raw.exchangeRate || 1) || 1;
@@ -197,13 +227,26 @@ export function SmartStockInView() {
       exchangeRateSource: raw.exchangeRateSource || (currency === 'CZK' ? 'CZK' : 'MANUAL'),
       items: raw.items.map((item) => ({
         ...item,
+        unit: sanitizeExtractedUnit(item.unit),
         originalPurchasePrice:
           item.originalPurchasePrice !== undefined
             ? item.originalPurchasePrice
             : item.purchasePrice,
       })),
     };
-    return matchExtractedToInventory(normalized, inventory, whId);
+    const matched = matchExtractedToInventory(normalized, inventory, whId);
+    return {
+      ...matched,
+      items: matched.items.map((line) => {
+        if (line.matchedInventoryId) {
+          const existing = inventoryById.get(line.matchedInventoryId);
+          if (existing?.unit && existing.unit.toLowerCase() !== 'ml') {
+            return { ...line, unit: existing.unit };
+          }
+        }
+        return line;
+      }),
+    };
   };
 
   const enqueueDocs = (newDocs: QueuedStockInDoc[]) => {
@@ -1683,7 +1726,27 @@ export function SmartStockInView() {
                   <th className="py-2.5 px-3">SKU</th>
                   <th className="py-2.5 px-3">Název, párování & kategorie</th>
                   <th className="py-2.5 px-3 w-24 text-right">Množství</th>
-                  <th className="py-2.5 px-3 w-20">MJ</th>
+                  <th className="py-2.5 px-3 w-24">
+                    <div className="flex items-center gap-1.5">
+                      <span>MJ</span>
+                      {note.items.some((i) => i.unit.trim().toLowerCase() !== 'ks') && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setNote({
+                              ...note,
+                              items: note.items.map((i) => ({ ...i, unit: 'ks' })),
+                            });
+                            notify('Všechny řádky přepnuty na jednotku „ks“.');
+                          }}
+                          title="Nastavit u všech řádků jednotku ks"
+                          className="px-1.5 py-0.5 text-[10px] font-semibold normal-case tracking-normal text-emerald-800 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 rounded whitespace-nowrap"
+                        >
+                          Vše ks
+                        </button>
+                      )}
+                    </div>
+                  </th>
                   {isForeignCurrency && (
                     <th className="py-2.5 px-3 w-28 text-right">Nákup ({docCurrency})</th>
                   )}

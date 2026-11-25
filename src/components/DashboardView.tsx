@@ -1,6 +1,7 @@
 import React, { useMemo } from 'react';
 import {
   AlertTriangle,
+  Archive,
   ArrowDownLeft,
   ArrowRight,
   ArrowUpRight,
@@ -33,6 +34,7 @@ interface DashboardViewProps {
 export function DashboardView({ onNavigate, onQuickCreateInvoice }: DashboardViewProps) {
   const {
     activeCompany,
+    isReadOnlyAccountant,
     accessibleWarehouses,
     inventory,
     movements,
@@ -124,31 +126,45 @@ export function DashboardView({ onNavigate, onQuickCreateInvoice }: DashboardVie
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={() => onNavigate('smart-stock-in')}
-            className="inline-flex items-center gap-2 px-3.5 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
-          >
-            <Sparkles className="w-4 h-4 text-slate-600" />
-            AI Příjemka
-          </button>
-          <button
-            type="button"
-            onClick={() => onNavigate('bank-matching')}
-            className="inline-flex items-center gap-2 px-3.5 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
-          >
-            <Landmark className="w-4 h-4 text-slate-600" />
-            Párování banky
-          </button>
-          <button
-            type="button"
-            onClick={onQuickCreateInvoice}
-            style={{ backgroundColor: palette.primary }}
-            className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white hover:opacity-95 rounded-lg transition-opacity whitespace-nowrap"
-          >
-            <FilePlus2 className="w-4 h-4" />
-            Nová faktura
-          </button>
+          {!isReadOnlyAccountant ? (
+            <>
+              <button
+                type="button"
+                onClick={() => onNavigate('smart-stock-in')}
+                className="inline-flex items-center gap-2 px-3.5 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
+              >
+                <Sparkles className="w-4 h-4 text-slate-600" />
+                AI Příjemka
+              </button>
+              <button
+                type="button"
+                onClick={() => onNavigate('bank-matching')}
+                className="inline-flex items-center gap-2 px-3.5 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
+              >
+                <Landmark className="w-4 h-4 text-slate-600" />
+                Párování banky
+              </button>
+              <button
+                type="button"
+                onClick={onQuickCreateInvoice}
+                style={{ backgroundColor: palette.primary }}
+                className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white hover:opacity-95 rounded-lg transition-opacity whitespace-nowrap"
+              >
+                <FilePlus2 className="w-4 h-4" />
+                Nová faktura
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={() => onNavigate('settings')}
+              style={{ backgroundColor: palette.primary }}
+              className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white hover:opacity-95 rounded-lg transition-opacity whitespace-nowrap"
+            >
+              <Archive className="w-4 h-4" />
+              Měsíční balíček pro účetní (ZIP)
+            </button>
+          )}
         </div>
       </div>
 
@@ -257,11 +273,12 @@ export function DashboardView({ onNavigate, onQuickCreateInvoice }: DashboardVie
         </div>
       )}
 
-      {/* Realtime Performance Chart */}
+      {/* Monthly Cashflow & Realtime Performance Chart */}
       <PerformanceChart
         invoices={companyInvoices}
         movements={companyMovements}
         accentPrimary={palette.primary}
+        vatPayer={activeCompany?.vatPayer ?? true}
       />
 
       {/* Recent Invoices + Recent Stock Movements */}

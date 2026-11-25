@@ -1,8 +1,10 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
+  Archive,
   Building2,
   Check,
   Download,
+  Eye,
   FileCode2,
   Loader2,
   Plus,
@@ -22,21 +24,28 @@ import {
   markInvoicesExportedToPohoda,
   removeColleague,
   saveCompany,
-  setColleagueAdminRole,
+  setColleagueRole,
 } from '../lib/firestoreService';
 import {
   czechAccountToIban,
   downloadTextFile,
   generatePohodaDataPackXml,
   getCompanyPalette,
+  isAccountantMember,
+  stripAccountantTag,
   toIsoDate,
 } from '../lib/format';
+import {
+  generateAndDownloadMonthlyAccountantPack,
+  getMonthlyPackPreviewCounts,
+} from '../lib/accountantPack';
 import {
   COMPANY_BRAND_PALETTES,
   INVOICE_TEMPLATES,
   type Company,
   type InvoiceTemplateId,
   type PohodaExportScope,
+  type TeamRole,
 } from '../types';
 
 type SettingsTab = 'COMPANY' | 'WAREHOUSES' | 'TEAM' | 'POHODA';
@@ -46,6 +55,7 @@ export function SettingsExportView() {
     workspace,
     userEmail,
     isCurrentUserAdmin,
+    isReadOnlyAccountant,
     teamMembers,
     companies,
     activeCompany,
@@ -53,12 +63,13 @@ export function SettingsExportView() {
     warehouses,
     accessibleWarehouses,
     inventory,
+    movements,
     invoices,
     lookupAres,
     notify,
   } = useApp();
 
-  const [tab, setTab] = useState<SettingsTab>('COMPANY');
+  const [tab, setTab] = useState<SettingsTab>(isReadOnlyAccountant ? 'POHODA' : 'COMPANY');
   const [draftCompany, setDraftCompany] = useState<Company | null>(activeCompany);
   const [aresBusy, setAresBusy] = useState(false);
   const [savingCompany, setSavingCompany] = useState(false);
@@ -100,8 +111,12 @@ export function SettingsExportView() {
   // Team form
   const [colleagueName, setColleagueName] = useState('');
   const [colleagueEmail, setColleagueEmail] = useState('');
-  const [colleagueAdmin, setColleagueAdmin] = useState(false);
+  const [colleagueRole, setColleagueRoleDraft] = useState<Exclude<TeamRole, 'OWNER'>>('MEMBER');
   const [teamBusy, setTeamBusy] = useState(false);
+
+  // Monthly accountant ZIP pack
+  const [packMonthKey, setPackMonthKey] = useState<string>(() => toIsoDate().slice(0, 7));
+  const [buildingPack, setBuildingPack] = useState(false);
 
   // Pohoda export
   const [pohodaScope, setPohodaScope] = useState<PohodaExportScope>('BOTH');
@@ -297,16 +312,50 @@ export function SettingsExportView() {
         callerEmail: userEmail,
         displayName: colleagueName,
         emailInput: colleagueEmail,
-        grantAdmin: colleagueAdmin,
+        role: colleagueRole,
       });
-      notify(`Kolega ${colleagueEmail.trim().toLowerCase()} byl přidán do sdíleného prostoru.`);
+      const roleLabel =
+        colleagueRole === 'ACCOUNTANT'
+          ? 'Účetní (jen pro čtení)'
+          : colleagueRole === 'ADMIN'
+            ? 'Administrátor'
+            : 'Kolega';
+      notify(
+        `${colleagueEmail.trim().toLowerCase()} byl přidán s rolí ${roleLabel}.`
+      );
       setColleagueName('');
       setColleagueEmail('');
-      setColleagueAdmin(false);
+      setColleagueRoleDraft('MEMBER');
     } catch (err) {
-      notify(err instanceof Error ? err.message : 'Přidání kolegy selhalo.', 'error');
+      notify(err instanceof Error ? err.message : 'Přidání uživatele selhalo.', 'error');
     } finally {
       setTeamBusy(false);
+    }
+  };
+
+  const handleDownloadMonthlyPack = async () => {
+    if (!workspace || !activeCompany) return;
+    setBuildingPack(true);
+    try {
+      const result = await generateAndDownloadMonthlyAccountantPack({
+        workspaceId: workspace.id,
+        company: activeCompany,
+        monthKey: packMonthKey,
+        invoices,
+        movements,
+        inventory: companyInventory,
+        warehouses,
+      });
+      notify(
+        `Balíček ${result.zipFileName} (${result.zipSizeKb} kB) stažen: ${result.issuedInvoicesCount} vydaných PDF, ${result.receivedArchiveFilesCount} přijatých souborů, ${result.cashEntriesCount} pokladních dokladů + POHODA XML.`
+      );
+    } catch (err) {
+      notify(
+        err instanceof Error ? err.message : 'Generování měsíčního balíčku selhalo.',
+        'error'
+      );
+    } finally {
+      setBuildingPack(false);
     }
   };
 
@@ -329,7 +378,11 @@ export function SettingsExportView() {
         'application/xml;charset=utf-8'
       );
 
-      if ((pohodaScope === 'INVOICES' || pohodaScope === 'BOTH') && invoicesForPohoda.length > 0) {
+      if (
+        !isReadOnlyAccountant &&
+        (pohodaScope === 'INVOICES' || pohodaScope === 'BOTH') &&
+        invoicesForPohoda.length > 0
+      ) {
         const unexportedIds = invoicesForPohoda
           .filter((i) => !i.exportedToPohoda)
           .map((i) => i.id);
@@ -344,6 +397,17 @@ export function SettingsExportView() {
       setExportingPohoda(false);
     }
   };
+
+  const packCounts = useMemo(
+    () =>
+      getMonthlyPackPreviewCounts({
+        company: activeCompany,
+        monthKey: packMonthKey,
+        invoices,
+        movements,
+      }),
+    [activeCompany, packMonthKey, invoices, movements]
+  );
 
   const nonOwnerCount = teamMembers.filter((m) => m.role !== 'OWNER').length;
 
@@ -362,8 +426,8 @@ export function SettingsExportView() {
           [
             ['COMPANY', 'Firemní údaje', Building2],
             ['WAREHOUSES', `Sklady (${warehouses.length})`, WarehouseIcon],
-            ['TEAM', `Tým (${teamMembers.length}/4)`, Users],
-            ['POHODA', 'Export POHODA XML', FileCode2],
+            ['TEAM', `Tým (${teamMembers.length}/6)`, Users],
+            ['POHODA', 'Balíček pro účetní & POHODA', Archive],
           ] as [SettingsTab, string, React.ComponentType<{ className?: string }>][]
         ).map(([id, label, Icon]) => (
           <button
@@ -886,51 +950,75 @@ export function SettingsExportView() {
             <div className="xl:col-span-3 bg-white border border-slate-200 rounded-xl overflow-hidden">
               <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
                 <h2 className="text-sm font-semibold text-slate-900">
-                  Členové sdíleného prostoru ({teamMembers.length} / 4)
+                  Členové sdíleného prostoru ({teamMembers.length} / 6)
                 </h2>
-                <span className="text-xs text-slate-500">Vlastník + až 3 kolegové</span>
+                <span className="text-xs text-slate-500">Vlastník + až 5 kolegů / účetní</span>
               </div>
               <div className="divide-y divide-slate-100">
                 {teamMembers.map((member) => {
                   const isOwner = member.role === 'OWNER';
-                  const isAdmin = member.role === 'ADMIN';
+                  const isAcct = isAccountantMember(member);
+                  const effectiveRole: TeamRole = isOwner
+                    ? 'OWNER'
+                    : member.role === 'ADMIN'
+                      ? 'ADMIN'
+                      : isAcct
+                        ? 'ACCOUNTANT'
+                        : 'MEMBER';
+                  const displayNameClean = stripAccountantTag(member.displayName) || member.email;
                   return (
                     <div
                       key={member.id}
                       className="px-5 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
                     >
                       <div>
-                        <p className="text-sm font-semibold text-slate-900">
-                          {member.displayName}
+                        <p className="text-sm font-semibold text-slate-900 flex items-center gap-2 flex-wrap">
+                          <span>{displayNameClean}</span>
                           {member.email.toLowerCase() === userEmail && (
-                            <span className="text-xs font-normal text-slate-500"> (vy)</span>
+                            <span className="text-xs font-normal text-slate-500">(vy)</span>
+                          )}
+                          {effectiveRole === 'ACCOUNTANT' && (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold bg-indigo-50 text-indigo-800 border border-indigo-200 rounded">
+                              <Eye className="w-3 h-3" />
+                              Účetní (jen pro čtení)
+                            </span>
                           )}
                         </p>
                         <p className="text-xs text-slate-500 mt-0.5">
                           {member.email} ·{' '}
                           <span className="font-medium text-slate-700">
-                            {isOwner ? 'Vlastník' : isAdmin ? 'Administrátor' : 'Kolega (člen)'}
+                            {effectiveRole === 'OWNER'
+                              ? 'Vlastník'
+                              : effectiveRole === 'ADMIN'
+                                ? 'Administrátor'
+                                : effectiveRole === 'ACCOUNTANT'
+                                  ? 'Účetní (jen čtení + exporty)'
+                                  : 'Kolega (úpravy skladu a faktur)'}
                           </span>
                         </p>
                       </div>
 
                       {!isOwner && isCurrentUserAdmin && workspace && (
                         <div className="flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={async () => {
+                          <select
+                            aria-label="Role člena týmu"
+                            value={effectiveRole}
+                            onChange={async (e) => {
+                              const nextRole = e.target.value as Exclude<TeamRole, 'OWNER'>;
                               try {
-                                await setColleagueAdminRole({
+                                await setColleagueRole({
                                   workspace,
                                   callerEmail: userEmail,
                                   member,
-                                  makeAdmin: !isAdmin,
+                                  newRole: nextRole,
                                 });
-                                notify(
-                                  !isAdmin
-                                    ? `${member.displayName} má nyní práva administrátora.`
-                                    : `Práva administrátora pro ${member.displayName} byla odebrána.`
-                                );
+                                const lbl =
+                                  nextRole === 'ACCOUNTANT'
+                                    ? 'Účetní (jen pro čtení)'
+                                    : nextRole === 'ADMIN'
+                                      ? 'Administrátor'
+                                      : 'Kolega';
+                                notify(`Role pro ${displayNameClean} byla změněna na ${lbl}.`);
                               } catch (err) {
                                 notify(
                                   err instanceof Error ? err.message : 'Změna role selhala.',
@@ -938,11 +1026,12 @@ export function SettingsExportView() {
                                 );
                               }
                             }}
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md"
+                            className="px-2.5 py-1.5 text-xs font-medium text-slate-800 bg-slate-50 border border-slate-200 rounded-md"
                           >
-                            <Shield className="w-3.5 h-3.5" />
-                            {isAdmin ? 'Odebrat admina' : 'Nastavit adminem'}
-                          </button>
+                            <option value="MEMBER">Kolega (úpravy)</option>
+                            <option value="ACCOUNTANT">Účetní (jen čtení)</option>
+                            <option value="ADMIN">Administrátor</option>
+                          </select>
                           <button
                             type="button"
                             onClick={async () => {
@@ -952,7 +1041,7 @@ export function SettingsExportView() {
                                   callerEmail: userEmail,
                                   member,
                                 });
-                                notify(`${member.displayName} byl odebrán z týmu.`, 'info');
+                                notify(`${displayNameClean} byl odebrán z týmu.`, 'info');
                               } catch (err) {
                                 notify(
                                   err instanceof Error ? err.message : 'Odebrání selhalo.',
@@ -977,54 +1066,63 @@ export function SettingsExportView() {
               onSubmit={handleAddColleague}
               className="xl:col-span-2 bg-white border border-slate-200 rounded-xl p-5 space-y-4 self-start"
             >
-              <h2 className="text-sm font-semibold text-slate-900">Pozvat kolegu podle e-mailu</h2>
+              <h2 className="text-sm font-semibold text-slate-900">
+                Pozvat kolegu nebo účetní
+              </h2>
               <p className="text-xs text-slate-500">
-                Můžete zadat libovolný e-mail (firemní, Seznam, Gmail…). Na webu se kolega přihlásí
-                tímto e-mailem a heslem (nebo přes Google účet); v Android aplikaci přes Google účet
-                propojený s touto adresou.
+                Účetní s rolí <strong>Účetní (jen pro čtení)</strong> vidí všechny faktury, DPH
+                přehledy a může si 1 kliknutím stáhnout měsíční ZIP balíček i POHODA XML, ale nemůže
+                nic smazat ani upravit.
               </p>
 
               <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">Jméno kolegy</label>
+                <label className="block text-xs font-medium text-slate-700 mb-1">Jméno</label>
                 <input
                   type="text"
-                  disabled={!isCurrentUserAdmin || nonOwnerCount >= 3}
+                  disabled={!isCurrentUserAdmin || nonOwnerCount >= 5}
                   value={colleagueName}
                   onChange={(e) => setColleagueName(e.target.value)}
-                  placeholder="Např. Petr Novák"
+                  placeholder="Např. Ing. Jana Nováková (účetní)"
                   className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
                 />
               </div>
 
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1">
-                  E-mail kolegy *
+                  E-mail *
                 </label>
                 <input
                   type="email"
                   required
-                  disabled={!isCurrentUserAdmin || nonOwnerCount >= 3}
+                  disabled={!isCurrentUserAdmin || nonOwnerCount >= 5}
                   value={colleagueEmail}
                   onChange={(e) => setColleagueEmail(e.target.value)}
-                  placeholder="kolega@firma.cz"
+                  placeholder="ucetni@firma.cz"
                   className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
                 />
               </div>
 
-              <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
-                <input
-                  type="checkbox"
-                  disabled={!isCurrentUserAdmin || nonOwnerCount >= 3}
-                  checked={colleagueAdmin}
-                  onChange={(e) => setColleagueAdmin(e.target.checked)}
-                  className="rounded border-slate-300"
-                />
-                Udělit práva administrátora (úprava firem, skladů a týmu)
-              </label>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  Role a oprávnění
+                </label>
+                <select
+                  disabled={!isCurrentUserAdmin || nonOwnerCount >= 5}
+                  value={colleagueRole}
+                  onChange={(e) =>
+                    setColleagueRoleDraft(e.target.value as Exclude<TeamRole, 'OWNER'>)
+                  }
+                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg bg-white"
+                >
+                  <option value="ACCOUNTANT">Účetní — jen pro čtení + exporty ZIP & POHODA</option>
+                  <option value="MEMBER">Kolega — fakturace a správa skladu</option>
+                  <option value="ADMIN">Administrátor — plný přístup včetně firem a týmu</option>
+                </select>
+              </div>
 
               <button
                 type="submit"
-                disabled={!isCurrentUserAdmin || nonOwnerCount >= 3 || teamBusy}
+                disabled={!isCurrentUserAdmin || nonOwnerCount >= 5 || teamBusy}
                 style={{ backgroundColor: palette.primary }}
                 className="w-full inline-flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white rounded-lg disabled:opacity-50"
               >
@@ -1033,93 +1131,182 @@ export function SettingsExportView() {
                 ) : (
                   <UserPlus className="w-4 h-4" />
                 )}
-                {nonOwnerCount >= 3 ? 'Dosažen limit 3 kolegů' : 'Přidat kolegu do týmu'}
+                {nonOwnerCount >= 5 ? 'Dosažen limit 5 členů' : 'Přidat do sdíleného prostoru'}
               </button>
             </form>
           </div>
         </div>
       )}
 
-      {/* TAB 4: POHODA XML EXPORT */}
+      {/* TAB 4: MONTHLY ACCOUNTANT PACK & POHODA XML EXPORT */}
       {tab === 'POHODA' && activeCompany && (
-        <div className="bg-white border border-slate-200 rounded-xl p-6 max-w-2xl space-y-5">
-          <div>
-            <h2 className="text-base font-semibold text-slate-900">
-              Export dat pro Stormware POHODA (XML DataPack v2.0)
-            </h2>
-            <p className="text-xs text-slate-500 mt-1">
-              Vygenerovaný XML balíček pro firmu <strong>{activeCompany.name}</strong> (IČO{' '}
-              {activeCompany.ico || 'nevyplněno'}) můžete přímo naimportovat přes Soubor → Datová
-              komunikace → XML import/export.
-            </p>
-          </div>
-
-          <div className="space-y-2">
-            <label className="block text-xs font-medium text-slate-700">Rozsah exportu</label>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-              {(
-                [
-                  ['INVOICES', 'Pouze faktury'],
-                  ['STOCK', 'Pouze skladové karty'],
-                  ['BOTH', 'Faktury i sklad'],
-                ] as [PohodaExportScope, string][]
-              ).map(([id, label]) => (
-                <button
-                  key={id}
-                  type="button"
-                  onClick={() => setPohodaScope(id)}
-                  className={`py-2.5 px-3 text-xs font-medium rounded-lg border transition-colors ${
-                    pohodaScope === id
-                      ? 'bg-slate-900 text-white border-slate-900'
-                      : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
-                  }`}
+        <div className="space-y-6 max-w-3xl">
+          {/* 1-CLICK MONTHLY ACCOUNTANT ZIP PACK */}
+          <div className="bg-white border-2 border-emerald-200 rounded-xl p-6 space-y-5 shadow-xs">
+            <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
+              <div className="flex items-start gap-3">
+                <div
+                  style={{ backgroundColor: palette.soft, color: palette.primary }}
+                  className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0"
                 >
-                  {label}
-                </button>
-              ))}
+                  <Archive className="w-5 h-5" />
+                </div>
+                <div>
+                  <h2 className="text-base font-bold text-slate-900">
+                    Měsíční balíček pro účetní (1 klik — ZIP)
+                  </h2>
+                  <p className="text-xs text-slate-600 mt-1 leading-relaxed">
+                    Jedním kliknutím stáhnete kompletní archiv za vybraný měsíc pro firmu{' '}
+                    <strong>{activeCompany.name}</strong>: všechna PDF vydaných faktur a prodejek,
+                    archivované přijaté doklady + přehled příjemek, pokladní knihu (PDF + CSV),
+                    POHODA XML DataPack v2.0 a podklad pro DPH.
+                  </p>
+                </div>
+              </div>
+              <div className="shrink-0">
+                <label className="block text-[11px] font-medium text-slate-500 mb-1">
+                  Vybraný měsíc
+                </label>
+                <input
+                  type="month"
+                  value={packMonthKey}
+                  onChange={(e) => setPackMonthKey(e.target.value)}
+                  className="px-3 py-2 text-sm font-medium border border-slate-200 rounded-lg bg-white"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+              <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                <p className="text-slate-500">Vydané doklady (PDF)</p>
+                <p className="text-lg font-bold text-slate-900 tabular-nums mt-0.5">
+                  {packCounts.issuedCount}
+                </p>
+              </div>
+              <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                <p className="text-slate-500">Příjemky na sklad</p>
+                <p className="text-lg font-bold text-slate-900 tabular-nums mt-0.5">
+                  {packCounts.receiptsCount}
+                </p>
+              </div>
+              <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                <p className="text-slate-500">Pokladna (hotovost)</p>
+                <p className="text-lg font-bold text-slate-900 tabular-nums mt-0.5">
+                  {packCounts.cashCount}
+                </p>
+              </div>
+              <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                <p className="text-slate-500">POHODA XML + DPH</p>
+                <p className="text-lg font-bold text-emerald-700 mt-0.5">V ceně ZIP</p>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+              <p className="text-xs text-slate-500">
+                Obsahuje složky: <span className="font-mono">01_Vydane_faktury_PDF</span>,{' '}
+                <span className="font-mono">02_Prijate_doklady</span>,{' '}
+                <span className="font-mono">03_Pokladna</span>,{' '}
+                <span className="font-mono">04_POHODA</span>,{' '}
+                <span className="font-mono">05_DPH_Prehled</span>
+              </p>
+              <button
+                type="button"
+                disabled={buildingPack || !packMonthKey}
+                onClick={handleDownloadMonthlyPack}
+                style={{ backgroundColor: palette.primary }}
+                className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-semibold text-white rounded-lg hover:opacity-95 disabled:opacity-60"
+              >
+                {buildingPack ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Download className="w-4 h-4" />
+                )}
+                {buildingPack
+                  ? 'Sestavuji PDF a ZIP balíček…'
+                  : `Stáhnout balíček pro účetní (${packMonthKey}.zip)`}
+              </button>
             </div>
           </div>
 
-          {(pohodaScope === 'INVOICES' || pohodaScope === 'BOTH') && (
-            <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={onlyUnexported}
-                onChange={(e) => setOnlyUnexported(e.target.checked)}
-                className="rounded border-slate-300"
-              />
-              Exportovat pouze dosud neexportované faktury
-            </label>
-          )}
+          {/* INDIVIDUAL POHODA XML EXPORT */}
+          <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-5">
+            <div>
+              <h2 className="text-base font-semibold text-slate-900">
+                Samostatný export pro Stormware POHODA (XML DataPack v2.0)
+              </h2>
+              <p className="text-xs text-slate-500 mt-1">
+                Vygenerovaný XML balíček pro firmu <strong>{activeCompany.name}</strong> (IČO{' '}
+                {activeCompany.ico || 'nevyplněno'}) můžete přímo naimportovat přes Soubor → Datová
+                komunikace → XML import/export.
+              </p>
+            </div>
 
-          <div className="bg-slate-50 border border-slate-200 rounded-lg p-4 text-xs text-slate-700 space-y-1 tabular-nums">
+            <div className="space-y-2">
+              <label className="block text-xs font-medium text-slate-700">Rozsah exportu</label>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                {(
+                  [
+                    ['INVOICES', 'Pouze faktury'],
+                    ['STOCK', 'Pouze skladové karty'],
+                    ['BOTH', 'Faktury i sklad'],
+                  ] as [PohodaExportScope, string][]
+                ).map(([id, label]) => (
+                  <button
+                    key={id}
+                    type="button"
+                    onClick={() => setPohodaScope(id)}
+                    className={`py-2.5 px-3 text-xs font-medium rounded-lg border transition-colors ${
+                      pohodaScope === id
+                        ? 'bg-slate-900 text-white border-slate-900'
+                        : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
             {(pohodaScope === 'INVOICES' || pohodaScope === 'BOTH') && (
-              <p>
-                Faktur k exportu: <strong>{invoicesForPohoda.length}</strong> (stornované se
-                vynechávají)
-              </p>
+              <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={onlyUnexported}
+                  onChange={(e) => setOnlyUnexported(e.target.checked)}
+                  className="rounded border-slate-300"
+                />
+                Exportovat pouze dosud neexportované faktury
+              </label>
             )}
-            {(pohodaScope === 'STOCK' || pohodaScope === 'BOTH') && (
-              <p>
-                Skladových karet k exportu: <strong>{companyInventory.length}</strong>
-              </p>
-            )}
-          </div>
 
-          <button
-            type="button"
-            disabled={exportingPohoda}
-            onClick={handleExportPohoda}
-            style={{ backgroundColor: palette.primary }}
-            className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-medium text-white rounded-lg hover:opacity-95 disabled:opacity-60"
-          >
-            {exportingPohoda ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
-            ) : (
-              <Download className="w-4 h-4" />
-            )}
-            Stáhnout POHODA XML balíček
-          </button>
+            <div className="bg-slate-50 border border-slate-200 rounded-lg p-4 text-xs text-slate-700 space-y-1 tabular-nums">
+              {(pohodaScope === 'INVOICES' || pohodaScope === 'BOTH') && (
+                <p>
+                  Faktur k exportu: <strong>{invoicesForPohoda.length}</strong> (stornované se
+                  vynechávají)
+                </p>
+              )}
+              {(pohodaScope === 'STOCK' || pohodaScope === 'BOTH') && (
+                <p>
+                  Skladových karet k exportu: <strong>{companyInventory.length}</strong>
+                </p>
+              )}
+            </div>
+
+            <button
+              type="button"
+              disabled={exportingPohoda}
+              onClick={handleExportPohoda}
+              className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-medium text-white bg-slate-900 hover:bg-slate-800 rounded-lg disabled:opacity-60"
+            >
+              {exportingPohoda ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <FileCode2 className="w-4 h-4" />
+              )}
+              Stáhnout POHODA XML balíček
+            </button>
+          </div>
         </div>
       )}
 

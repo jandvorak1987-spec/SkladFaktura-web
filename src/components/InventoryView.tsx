@@ -103,6 +103,8 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
     accessibleWarehouses,
     inventory,
     movements,
+    userEmail,
+    isReadOnlyAccountant,
     notify,
   } = useApp();
 
@@ -674,50 +676,54 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
             <Download className="w-4 h-4" />
             Export CSV
           </button>
-          <button
-            type="button"
-            onClick={() => {
-              setPriceEditorTab('BUILDER');
-              setPriceEditorOpen(true);
-            }}
-            className="inline-flex items-center gap-2 px-3.5 py-2 text-sm font-medium text-slate-800 bg-white border border-slate-300 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
-          >
-            <Calculator className="w-4 h-4" />
-            Hromadné přecenění
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              const uncat = filteredItems.filter((i) => !(i.category || '').trim());
-              const targets = uncat.length > 0 ? uncat : filteredItems;
-              if (targets.length === 0) {
-                notify('Ve filtru nejsou žádné položky ke kategorizaci.', 'info');
-                return;
-              }
-              setNerxTargetItems(targets);
-            }}
-            className="inline-flex items-center gap-2 px-3.5 py-2 text-sm font-medium text-emerald-800 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 rounded-lg transition-colors whitespace-nowrap"
-          >
-            <Globe className="w-4 h-4" />
-            Kategorizovat (Nerx.cz)
-          </button>
-          <button
-            type="button"
-            onClick={() => onNavigate('smart-stock-in')}
-            className="inline-flex items-center gap-2 px-3.5 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
-          >
-            <Sparkles className="w-4 h-4" />
-            AI Příjemka
-          </button>
-          <button
-            type="button"
-            onClick={() => openNewItem()}
-            style={{ backgroundColor: palette.primary }}
-            className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white hover:opacity-95 rounded-lg transition-opacity whitespace-nowrap"
-          >
-            <Plus className="w-4 h-4" />
-            Nová položka
-          </button>
+          {!isReadOnlyAccountant && (
+            <>
+              <button
+                type="button"
+                onClick={() => {
+                  setPriceEditorTab('BUILDER');
+                  setPriceEditorOpen(true);
+                }}
+                className="inline-flex items-center gap-2 px-3.5 py-2 text-sm font-medium text-slate-800 bg-white border border-slate-300 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
+              >
+                <Calculator className="w-4 h-4" />
+                Hromadné přecenění
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const uncat = filteredItems.filter((i) => !(i.category || '').trim());
+                  const targets = uncat.length > 0 ? uncat : filteredItems;
+                  if (targets.length === 0) {
+                    notify('Ve filtru nejsou žádné položky ke kategorizaci.', 'info');
+                    return;
+                  }
+                  setNerxTargetItems(targets);
+                }}
+                className="inline-flex items-center gap-2 px-3.5 py-2 text-sm font-medium text-emerald-800 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 rounded-lg transition-colors whitespace-nowrap"
+              >
+                <Globe className="w-4 h-4" />
+                Kategorizovat (Nerx.cz)
+              </button>
+              <button
+                type="button"
+                onClick={() => onNavigate('smart-stock-in')}
+                className="inline-flex items-center gap-2 px-3.5 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
+              >
+                <Sparkles className="w-4 h-4" />
+                AI Příjemka
+              </button>
+              <button
+                type="button"
+                onClick={() => openNewItem()}
+                style={{ backgroundColor: palette.primary }}
+                className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white hover:opacity-95 rounded-lg transition-opacity whitespace-nowrap"
+              >
+                <Plus className="w-4 h-4" />
+                Nová položka
+              </button>
+            </>
+          )}
         </div>
       </div>
 
@@ -1128,16 +1134,18 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                               {formatCzk(group.totalValue)}
                             </td>
                             <td className="py-2.5 px-4 text-right">
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  openNewItem(group.isUncategorized ? '' : group.key)
-                                }
-                                className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-200/70 rounded-md transition-colors whitespace-nowrap"
-                              >
-                                <Plus className="w-3.5 h-3.5" />
-                                Přidat
-                              </button>
+                              {!isReadOnlyAccountant && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    openNewItem(group.isUncategorized ? '' : group.key)
+                                  }
+                                  className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-200/70 rounded-md transition-colors whitespace-nowrap"
+                                >
+                                  <Plus className="w-3.5 h-3.5" />
+                                  Přidat
+                                </button>
+                              )}
                             </td>
                           </tr>
                         )}
@@ -1255,56 +1263,60 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                                   })()}
                                 </td>
                                 <td className="py-3 px-4 text-right">
-                                  <div className="inline-flex items-center gap-1 justify-end">
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        setAdjustTarget(item);
-                                        setAdjustMode('RECEIPT');
-                                        setAdjustQty('1');
-                                      }}
-                                      title="Rychlý příjem"
-                                      className="p-1.5 text-emerald-700 hover:bg-emerald-50 rounded-md transition-colors"
-                                    >
-                                      <Plus className="w-4 h-4" />
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        setAdjustTarget(item);
-                                        setAdjustMode('ISSUE');
-                                        setAdjustQty('1');
-                                      }}
-                                      title="Rychlý výdej"
-                                      className="p-1.5 text-amber-700 hover:bg-amber-50 rounded-md transition-colors"
-                                    >
-                                      <Minus className="w-4 h-4" />
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => openEditItem(item)}
-                                      title="Upravit kartu"
-                                      className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md transition-colors"
-                                    >
-                                      <Edit3 className="w-4 h-4" />
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => openDuplicateItem(item)}
-                                      title="Kopírovat položku"
-                                      className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md transition-colors"
-                                    >
-                                      <Copy className="w-4 h-4" />
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleDelete(item)}
-                                      title="Smazat položku"
-                                      className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors"
-                                    >
-                                      <Trash2 className="w-4 h-4" />
-                                    </button>
-                                  </div>
+                                  {isReadOnlyAccountant ? (
+                                    <span className="text-[11px] text-slate-400">Jen čtení</span>
+                                  ) : (
+                                    <div className="inline-flex items-center gap-1 justify-end">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setAdjustTarget(item);
+                                          setAdjustMode('RECEIPT');
+                                          setAdjustQty('1');
+                                        }}
+                                        title="Rychlý příjem"
+                                        className="p-1.5 text-emerald-700 hover:bg-emerald-50 rounded-md transition-colors"
+                                      >
+                                        <Plus className="w-4 h-4" />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setAdjustTarget(item);
+                                          setAdjustMode('ISSUE');
+                                          setAdjustQty('1');
+                                        }}
+                                        title="Rychlý výdej"
+                                        className="p-1.5 text-amber-700 hover:bg-amber-50 rounded-md transition-colors"
+                                      >
+                                        <Minus className="w-4 h-4" />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => openEditItem(item)}
+                                        title="Upravit kartu"
+                                        className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md transition-colors"
+                                      >
+                                        <Edit3 className="w-4 h-4" />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => openDuplicateItem(item)}
+                                        title="Kopírovat položku"
+                                        className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md transition-colors"
+                                      >
+                                        <Copy className="w-4 h-4" />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => handleDelete(item)}
+                                        title="Smazat položku"
+                                        className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors"
+                                      >
+                                        <Trash2 className="w-4 h-4" />
+                                      </button>
+                                    </div>
+                                  )}
                                 </td>
                               </tr>
                             );
@@ -1324,6 +1336,9 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
           warehouses={accessibleWarehouses}
           workspace={workspace}
           activeCompanyId={activeCompany?.id || 'company_1'}
+          company={activeCompany}
+          auditorEmail={userEmail}
+          readOnly={isReadOnlyAccountant}
           accentColor={palette.primary}
           onNotify={notify}
         />

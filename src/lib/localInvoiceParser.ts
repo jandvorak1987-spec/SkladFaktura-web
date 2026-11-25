@@ -31,7 +31,6 @@ const UNIT_SET = new Set([
   'litr',
   'litru',
   'litrů',
-  'ml',
   'hod',
   'h',
   'den',
@@ -155,6 +154,27 @@ export function parseLocaleNumber(raw: string): number | null {
 
   const num = Number(s);
   return Number.isFinite(num) ? num : null;
+}
+
+function sanitizeStockUnit(raw: string): string {
+  const trimmed = (raw || '').trim();
+  const clean = trimmed.toLowerCase().replace(/[.,;:()]/g, '');
+  if (
+    !clean ||
+    clean === 'ml' ||
+    clean === 'mlt' ||
+    clean === 'cl' ||
+    clean === 'dl' ||
+    clean === 'mililitr' ||
+    clean === 'mililitru' ||
+    clean === 'mililitrů' ||
+    clean === 'mililitry' ||
+    clean === 'h87' ||
+    clean === 'pce'
+  ) {
+    return 'ks';
+  }
+  return (normalizeUnit(trimmed) || trimmed || 'ks').slice(0, 20);
 }
 
 function normalizeUnit(token: string): string | null {
@@ -500,8 +520,9 @@ function parseSingleItemLine(line: string, previousTitleLine?: string): ParsedRo
   if (isSkippableLine(line)) return null;
 
   // Strategy 1: Explicit quantity + known unit token ("10 ks", "2,5 m", "1 bal.")
+  // Deliberately excludes "ml" so bottle volumes inside product names ("10 ml", "2 ml") are never misparsed as quantity+unit.
   const qtyUnitRegex =
-    /(?:^|[\s\t])(\d+(?:[.,]\d{1,3})?)\s*(ks|kus|kusů|kusu|kusy|bal\.?|balení|baleni|bm|m2|m²|m3|m³|cm|mm|kg|dg|ml|litr(?:ů|u)?|hod|sada|sad|set|pár(?:y)?|par(?:y)?|kpl|komplet|kart(?:on)?|krab(?:ice)?|role|rol|pal(?:eta)?|pcs|pc|ea|box|pack|pkt|stk|st|m|g|t|l|h)(?=$|[\s\t.,;:/])/gi;
+    /(?:^|[\s\t])(\d+(?:[.,]\d{1,3})?)\s*(ks|kus|kusů|kusu|kusy|bal\.?|balení|baleni|bm|m2|m²|m3|m³|cm|mm|kg|dg|litr(?:ů|u)?|hod|sada|sad|set|pár(?:y)?|par(?:y)?|kpl|komplet|kart(?:on)?|krab(?:ice)?|role|rol|pal(?:eta)?|pcs|pc|ea|box|pack|pkt|stk|st|m|g|t|l|h)(?=$|[\s\t.,;:/])/gi;
 
   let bestMatch: RegExpExecArray | null = null;
   let m: RegExpExecArray | null;
@@ -651,7 +672,7 @@ export function parseInvoiceFromTextLines(
     name: c.name.slice(0, 200),
     ean: c.ean.slice(0, 40),
     quantity: Math.max(0.01, round2(c.quantity)),
-    unit: (c.unit || 'ks').slice(0, 20),
+    unit: sanitizeStockUnit(c.unit),
     originalPurchasePrice: Math.max(0, round2(c.unitPurchasePrice)),
     purchasePrice: Math.max(0, round2(c.unitPurchasePrice)),
     suggestedSalePrice: c.unitPurchasePrice > 0 ? round2(c.unitPurchasePrice * 1.25) : 0,
@@ -769,7 +790,7 @@ export function parseXmlInvoice(
           name: name.slice(0, 200),
           ean: ean.slice(0, 40),
           quantity: round2(qty),
-          unit: (normalizeUnit(unit) || unit || 'ks').slice(0, 20),
+          unit: sanitizeStockUnit(unit),
           originalPurchasePrice: unitPrice,
           purchasePrice: unitPrice,
           suggestedSalePrice: unitPrice > 0 ? round2(unitPrice * 1.25) : 0,
@@ -848,7 +869,7 @@ export function parseXmlInvoice(
           name: name.slice(0, 200),
           ean: ean.slice(0, 40),
           quantity: round2(qty),
-          unit: (normalizeUnit(unit) || unit || 'ks').slice(0, 20),
+          unit: sanitizeStockUnit(unit),
           originalPurchasePrice: unitPrice,
           purchasePrice: unitPrice,
           suggestedSalePrice: unitPrice > 0 ? round2(unitPrice * 1.25) : 0,

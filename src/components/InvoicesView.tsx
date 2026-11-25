@@ -11,6 +11,7 @@ import {
   CheckCircle2,
   ClipboardList,
   Copy,
+  Download,
   Edit3,
   FileMinus2,
   FilePlus2,
@@ -21,10 +22,12 @@ import {
   Package,
   Plus,
   Printer,
+  Receipt,
   RefreshCw,
   Search,
   ShieldCheck,
   Trash2,
+  TrendingUp,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { QtyInput, parseQtyNumber } from './QtyInput';
@@ -42,6 +45,7 @@ import {
   addMonthsIso,
   buildCzechSpdQr,
   calculateInvoiceTotals,
+  computeInvoiceProfitStats,
   czechAccountToIban,
   daysUntilDue,
   formatCzk,
@@ -57,6 +61,7 @@ import {
   round2,
   toIsoDate,
 } from '../lib/format';
+import { downloadPdfBytes, generateInvoicePdfBytes } from '../lib/pdfExport';
 import {
   INVOICE_TEMPLATES,
   type Client,
@@ -77,7 +82,7 @@ interface InvoicesViewProps {
   onClearPrefillClient?: () => void;
 }
 
-type StatusFilter = 'ALL' | InvoiceStatus | 'OVERDUE' | 'RECURRING' | 'NON_TAX';
+type StatusFilter = 'ALL' | InvoiceStatus | 'OVERDUE' | 'RECURRING' | 'NON_TAX' | 'SIMPLIFIED';
 
 const SUPPORTED_CURRENCIES = ['CZK', 'EUR', 'USD', 'PLN', 'GBP', 'CHF'] as const;
 const REVERSE_CHARGE_LEGAL_TEXT =
@@ -744,6 +749,7 @@ export function InvoicesView({
   const {
     workspace,
     isCurrentUserAdmin,
+    isReadOnlyAccountant,
     activeCompany,
     accessibleWarehouses,
     inventory,
@@ -780,6 +786,7 @@ export function InvoicesView({
   const [relatedInvoiceNumber, setRelatedInvoiceNumber] = useState('');
   const [recurringInterval, setRecurringInterval] = useState<RecurringInterval>('NONE');
   const [deductFromStock, setDeductFromStock] = useState(true);
+  const [markPaidImmediately, setMarkPaidImmediately] = useState(false);
   const [note, setNote] = useState('');
 
   const [clientId, setClientId] = useState('');
@@ -813,10 +820,22 @@ export function InvoicesView({
     [invoices, selectedInvoiceId]
   );
 
+  const inventoryLookups = useMemo(() => {
+    const byId = new Map(inventory.map((i) => [i.id, i]));
+    const bySku = new Map<string, (typeof inventory)[number]>();
+    const byName = new Map<string, (typeof inventory)[number]>();
+    for (const item of inventory) {
+      if (item.sku.trim()) bySku.set(item.sku.trim().toLowerCase(), item);
+      if (item.name.trim()) byName.set(item.name.trim().toLowerCase(), item);
+    }
+    return { byId, bySku, byName };
+  }, [inventory]);
+
   const suggestNumberForType = (type: InvoiceDocumentType, refNum?: string) => {
     const baseNext = activeCompany ? previewNextInvoiceNumber(activeCompany) : `20260001`;
     const stamp = toIsoDate().replace(/-/g, '').slice(2);
     const seq = String(companyInvoices.length + 1).padStart(3, '0');
+    if (type === 'SIMPLIFIED') return `PRO-${stamp}-${seq}`;
     if (type === 'PROFORMA') return `ZAL-${stamp}-${seq}`;
     if (type === 'QUOTE') return `NAB-${stamp}-${seq}`;
     if (type === 'CREDIT_NOTE') return refNum ? `DOB-${refNum}` : `DOB-${stamp}-${seq}`;
@@ -863,7 +882,18 @@ export function InvoicesView({
       const num = suggestNumberForType(nextType, relatedInvoiceNumber || undefined);
       setInvoiceNumber(num);
       setVariableSymbol(num.replace(/\D/g, ''));
-      setDeductFromStock(nextType === 'INVOICE' || nextType === 'CREDIT_NOTE');
+      setDeductFromStock(
+        nextType === 'INVOICE' || nextType === 'CREDIT_NOTE' || nextType === 'SIMPLIFIED'
+      );
+      if (nextType === 'SIMPLIFIED') {
+        setPaymentMethod('CASH');
+        setDueDate(issueDate);
+        setMarkPaidImmediately(true);
+        if (!clientName.trim()) setClientName('Konečný zákazník (Prodejka)');
+      } else {
+        setMarkPaidImmediately(false);
+        if (clientName === 'Konečný zákazník (Prodejka)') setClientName('');
+      }
     }
   };
 
@@ -871,15 +901,17 @@ export function InvoicesView({
     client?: Client | null,
     initialType: InvoiceDocumentType = 'INVOICE'
   ) => {
+    if (isReadOnlyAccountant) return;
     const today = toIsoDate();
+    const isSimplifiedInit = initialType === 'SIMPLIFIED';
     const nextNum = suggestNumberForType(initialType);
     setDocumentType(initialType);
     setInvoiceNumber(nextNum);
     setVariableSymbol(nextNum.replace(/\D/g, ''));
     setIssueDate(today);
     setTaxDate(today);
-    setDueDate(addDaysIso(today, 14));
-    setPaymentMethod('BANK_TRANSFER');
+    setDueDate(isSimplifiedInit ? today : addDaysIso(today, 14));
+    setPaymentMethod(isSimplifiedInit ? 'CASH' : 'BANK_TRANSFER');
     setInvoiceTemplate(activeCompany?.invoiceTemplate || 'CLASSIC');
     setCurrency('CZK');
     setExchangeRate('1');
@@ -888,7 +920,10 @@ export function InvoicesView({
     setLegalNotice('');
     setRelatedInvoiceNumber('');
     setRecurringInterval('NONE');
-    setDeductFromStock(initialType === 'INVOICE' || initialType === 'CREDIT_NOTE');
+    setDeductFromStock(
+      initialType === 'INVOICE' || initialType === 'CREDIT_NOTE' || initialType === 'SIMPLIFIED'
+    );
+    setMarkPaidImmediately(isSimplifiedInit);
     setNote('');
 
     if (client) {
@@ -902,7 +937,7 @@ export function InvoicesView({
       setClientEmail(client.email || '');
     } else {
       setClientId('');
-      setClientName('');
+      setClientName(isSimplifiedInit ? 'Konečný zákazník (Prodejka)' : '');
       setClientIco('');
       setClientDic('');
       setClientStreet('');
@@ -1100,6 +1135,9 @@ export function InvoicesView({
       ) {
         return false;
       }
+      if (statusFilter === 'SIMPLIFIED' && inv.documentType !== 'SIMPLIFIED') {
+        return false;
+      }
       if (
         statusFilter === 'NON_TAX' &&
         inv.documentType !== 'QUOTE' &&
@@ -1113,6 +1151,7 @@ export function InvoicesView({
         statusFilter !== 'OVERDUE' &&
         statusFilter !== 'RECURRING' &&
         statusFilter !== 'NON_TAX' &&
+        statusFilter !== 'SIMPLIFIED' &&
         inv.status !== statusFilter
       ) {
         return false;
@@ -1132,6 +1171,16 @@ export function InvoicesView({
     () => calculateInvoiceTotals(items, effectiveDraftVatPayer),
     [items, effectiveDraftVatPayer]
   );
+
+  const draftProfitStats = useMemo(() => {
+    const fxVal = currency === 'CZK' ? 1 : Number(exchangeRate.replace(',', '.')) || 1;
+    return computeInvoiceProfitStats(
+      { items, currency, exchangeRate: fxVal, documentType },
+      inventoryLookups.byId,
+      inventoryLookups.bySku,
+      inventoryLookups.byName
+    );
+  }, [items, currency, exchangeRate, documentType, inventoryLookups]);
 
   const handleSelectClient = (id: string) => {
     setClientId(id);
@@ -1197,14 +1246,25 @@ export function InvoicesView({
 
   const handleIssueInvoice = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!workspace || !activeCompany) return;
-    if (!clientName.trim()) {
+    if (!workspace || !activeCompany || isReadOnlyAccountant) return;
+    const isSimplified = documentType === 'SIMPLIFIED';
+    const resolvedClientName =
+      clientName.trim() || (isSimplified ? 'Konečný zákazník (Prodejka)' : '');
+    if (!resolvedClientName) {
       notify('Vyplňte název odběratele.', 'error');
       return;
     }
     const parsedFx = currency === 'CZK' ? 1 : Number(exchangeRate.replace(',', '.')) || 0;
     if (currency !== 'CZK' && parsedFx <= 0) {
       notify('Zadejte platný směnný kurz v Kč nebo jej načtěte z ČNB.', 'error');
+      return;
+    }
+    const totalWithVatCzk = round2(draftTotals.totalWithVat * parsedFx);
+    if (isSimplified && totalWithVatCzk > 10000) {
+      notify(
+        'Prodejka (zjednodušený daňový doklad) může být dle § 30a ZDPH max. do 10 000 Kč s DPH. Přepněte typ na standardní fakturu.',
+        'error'
+      );
       return;
     }
 
@@ -1228,7 +1288,7 @@ export function InvoicesView({
         relatedInvoiceNumber: relatedInvoiceNumber.trim(),
         recurringInterval,
         clientId,
-        clientName,
+        clientName: resolvedClientName,
         clientIco,
         clientDic,
         clientStreet,
@@ -1238,6 +1298,7 @@ export function InvoicesView({
         note,
         deductFromStock:
           documentType === 'QUOTE' || documentType === 'PROFORMA' ? false : deductFromStock,
+        markPaidImmediately: mode === 'CREATE' && markPaidImmediately,
         invoiceTemplate,
         items,
       };
@@ -1263,7 +1324,9 @@ export function InvoicesView({
           inventory,
           payload,
         });
-        notify(`${label} ${invoiceNumber} byla vystavena.`);
+        notify(
+          `${label} ${invoiceNumber} byla vystavena${markPaidImmediately ? ' a označena jako uhrazená' : ''}.`
+        );
         setSelectedInvoiceId(newId);
         setDeliveryNoteMode(false);
         setMode('DETAIL');
@@ -1532,7 +1595,7 @@ export function InvoicesView({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            {canConvert && selectedInvoice.status !== 'CANCELLED' && (
+            {!isReadOnlyAccountant && canConvert && selectedInvoice.status !== 'CANCELLED' && (
               <button
                 type="button"
                 onClick={() => startConvertToInvoice(selectedInvoice)}
@@ -1542,7 +1605,7 @@ export function InvoicesView({
                 Převést na fakturu
               </button>
             )}
-            {canCreditNote && (
+            {!isReadOnlyAccountant && canCreditNote && (
               <button
                 type="button"
                 onClick={() => startCreditNote(selectedInvoice)}
@@ -1552,7 +1615,7 @@ export function InvoicesView({
                 Dobropis
               </button>
             )}
-            {hasRecurring && (
+            {!isReadOnlyAccountant && hasRecurring && (
               <button
                 type="button"
                 onClick={() => startNextRecurringPeriod(selectedInvoice)}
@@ -1562,7 +1625,7 @@ export function InvoicesView({
                 Další období
               </button>
             )}
-            {selectedInvoice.status !== 'CANCELLED' && (
+            {!isReadOnlyAccountant && selectedInvoice.status !== 'CANCELLED' && (
               <button
                 type="button"
                 onClick={() => handleSendEmail(selectedInvoice, false)}
@@ -1572,7 +1635,7 @@ export function InvoicesView({
                 E-mail
               </button>
             )}
-            {selOverdue && selDocType !== 'QUOTE' && (
+            {!isReadOnlyAccountant && selOverdue && selDocType !== 'QUOTE' && (
               <button
                 type="button"
                 onClick={() => handleSendEmail(selectedInvoice, true)}
@@ -1582,7 +1645,7 @@ export function InvoicesView({
                 Upomínka{selectedInvoice.reminderCount ? ` (${selectedInvoice.reminderCount + 1}.)` : ''}
               </button>
             )}
-            {selectedInvoice.status !== 'CANCELLED' && (
+            {!isReadOnlyAccountant && selectedInvoice.status !== 'CANCELLED' && (
               <button
                 type="button"
                 onClick={() => startEditInvoice(selectedInvoice)}
@@ -1592,15 +1655,17 @@ export function InvoicesView({
                 Upravit
               </button>
             )}
-            <button
-              type="button"
-              onClick={() => startDuplicateInvoice(selectedInvoice)}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg"
-            >
-              <Copy className="w-4 h-4" />
-              Duplikovat
-            </button>
-            {selectedInvoice.status === 'ISSUED' && (
+            {!isReadOnlyAccountant && (
+              <button
+                type="button"
+                onClick={() => startDuplicateInvoice(selectedInvoice)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg"
+              >
+                <Copy className="w-4 h-4" />
+                Duplikovat
+              </button>
+            )}
+            {!isReadOnlyAccountant && selectedInvoice.status === 'ISSUED' && (
               <>
                 <button
                   type="button"
@@ -1620,7 +1685,7 @@ export function InvoicesView({
                 </button>
               </>
             )}
-            {selectedInvoice.status === 'CANCELLED' && isCurrentUserAdmin && (
+            {!isReadOnlyAccountant && selectedInvoice.status === 'CANCELLED' && isCurrentUserAdmin && (
               <button
                 type="button"
                 onClick={() => setDeleteConfirmInvoice(selectedInvoice)}
@@ -1628,6 +1693,20 @@ export function InvoicesView({
               >
                 <Trash2 className="w-4 h-4" />
                 Smazat ze seznamu
+              </button>
+            )}
+            {!deliveryNoteMode && (
+              <button
+                type="button"
+                onClick={() => {
+                  const pdf = generateInvoicePdfBytes(selectedInvoice, activeCompany, palette);
+                  downloadPdfBytes(pdf, `${selectedInvoice.invoiceNumber}.pdf`);
+                  notify(`PDF dokladu ${selectedInvoice.invoiceNumber} bylo staženo.`);
+                }}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg"
+              >
+                <Download className="w-4 h-4" />
+                Stáhnout PDF
               </button>
             )}
             <button
@@ -1730,6 +1809,75 @@ export function InvoicesView({
           );
         })()}
 
+        {/* Screen-only real profit & margin banner on invoice detail */}
+        {(() => {
+          if (selectedInvoice.status === 'CANCELLED' || selDocType === 'QUOTE') return null;
+          const profitStats = computeInvoiceProfitStats(
+            selectedInvoice,
+            inventoryLookups.byId,
+            inventoryLookups.bySku,
+            inventoryLookups.byName
+          );
+          if (profitStats.matchedLinesCount === 0) return null;
+          const isLoss = profitStats.profitCzk < 0 || profitStats.hasBelowCostItems;
+          return (
+            <div
+              className={`no-print rounded-xl border p-4 flex flex-wrap items-center justify-between gap-4 text-xs ${
+                isLoss
+                  ? 'bg-red-50 border-red-200 text-red-950'
+                  : 'bg-emerald-50/60 border-emerald-200 text-emerald-950'
+              }`}
+            >
+              <div className="flex items-center gap-2.5">
+                {isLoss ? (
+                  <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+                ) : (
+                  <TrendingUp className="w-4 h-4 text-emerald-700 shrink-0" />
+                )}
+                <div>
+                  <p className="font-semibold">
+                    Ekonomika dokladu (interní přehled — netiskne se na PDF)
+                  </p>
+                  <p className="opacity-80 mt-0.5">
+                    Spárováno {profitStats.matchedLinesCount} z {profitStats.totalLinesCount} položek se skladem
+                    {profitStats.hasBelowCostItems &&
+                      ` · Pozor: ${profitStats.belowCostLinesCount} položek je pod nákupní cenou!`}
+                  </p>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-5 tabular-nums">
+                <div>
+                  <span className="text-[11px] opacity-70 block">Obrat bez DPH</span>
+                  <span className="font-semibold">{formatCzk(profitStats.revenueNetCzk)}</span>
+                </div>
+                <div>
+                  <span className="text-[11px] opacity-70 block">Nákupní náklady</span>
+                  <span className="font-semibold">{formatCzk(profitStats.costCzk)}</span>
+                </div>
+                <div>
+                  <span className="text-[11px] opacity-70 block">Reálný zisk</span>
+                  <span
+                    className={`font-bold ${profitStats.profitCzk < 0 ? 'text-red-700' : 'text-emerald-700'}`}
+                  >
+                    {profitStats.profitCzk >= 0 ? '+' : ''}
+                    {formatCzk(profitStats.profitCzk)}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-[11px] opacity-70 block">Marže</span>
+                  <span
+                    className={`font-bold ${
+                      (profitStats.marginPercent ?? 0) < 0 ? 'text-red-700' : 'text-emerald-700'
+                    }`}
+                  >
+                    {profitStats.marginPercent !== null ? `${profitStats.marginPercent.toFixed(1)} %` : '—'}
+                  </span>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
         <InvoiceDocumentPreview
           invoice={selectedInvoice}
           company={activeCompany}
@@ -1812,10 +1960,11 @@ export function InvoicesView({
             <div className="grid grid-cols-2 gap-3">
               <div className="col-span-2">
                 <label className="block text-xs font-medium text-slate-700 mb-1">Typ dokladu</label>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5">
                   {(
                     [
                       ['INVOICE', 'Faktura'],
+                      ['SIMPLIFIED', 'Prodejka'],
                       ['PROFORMA', 'Záloha'],
                       ['QUOTE', 'Nabídka'],
                       ['CREDIT_NOTE', 'Dobropis'],
@@ -1825,7 +1974,7 @@ export function InvoicesView({
                       key={tId}
                       type="button"
                       onClick={() => handleDocumentTypeChange(tId)}
-                      className={`px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
+                      className={`px-2 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
                         documentType === tId
                           ? 'bg-slate-900 border-slate-900 text-white'
                           : 'bg-white border-slate-200 text-slate-600 hover:text-slate-900'
@@ -1835,6 +1984,11 @@ export function InvoicesView({
                     </button>
                   ))}
                 </div>
+                {documentType === 'SIMPLIFIED' && (
+                  <p className="text-[11px] text-emerald-700 mt-1.5">
+                    Rychlý prodej na prodejně (zjednodušený daňový doklad dle § 30a ZDPH do 10 000 Kč s DPH) — odběratele není potřeba vyplňovat.
+                  </p>
+                )}
               </div>
 
               <div>
@@ -2019,6 +2173,18 @@ export function InvoicesView({
                       : 'Automaticky odepsat ze skladu'}
                 </label>
 
+                {mode === 'CREATE' && (documentType === 'SIMPLIFIED' || paymentMethod === 'CASH' || paymentMethod === 'CARD') && (
+                  <label className="inline-flex items-center gap-2 text-xs font-medium text-emerald-800 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={markPaidImmediately}
+                      onChange={(e) => setMarkPaidImmediately(e.target.checked)}
+                      className="rounded border-emerald-400"
+                    />
+                    Uhrazeno ihned na místě ({paymentMethod === 'CARD' ? 'kartou' : 'hotově'})
+                  </label>
+                )}
+
                 {activeCompany?.vatPayer && (
                   <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer">
                     <input
@@ -2086,12 +2252,19 @@ export function InvoicesView({
               </div>
 
               <div className="col-span-2">
-                <label className="block text-xs font-medium text-slate-700 mb-1">Název odběratele *</label>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  {documentType === 'SIMPLIFIED'
+                    ? 'Název odběratele (u prodejky volitelné)'
+                    : 'Název odběratele *'}
+                </label>
                 <input
                   type="text"
-                  required
+                  required={documentType !== 'SIMPLIFIED'}
                   value={clientName}
                   onChange={(e) => setClientName(e.target.value)}
+                  placeholder={
+                    documentType === 'SIMPLIFIED' ? 'Konečný zákazník (Prodejka)' : ''
+                  }
                   className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
                 />
               </div>
@@ -2320,103 +2493,194 @@ export function InvoicesView({
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {items.map((line, idx) => (
-                  <tr key={idx}>
-                    <td className="py-2 pr-2 min-w-[200px]">
-                      <input
-                        type="text"
-                        required
-                        value={line.name}
-                        onChange={(e) => updateLine(idx, { name: e.target.value })}
-                        placeholder="Název zboží nebo služby"
-                        className="w-full px-2.5 py-1.5 text-sm border border-slate-200 rounded-md"
-                      />
-                      {line.inventoryItemId && (
-                        <p className="text-[11px] text-emerald-700 mt-0.5">
-                          Propojeno se skladem ({line.sku})
-                        </p>
-                      )}
-                    </td>
-                    <td className="py-2 px-2">
-                      <QtyInput
-                        value={line.quantity}
-                        onValueChange={(cleaned) =>
-                          updateLine(idx, { quantity: parseQtyNumber(cleaned) })
-                        }
-                        className="w-20 px-2 py-1.5 text-sm text-right border border-slate-200 rounded-md tabular-nums"
-                      />
-                    </td>
-                    <td className="py-2 px-2">
-                      <input
-                        type="text"
-                        value={line.unit}
-                        onChange={(e) => updateLine(idx, { unit: e.target.value })}
-                        className="w-16 px-2 py-1.5 text-xs border border-slate-200 rounded-md"
-                      />
-                    </td>
-                    <td className="py-2 px-2">
-                      <QtyInput
-                        value={line.unitPrice}
-                        onValueChange={(cleaned) =>
-                          updateLine(idx, { unitPrice: parseQtyNumber(cleaned) })
-                        }
-                        className="w-28 px-2 py-1.5 text-sm text-right border border-slate-200 rounded-md tabular-nums"
-                      />
-                    </td>
-                    <td className="py-2 px-2">
-                      <QtyInput
-                        value={line.discountPercent}
-                        onValueChange={(cleaned) =>
-                          updateLine(idx, {
-                            discountPercent: Math.min(100, Math.max(0, parseQtyNumber(cleaned))),
-                          })
-                        }
-                        className="w-16 px-2 py-1.5 text-sm text-right border border-slate-200 rounded-md tabular-nums"
-                      />
-                    </td>
-                    {effectiveDraftVatPayer && (
-                      <td className="py-2 px-2">
-                        <select
-                          value={line.vatRate}
-                          onChange={(e) => updateLine(idx, { vatRate: Number(e.target.value) })}
-                          className="px-2 py-1.5 text-xs border border-slate-200 rounded-md bg-white"
-                        >
-                          <option value={21}>21 %</option>
-                          <option value={12}>12 %</option>
-                          <option value={0}>0 %</option>
-                        </select>
+                {items.map((line, idx) => {
+                  const lineProfit = draftProfitStats.lineDetails[idx];
+                  const isBelowCost = Boolean(lineProfit?.isBelowCost);
+                  return (
+                    <tr key={idx} className={isBelowCost ? 'bg-red-50/70' : ''}>
+                      <td className="py-2 pr-2 min-w-[200px]">
+                        <input
+                          type="text"
+                          required
+                          value={line.name}
+                          onChange={(e) => updateLine(idx, { name: e.target.value })}
+                          placeholder="Název zboží nebo služby"
+                          className="w-full px-2.5 py-1.5 text-sm border border-slate-200 rounded-md bg-white"
+                        />
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-0.5">
+                          {line.inventoryItemId && (
+                            <span className="text-[11px] text-emerald-700">
+                              Sklad ({line.sku})
+                            </span>
+                          )}
+                          {lineProfit && lineProfit.purchaseUnitPriceCzk !== null && (
+                            <span
+                              className={`text-[11px] tabular-nums ${
+                                isBelowCost
+                                  ? 'text-red-700 font-semibold'
+                                  : 'text-slate-500'
+                              }`}
+                            >
+                              {isBelowCost ? '⚠ Pod nákupní cenou! ' : ''}
+                              Nákup {formatCzk(lineProfit.purchaseUnitPriceCzk)}
+                              {lineProfit.marginPercent !== null &&
+                                ` · Marže ${lineProfit.marginPercent.toFixed(1)} %`}
+                            </span>
+                          )}
+                        </div>
                       </td>
-                    )}
-                    <td className="py-2 pl-2 text-right font-semibold tabular-nums whitespace-nowrap">
-                      {formatCzk(lineTotalWithoutVat(line), currency)}
-                    </td>
-                    <td className="py-2 pl-2 text-right">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setItems((prev) => (prev.length > 1 ? prev.filter((_, i) => i !== idx) : prev))
-                        }
-                        className="p-1 text-slate-400 hover:text-red-600"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                      <td className="py-2 px-2">
+                        <QtyInput
+                          value={line.quantity}
+                          onValueChange={(cleaned) =>
+                            updateLine(idx, { quantity: parseQtyNumber(cleaned) })
+                          }
+                          className="w-20 px-2 py-1.5 text-sm text-right border border-slate-200 rounded-md tabular-nums bg-white"
+                        />
+                      </td>
+                      <td className="py-2 px-2">
+                        <input
+                          type="text"
+                          value={line.unit}
+                          onChange={(e) => updateLine(idx, { unit: e.target.value })}
+                          className="w-16 px-2 py-1.5 text-xs border border-slate-200 rounded-md bg-white"
+                        />
+                      </td>
+                      <td className="py-2 px-2">
+                        <QtyInput
+                          value={line.unitPrice}
+                          onValueChange={(cleaned) =>
+                            updateLine(idx, { unitPrice: parseQtyNumber(cleaned) })
+                          }
+                          className={`w-28 px-2 py-1.5 text-sm text-right border rounded-md tabular-nums bg-white ${
+                            isBelowCost ? 'border-red-400 text-red-700 font-semibold' : 'border-slate-200'
+                          }`}
+                        />
+                      </td>
+                      <td className="py-2 px-2">
+                        <QtyInput
+                          value={line.discountPercent}
+                          onValueChange={(cleaned) =>
+                            updateLine(idx, {
+                              discountPercent: Math.min(100, Math.max(0, parseQtyNumber(cleaned))),
+                            })
+                          }
+                          className="w-16 px-2 py-1.5 text-sm text-right border border-slate-200 rounded-md tabular-nums bg-white"
+                        />
+                      </td>
+                      {effectiveDraftVatPayer && (
+                        <td className="py-2 px-2">
+                          <select
+                            value={line.vatRate}
+                            onChange={(e) => updateLine(idx, { vatRate: Number(e.target.value) })}
+                            className="px-2 py-1.5 text-xs border border-slate-200 rounded-md bg-white"
+                          >
+                            <option value={21}>21 %</option>
+                            <option value={12}>12 %</option>
+                            <option value={0}>0 %</option>
+                          </select>
+                        </td>
+                      )}
+                      <td className="py-2 pl-2 text-right font-semibold tabular-nums whitespace-nowrap">
+                        {formatCzk(lineTotalWithoutVat(line), currency)}
+                      </td>
+                      <td className="py-2 pl-2 text-right">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setItems((prev) =>
+                              prev.length > 1 ? prev.filter((_, i) => i !== idx) : prev
+                            )
+                          }
+                          className="p-1 text-slate-400 hover:text-red-600"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
 
+          {/* Below-cost warning or § 30a limit warning */}
+          {documentType === 'SIMPLIFIED' && round2(draftTotals.totalWithVat * (fxNum || 1)) > 10000 && (
+            <div className="bg-red-50 border border-red-300 rounded-lg p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-red-900">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                <div>
+                  <p className="font-semibold">
+                    Překročen zákonný limit 10 000 Kč s DPH pro zjednodušený daňový doklad (§ 30a ZDPH)
+                  </p>
+                  <p className="mt-0.5 text-red-800">
+                    Částka dokladu přesahuje 10 000 Kč s DPH. Pro vystavení přepněte doklad na běžnou fakturu s údaji odběratele.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => handleDocumentTypeChange('INVOICE')}
+                className="px-3 py-1.5 font-semibold text-white bg-red-600 hover:bg-red-700 rounded-lg whitespace-nowrap"
+              >
+                Přepnout na fakturu
+              </button>
+            </div>
+          )}
+
+          {draftProfitStats.hasBelowCostItems && (
+            <div className="bg-amber-50 border border-amber-300 rounded-lg p-3 flex items-start gap-2.5 text-xs text-amber-950">
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-semibold">
+                  Pozor: {draftProfitStats.belowCostLinesCount}{' '}
+                  {draftProfitStats.belowCostLinesCount === 1
+                    ? 'položka je'
+                    : 'položky jsou'}{' '}
+                  prodávány pod nákupní cenou!
+                </p>
+                <p className="text-amber-800 mt-0.5">
+                  Zkontrolujte červeně označené řádky výše nebo případnou slevu před vystavením dokladu.
+                </p>
+              </div>
+            </div>
+          )}
+
           <div className="pt-4 border-t border-slate-100 flex flex-col sm:flex-row justify-between gap-4">
-            <div className="flex-1 max-w-md">
-              <label className="block text-xs font-medium text-slate-700 mb-1">Poznámka na dokladu</label>
-              <input
-                type="text"
-                value={note}
-                onChange={(e) => setNote(e.target.value)}
-                placeholder="Volitelná poznámka pro odběratele"
-                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
-              />
+            <div className="flex-1 max-w-md space-y-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  Poznámka na dokladu
+                </label>
+                <input
+                  type="text"
+                  value={note}
+                  onChange={(e) => setNote(e.target.value)}
+                  placeholder="Volitelná poznámka pro odběratele"
+                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                />
+              </div>
+
+              {draftProfitStats.matchedLinesCount > 0 && documentType !== 'QUOTE' && (
+                <div
+                  className={`rounded-lg border px-3.5 py-2.5 text-xs tabular-nums flex flex-wrap items-center justify-between gap-2 ${
+                    draftProfitStats.profitCzk < 0 || draftProfitStats.hasBelowCostItems
+                      ? 'bg-red-50 border-red-200 text-red-900'
+                      : 'bg-emerald-50/70 border-emerald-200 text-emerald-950'
+                  }`}
+                >
+                  <span className="font-medium flex items-center gap-1.5">
+                    <TrendingUp className="w-3.5 h-3.5" />
+                    Reálný zisk dokladu (interní):
+                  </span>
+                  <span className="font-bold">
+                    {draftProfitStats.profitCzk >= 0 ? '+' : ''}
+                    {formatCzk(draftProfitStats.profitCzk)}{' '}
+                    {draftProfitStats.marginPercent !== null &&
+                      `(${draftProfitStats.marginPercent.toFixed(1)} % marže)`}
+                  </span>
+                </div>
+              )}
             </div>
 
             <div className="sm:w-80 space-y-1 text-sm tabular-nums">
@@ -2482,31 +2746,41 @@ export function InvoicesView({
           </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2 self-start md:self-auto">
-          <button
-            type="button"
-            onClick={() => startNewInvoice(null, 'QUOTE')}
-            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg whitespace-nowrap"
-          >
-            + Nabídka
-          </button>
-          <button
-            type="button"
-            onClick={() => startNewInvoice(null, 'PROFORMA')}
-            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg whitespace-nowrap"
-          >
-            + Záloha
-          </button>
-          <button
-            type="button"
-            onClick={() => startNewInvoice(null, 'INVOICE')}
-            style={{ backgroundColor: palette.primary }}
-            className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white rounded-lg hover:opacity-95 whitespace-nowrap"
-          >
-            <FilePlus2 className="w-4 h-4" />
-            Nová faktura
-          </button>
-        </div>
+        {!isReadOnlyAccountant && (
+          <div className="flex flex-wrap items-center gap-2 self-start md:self-auto">
+            <button
+              type="button"
+              onClick={() => startNewInvoice(null, 'SIMPLIFIED')}
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-emerald-800 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 rounded-lg whitespace-nowrap"
+            >
+              <Receipt className="w-3.5 h-3.5" />
+              + Prodejka (&lt;10 tis.)
+            </button>
+            <button
+              type="button"
+              onClick={() => startNewInvoice(null, 'QUOTE')}
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg whitespace-nowrap"
+            >
+              + Nabídka
+            </button>
+            <button
+              type="button"
+              onClick={() => startNewInvoice(null, 'PROFORMA')}
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg whitespace-nowrap"
+            >
+              + Záloha
+            </button>
+            <button
+              type="button"
+              onClick={() => startNewInvoice(null, 'INVOICE')}
+              style={{ backgroundColor: palette.primary }}
+              className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white rounded-lg hover:opacity-95 whitespace-nowrap"
+            >
+              <FilePlus2 className="w-4 h-4" />
+              Nová faktura
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Filters */}
@@ -2518,6 +2792,7 @@ export function InvoicesView({
               ['ISSUED', 'Neuhrazené'],
               ['OVERDUE', 'Po splatnosti'],
               ['PAID', 'Uhrazené'],
+              ['SIMPLIFIED', 'Prodejky'],
               ['NON_TAX', 'Nabídky / Zálohy / Dobropisy'],
               ['RECURRING', 'Opakované'],
               ['CANCELLED', 'Stornované'],
@@ -2584,6 +2859,15 @@ export function InvoicesView({
                     inv.status !== 'CANCELLED';
                   const isRowRecurring =
                     Boolean(inv.recurringInterval) && inv.recurringInterval !== 'NONE';
+                  const rowProfit =
+                    inv.status !== 'CANCELLED' && rowDocType !== 'QUOTE'
+                      ? computeInvoiceProfitStats(
+                          inv,
+                          inventoryLookups.byId,
+                          inventoryLookups.bySku,
+                          inventoryLookups.byName
+                        )
+                      : null;
                   return (
                     <tr
                       key={inv.id}
@@ -2602,9 +2886,11 @@ export function InvoicesView({
                               className={`font-sans text-[10px] font-semibold px-1.5 py-0.5 rounded ${
                                 rowDocType === 'CREDIT_NOTE'
                                   ? 'bg-red-50 text-red-700'
-                                  : rowDocType === 'PROFORMA'
-                                    ? 'bg-blue-50 text-blue-700'
-                                    : 'bg-slate-100 text-slate-700'
+                                  : rowDocType === 'SIMPLIFIED'
+                                    ? 'bg-emerald-50 text-emerald-700'
+                                    : rowDocType === 'PROFORMA'
+                                      ? 'bg-blue-50 text-blue-700'
+                                      : 'bg-slate-100 text-slate-700'
                               }`}
                             >
                               {getDocumentTypeShortLabel(rowDocType)}
@@ -2625,7 +2911,7 @@ export function InvoicesView({
                       <td className="py-3 px-4">
                         <p className="font-medium text-slate-900">{inv.clientName}</p>
                         <p className="text-xs text-slate-500 tabular-nums">
-                          {inv.clientIco ? `IČO ${inv.clientIco}` : '—'}
+                          {inv.clientIco ? `IČO ${inv.clientIco}` : rowDocType === 'SIMPLIFIED' ? 'Prodejna (§ 30a)' : '—'}
                           {inv.exportedToPohoda && ' · POHODA ✓'}
                           {inv.sentAt && ' · E-mail ✓'}
                           {inv.reminderCount && inv.reminderCount > 0
@@ -2646,7 +2932,22 @@ export function InvoicesView({
                           isRowCredit ? 'text-red-700' : 'text-slate-900'
                         }`}
                       >
-                        {formatCzk((isRowCredit ? -1 : 1) * inv.totalWithVat, inv.currency)}
+                        <p>{formatCzk((isRowCredit ? -1 : 1) * inv.totalWithVat, inv.currency)}</p>
+                        {rowProfit && rowProfit.matchedLinesCount > 0 && (
+                          <p
+                            className={`text-[11px] font-medium mt-0.5 ${
+                              rowProfit.hasBelowCostItems || rowProfit.profitCzk < 0
+                                ? 'text-red-600'
+                                : 'text-emerald-700'
+                            }`}
+                          >
+                            {rowProfit.hasBelowCostItems && '⚠ '}
+                            Zisk {rowProfit.profitCzk >= 0 ? '+' : ''}
+                            {formatCzk(rowProfit.profitCzk)}
+                            {rowProfit.marginPercent !== null &&
+                              ` · ${rowProfit.marginPercent.toFixed(0)} %`}
+                          </p>
+                        )}
                       </td>
                       <td className="py-3 px-4 text-xs font-medium whitespace-nowrap">
                         {inv.status === 'PAID' ? (
@@ -2666,7 +2967,19 @@ export function InvoicesView({
                         onClick={(e) => e.stopPropagation()}
                       >
                         <div className="inline-flex items-center gap-1">
-                          {canRowConvert && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const pdf = generateInvoicePdfBytes(inv, activeCompany, palette);
+                              downloadPdfBytes(pdf, `${inv.invoiceNumber}.pdf`);
+                              notify(`PDF dokladu ${inv.invoiceNumber} bylo staženo.`);
+                            }}
+                            title="Stáhnout PDF dokladu"
+                            className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md"
+                          >
+                            <Download className="w-4 h-4" />
+                          </button>
+                          {!isReadOnlyAccountant && canRowConvert && (
                             <button
                               type="button"
                               onClick={() => startConvertToInvoice(inv)}
@@ -2676,7 +2989,7 @@ export function InvoicesView({
                               <ArrowRightLeft className="w-4 h-4" />
                             </button>
                           )}
-                          {isRowRecurring && inv.status !== 'CANCELLED' && (
+                          {!isReadOnlyAccountant && isRowRecurring && inv.status !== 'CANCELLED' && (
                             <button
                               type="button"
                               onClick={() => startNextRecurringPeriod(inv)}
@@ -2686,7 +2999,7 @@ export function InvoicesView({
                               <CalendarClock className="w-4 h-4" />
                             </button>
                           )}
-                          {overdue && rowDocType !== 'QUOTE' && (
+                          {!isReadOnlyAccountant && overdue && rowDocType !== 'QUOTE' && (
                             <button
                               type="button"
                               onClick={() => handleSendEmail(inv, true)}
@@ -2696,7 +3009,7 @@ export function InvoicesView({
                               <BellRing className="w-4 h-4" />
                             </button>
                           )}
-                          {inv.status !== 'CANCELLED' && (
+                          {!isReadOnlyAccountant && inv.status !== 'CANCELLED' && (
                             <button
                               type="button"
                               onClick={() => startEditInvoice(inv)}
@@ -2706,15 +3019,17 @@ export function InvoicesView({
                               <Edit3 className="w-4 h-4" />
                             </button>
                           )}
-                          <button
-                            type="button"
-                            onClick={() => startDuplicateInvoice(inv)}
-                            title="Duplikovat doklad"
-                            className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md"
-                          >
-                            <Copy className="w-4 h-4" />
-                          </button>
-                          {inv.status === 'CANCELLED' && isCurrentUserAdmin && (
+                          {!isReadOnlyAccountant && (
+                            <button
+                              type="button"
+                              onClick={() => startDuplicateInvoice(inv)}
+                              title="Duplikovat doklad"
+                              className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md"
+                            >
+                              <Copy className="w-4 h-4" />
+                            </button>
+                          )}
+                          {!isReadOnlyAccountant && inv.status === 'CANCELLED' && isCurrentUserAdmin && (
                             <button
                               type="button"
                               onClick={() => setDeleteConfirmInvoice(inv)}

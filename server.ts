@@ -418,6 +418,47 @@ async function startServer() {
     return c.slice(0, 3) || 'CZK';
   }
 
+  function normalizeStockInUnit(rawUnit: unknown): string {
+    const trimmed = String(rawUnit || '').trim();
+    const clean = trimmed.toLowerCase().replace(/[.,;:()]/g, '');
+    if (!clean) return 'ks';
+    if (
+      clean === 'ml' ||
+      clean === 'mlt' ||
+      clean === 'cl' ||
+      clean === 'dl' ||
+      clean === 'mililitr' ||
+      clean === 'mililitru' ||
+      clean === 'mililitrů' ||
+      clean === 'mililitry'
+    ) {
+      return 'ks';
+    }
+    if (
+      clean === 'ks' ||
+      clean === 'kus' ||
+      clean === 'kusy' ||
+      clean === 'kusu' ||
+      clean === 'kusů' ||
+      clean === 'pcs' ||
+      clean === 'pc' ||
+      clean === 'ea' ||
+      clean === 'st' ||
+      clean === 'stk' ||
+      clean === 'unit' ||
+      clean === 'units' ||
+      clean === 'pce' ||
+      clean === 'h87'
+    ) {
+      return 'ks';
+    }
+    if (clean === 'balení' || clean === 'baleni' || clean === 'pack' || clean === 'pkt') return 'bal';
+    if (clean === 'karton') return 'kart';
+    if (clean === 'krabice') return 'krab';
+    if (clean === 'paleta') return 'pal';
+    return trimmed.slice(0, 20);
+  }
+
   app.get('/api/cnb-rates', async (_req, res) => {
     const data = await fetchCnbRatesServer();
     res.json(data);
@@ -442,8 +483,12 @@ async function startServer() {
       const systemInstruction =
         'Jsi přesný český účetní a skladový extraktor pro aplikaci SkladFaktura. ' +
         'Z dodacího listu, nákupní faktury nebo ceníku vyextrahuj hlavičku dodavatele, měnu dokladu a všechny zbožové položky k naskladnění. ' +
+        'DŮLEŽITÉ PRO MĚRNOU JEDNOTKU (unit) A MNOŽSTVÍ (quantity): ' +
+        'Zboží v lahvičkách, kapslích, cartridgích, podech, e-liquidech, aromatech, příchutích či jiných baleních (např. „10ml“, „20ml“, „2ml“, „60ml“, „10 ml“) se VŽDY naskladňuje po kusech ("ks") — NIKDY jako "ml"! ' +
+        'Údaj v ml (např. 10ml, 20 ml) nebo mg v názvu produktu či ve sloupci objemu/spotřební daně je pouze objem/síla jednoho kusu (ponech jej v názvu produktu), nikoli měrná jednotka ani počet kusů. ' +
+        'Do pole quantity uveď skutečný počet kusů/lahviček/balení ze sloupce množství (nikdy ne objem v ml) a do pole unit nastav "ks" (případně "bal", "kart", "sada" jen pokud je to výslovná jednotka počtu balení). ' +
         'DŮLEŽITÉ PRO MĚNU: Pole currency uveď jako 3písmenný ISO kód měny z dokladu (např. CZK, EUR, USD, PLN, GBP). ' +
-        'Pole unitPurchasePrice uveď jako jednotkovou cenu bez DPH v PŮVODNÍ MĚNĚ DOKLADU — sám ji nepřepočítávej odhadem na CZK (přepočet proběhne přesným kurzem ČNB na serveru). ' +
+        'Pole unitPurchasePrice uveď jako jednotkovou cenu bez DPH za 1 kus (MJ) v PŮVODNÍ MĚNĚ DOKLADU — sám ji nepřepočítávej odhadem na CZK (přepočet proběhne přesným kurzem ČNB na serveru). ' +
         'Pokud je na faktuře jen cena s DPH, přepočítej ji bez DPH ve stejné měně. ' +
         'Pokud je na dokladu výslovně vytištěn směnný kurz vůči CZK (např. 1 EUR = 25,20 Kč), uveď ho v documentExchangeRate, jinak 0. ' +
         'Sazba DPH musí být 0, 12 nebo 21 (u zahraničních faktur s reverse charge / bez DPH uveď 0 nebo 21 dle povahy zboží). Odpovídej striktně dle JSON schématu.';
@@ -556,7 +601,7 @@ async function startServer() {
             name: String(it.name || '').trim().slice(0, 200),
             ean: String(it.ean || '').trim().slice(0, 40),
             quantity,
-            unit: (String(it.unit || '').trim() || 'ks').slice(0, 20),
+            unit: normalizeStockInUnit(it.unit),
             originalPurchasePrice,
             purchasePrice,
             suggestedSalePrice: purchasePrice > 0 ? round2(purchasePrice * 1.25) : 0,

@@ -27,7 +27,13 @@ import {
   OperationType,
 } from '../lib/firebase';
 import { ensureSharedWorkspace } from '../lib/firestoreService';
-import { hasAdminRights, isInvoiceOverdue, needsRestockAlert, timestampToMs } from '../lib/format';
+import {
+  hasAdminRights,
+  isAccountantMember,
+  isInvoiceOverdue,
+  needsRestockAlert,
+  timestampToMs,
+} from '../lib/format';
 import type {
   AresSubject,
   BankTransaction,
@@ -40,6 +46,7 @@ import type {
   ParsedBankTx,
   StockMovement,
   TeamMember,
+  TeamRole,
   Warehouse,
   Workspace,
 } from '../types';
@@ -60,6 +67,8 @@ interface AppContextValue {
   workspaceInitError: string | null;
   retryWorkspaceInit: () => void;
   isCurrentUserAdmin: boolean;
+  currentUserRole: TeamRole;
+  isReadOnlyAccountant: boolean;
   teamMembers: TeamMember[];
   companies: Company[];
   activeCompanyId: string;
@@ -374,6 +383,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
     [workspace, userEmail]
   );
 
+  const currentTeamMember = useMemo(
+    () => teamMembers.find((m) => m.email.trim().toLowerCase() === userEmail) || null,
+    [teamMembers, userEmail]
+  );
+
+  const currentUserRole: TeamRole = useMemo(() => {
+    if (workspace && workspace.ownerEmail.toLowerCase() === userEmail) return 'OWNER';
+    if (isCurrentUserAdmin) return 'ADMIN';
+    if (isAccountantMember(currentTeamMember)) return 'ACCOUNTANT';
+    return 'MEMBER';
+  }, [workspace, userEmail, isCurrentUserAdmin, currentTeamMember]);
+
+  const isReadOnlyAccountant = currentUserRole === 'ACCOUNTANT';
+
   const lowStockItems = useMemo(() => {
     const whIds = new Set(accessibleWarehouses.map((w) => w.id));
     return inventory.filter((i) => whIds.has(i.warehouseId) && needsRestockAlert(i));
@@ -497,6 +520,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       workspaceInitError,
       retryWorkspaceInit,
       isCurrentUserAdmin,
+      currentUserRole,
+      isReadOnlyAccountant,
       teamMembers,
       companies,
       activeCompanyId,
@@ -536,6 +561,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       workspaceInitError,
       retryWorkspaceInit,
       isCurrentUserAdmin,
+      currentUserRole,
+      isReadOnlyAccountant,
       teamMembers,
       companies,
       activeCompanyId,

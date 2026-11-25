@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import {
   BarChart3,
   Bell,
+  Eye,
   FilePlus2,
   FileText,
   Landmark,
@@ -61,6 +62,7 @@ function WorkspaceShell() {
     companies,
     activeCompany,
     switchCompany,
+    isReadOnlyAccountant,
     totalAlertCount,
     signOutUser,
     toasts,
@@ -140,6 +142,7 @@ function WorkspaceShell() {
   const palette = getCompanyPalette(activeCompany?.accentIndex);
 
   const openNewInvoice = (client?: Client) => {
+    if (isReadOnlyAccountant) return;
     if (client) {
       setPrefillClient(client);
     } else {
@@ -149,7 +152,12 @@ function WorkspaceShell() {
     setInvoiceCreateTrigger((n) => n + 1);
   };
 
+  const visibleNavItems = isReadOnlyAccountant
+    ? NAV_ITEMS.filter((i) => i.id !== 'smart-stock-in')
+    : NAV_ITEMS;
+
   const navigate = (target: AppSection) => {
+    if (isReadOnlyAccountant && target === 'smart-stock-in') return;
     setSection(target);
     setMobileMenuOpen(false);
   };
@@ -172,7 +180,7 @@ function WorkspaceShell() {
       </div>
 
       <nav className="flex-1 p-3 space-y-0.5 overflow-y-auto">
-        {NAV_ITEMS.map((item) => {
+        {visibleNavItems.map((item) => {
           const Icon = item.icon;
           const active = section === item.id;
           return (
@@ -292,6 +300,16 @@ function WorkspaceShell() {
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
+            {isReadOnlyAccountant && (
+              <span
+                title="Role Účetní: plný přístup ke čtení, reportům a exportům bez možnosti měnit data"
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold text-indigo-800 bg-indigo-50 border border-indigo-200 rounded-lg whitespace-nowrap"
+              >
+                <Eye className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Režim Účetní (jen čtení)</span>
+                <span className="sm:hidden">Účetní</span>
+              </span>
+            )}
             <button
               type="button"
               onClick={() => navigate('alerts')}
@@ -306,15 +324,17 @@ function WorkspaceShell() {
               )}
             </button>
 
-            <button
-              type="button"
-              onClick={() => openNewInvoice()}
-              style={{ backgroundColor: palette.primary }}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white rounded-lg hover:opacity-95 whitespace-nowrap"
-            >
-              <FilePlus2 className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Nová faktura</span>
-            </button>
+            {!isReadOnlyAccountant && (
+              <button
+                type="button"
+                onClick={() => openNewInvoice()}
+                style={{ backgroundColor: palette.primary }}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white rounded-lg hover:opacity-95 whitespace-nowrap"
+              >
+                <FilePlus2 className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Nová faktura</span>
+              </button>
+            )}
           </div>
         </header>
 
