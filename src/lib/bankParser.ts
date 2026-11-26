@@ -278,16 +278,41 @@ export function buildStatementImportPreview(params: {
   const existingIds = new Set(
     existingTransactions.filter((t) => t.companyId === companyId).map((t) => t.externalId)
   );
-  const remainingUnpaid = [...unpaidCompanyInvoices];
+
+  // O(1) Map lookup by normalized VS and invoice number digits
+  const invoicesByVs = new Map<string, Invoice[]>();
+  const addKey = (key: string, inv: Invoice) => {
+    if (!key) return;
+    const list = invoicesByVs.get(key);
+    if (list) list.push(inv);
+    else invoicesByVs.set(key, [inv]);
+  };
+  for (const inv of unpaidCompanyInvoices) {
+    const invVs = inv.variableSymbol.replace(/^0+/, '').replace(/\D/g, '');
+    const invNumDigits = inv.invoiceNumber.replace(/^0+/, '').replace(/\D/g, '');
+    addKey(invVs, inv);
+    if (invNumDigits && invNumDigits !== invVs) {
+      addKey(invNumDigits, inv);
+    }
+  }
+  const claimedInvoiceIds = new Set<string>();
 
   const rows: StatementPreviewRow[] = parsed.map((tx) => {
     const isDuplicate = existingIds.has(tx.externalId);
     let matchedInvoice: Invoice | null = null;
-    if (!isDuplicate) {
-      matchedInvoice = findBestMatchingInvoice(tx, remainingUnpaid);
-      if (matchedInvoice) {
-        const idx = remainingUnpaid.findIndex((i) => i.id === matchedInvoice!.id);
-        if (idx >= 0) remainingUnpaid.splice(idx, 1);
+    if (!isDuplicate && tx.amount > 0) {
+      const txVs = tx.variableSymbol.replace(/^0+/, '').replace(/\D/g, '');
+      const bucket = txVs ? invoicesByVs.get(txVs) : undefined;
+      if (bucket && bucket.length > 0) {
+        const available = bucket.filter((inv) => !claimedInvoiceIds.has(inv.id));
+        if (available.length > 0) {
+          matchedInvoice =
+            available.find((inv) => {
+              const remaining = round2(Math.max(0, inv.totalWithVat - inv.paidAmount));
+              return Math.abs(remaining - tx.amount) <= 1.0;
+            }) || available[0];
+          claimedInvoiceIds.add(matchedInvoice.id);
+        }
       }
     }
     return { transaction: tx, isDuplicate, matchedInvoice };
@@ -405,51 +430,116 @@ export function generateUniqueSku(name: string, takenSkus: Set<string>): string 
   return fallback;
 }
 
+function canonicalTokenKey(normalized: string): string {
+  const tokens = normalized.split(' ').filter((w) => w.length >= 1);
+  if (tokens.length < 2) return '';
+  return [...tokens].sort().join('\0');
+}
+
 function tokensEqualSet(a: string, b: string): boolean {
-  const ta = a.split(' ').filter((w) => w.length >= 1);
-  const tb = b.split(' ').filter((w) => w.length >= 1);
-  if (ta.length < 2 || ta.length !== tb.length) return false;
-  // Require identical token multiset (every word & variant digit must match 1:1)
-  const sortedA = [...ta].sort();
-  const sortedB = [...tb].sort();
-  return sortedA.every((w, idx) => w === sortedB[idx]);
+  const ka = canonicalTokenKey(a);
+  if (!ka) return false;
+  return ka === canonicalTokenKey(b);
+}
+
+export interface InventoryLookupIndex {
+  byEan: Map<string, InventoryItem>;
+  bySku: Map<string, InventoryItem[]>;
+  byExactName: Map<string, InventoryItem>;
+  bySortedTokens: Map<string, InventoryItem>;
+}
+
+/**
+ * Pre-indexes warehouse inventory into O(1) Maps so matching N imported lines against M stock items
+ * runs in O(N + M) instead of O(N * M) nested .find() loops.
+ */
+export function buildInventoryLookupIndex(candidates: InventoryItem[]): InventoryLookupIndex {
+  const byEan = new Map<string, InventoryItem>();
+  const bySku = new Map<string, InventoryItem[]>();
+  const byExactName = new Map<string, InventoryItem>();
+  const bySortedTokens = new Map<string, InventoryItem>();
+
+  for (const item of candidates) {
+    const eanClean = (item.ean || '').replace(/\D/g, '');
+    if (eanClean.length >= 8 && !byEan.has(eanClean)) {
+      byEan.set(eanClean, item);
+    }
+
+    if (!isSyntheticSku(item.sku)) {
+      const skuKey = normalizeSkuKey(item.sku);
+      if (skuKey.length >= 2) {
+        const list = bySku.get(skuKey);
+        if (list) list.push(item);
+        else bySku.set(skuKey, [item]);
+      }
+    }
+
+    const nameKey = normalizeMatchKey(item.name);
+    if (nameKey.length >= 2) {
+      if (!byExactName.has(nameKey)) {
+        byExactName.set(nameKey, item);
+      }
+      const tokenSig = canonicalTokenKey(nameKey);
+      if (tokenSig && !bySortedTokens.has(tokenSig)) {
+        bySortedTokens.set(tokenSig, item);
+      }
+    }
+  }
+
+  return { byEan, bySku, byExactName, bySortedTokens };
+}
+
+export function findMatchingInventoryItemInIndex(
+  line: Pick<ExtractedLineItem, 'ean' | 'sku' | 'name'>,
+  index: InventoryLookupIndex
+): InventoryItem | null {
+  const eanClean = (line.ean || '').replace(/\D/g, '');
+  if (eanClean.length >= 8) {
+    const byEan = index.byEan.get(eanClean);
+    if (byEan) return byEan;
+  }
+
+  const nameKey = normalizeMatchKey(line.name);
+
+  // Never match by auto-generated placeholder SKUs like SKU-001..SKU-008, AI-1234, IMP-1
+  if (!isSyntheticSku(line.sku)) {
+    const skuKey = normalizeSkuKey(line.sku);
+    if (skuKey.length >= 2) {
+      const skuBucket = index.bySku.get(skuKey);
+      if (skuBucket) {
+        for (const cand of skuBucket) {
+          if (nameKey.length >= 2 && normalizeMatchKey(cand.name).length >= 2) {
+            if (areNamesCompatible(cand.name, line.name)) return cand;
+          } else {
+            return cand;
+          }
+        }
+      }
+    }
+  }
+
+  if (nameKey.length >= 2) {
+    const byExact = index.byExactName.get(nameKey);
+    if (byExact) return byExact;
+
+    const tokenSig = canonicalTokenKey(nameKey);
+    if (tokenSig) {
+      const byTokens = index.bySortedTokens.get(tokenSig);
+      if (byTokens) return byTokens;
+    }
+  }
+
+  return null;
 }
 
 export function findMatchingInventoryItem(
   line: Pick<ExtractedLineItem, 'ean' | 'sku' | 'name'>,
-  candidates: InventoryItem[]
+  candidatesOrIndex: InventoryItem[] | InventoryLookupIndex
 ): InventoryItem | null {
-  const eanClean = (line.ean || '').replace(/\D/g, '');
-  const skuKey = normalizeSkuKey(line.sku);
-  const nameKey = normalizeMatchKey(line.name);
-
-  if (eanClean.length >= 8) {
-    const byEan = candidates.find((i) => (i.ean || '').replace(/\D/g, '') === eanClean);
-    if (byEan) return byEan;
-  }
-
-  // Never match by auto-generated placeholder SKUs like SKU-001..SKU-008, AI-1234, IMP-1
-  if (skuKey.length >= 2 && !isSyntheticSku(line.sku)) {
-    const bySku = candidates.find((i) => {
-      if (isSyntheticSku(i.sku) || normalizeSkuKey(i.sku) !== skuKey) return false;
-      // Extra guard: if both have names, ensure we didn't match two totally different products
-      if (nameKey.length >= 2 && normalizeMatchKey(i.name).length >= 2) {
-        return areNamesCompatible(i.name, line.name);
-      }
-      return true;
-    });
-    if (bySku) return bySku;
-  }
-
-  if (nameKey.length >= 2) {
-    const byExactName = candidates.find((i) => normalizeMatchKey(i.name) === nameKey);
-    if (byExactName) return byExactName;
-
-    const byTokens = candidates.find((i) => tokensEqualSet(normalizeMatchKey(i.name), nameKey));
-    if (byTokens) return byTokens;
-  }
-
-  return null;
+  const index = Array.isArray(candidatesOrIndex)
+    ? buildInventoryLookupIndex(candidatesOrIndex)
+    : candidatesOrIndex;
+  return findMatchingInventoryItemInIndex(line, index);
 }
 
 export function matchExtractedToInventory(
@@ -457,15 +547,28 @@ export function matchExtractedToInventory(
   inventory: InventoryItem[],
   warehouseId: string
 ): ExtractedDeliveryNote {
-  const whItems = inventory.filter((i) => i.warehouseId === warehouseId);
-  const otherWhItems = inventory.filter((i) => i.warehouseId !== warehouseId);
+  const inventoryById = new Map<string, InventoryItem>();
+  const whItems: InventoryItem[] = [];
+  const otherWhItems: InventoryItem[] = [];
+
+  for (const item of inventory) {
+    inventoryById.set(item.id, item);
+    if (item.warehouseId === warehouseId) {
+      whItems.push(item);
+    } else {
+      otherWhItems.push(item);
+    }
+  }
+
+  const whIndex = buildInventoryLookupIndex(whItems);
+  const otherWhIndex = buildInventoryLookupIndex(otherWhItems);
 
   return {
     ...note,
     items: note.items.map((line) => {
       if (line.manualMatchLock) {
         const pinned = line.matchedInventoryId
-          ? inventory.find((i) => i.id === line.matchedInventoryId) || null
+          ? inventoryById.get(line.matchedInventoryId) || null
           : null;
         return {
           ...line,
@@ -475,7 +578,7 @@ export function matchExtractedToInventory(
         };
       }
 
-      const matched = findMatchingInventoryItem(line, whItems);
+      const matched = findMatchingInventoryItemInIndex(line, whIndex);
       if (matched) {
         return {
           ...line,
@@ -485,7 +588,7 @@ export function matchExtractedToInventory(
         };
       }
 
-      const otherMatch = findMatchingInventoryItem(line, otherWhItems);
+      const otherMatch = findMatchingInventoryItemInIndex(line, otherWhIndex);
       return {
         ...line,
         matchedInventoryId: null,

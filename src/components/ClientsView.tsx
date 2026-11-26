@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useDeferredValue, useMemo, useState } from 'react';
 import {
   Building2,
   Edit3,
@@ -53,12 +53,13 @@ export function ClientsView({ onCreateInvoiceForClient }: ClientsViewProps) {
   const palette = getCompanyPalette(activeCompany?.accentIndex);
 
   const [search, setSearch] = useState('');
+  const deferredSearch = useDeferredValue(search);
   const [form, setForm] = useState<ClientFormState | null>(null);
   const [aresLoading, setAresLoading] = useState(false);
   const [saving, setSaving] = useState(false);
 
   const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = deferredSearch.trim().toLowerCase();
     if (!q) return clients;
     return clients.filter(
       (c) =>
@@ -68,7 +69,7 @@ export function ClientsView({ onCreateInvoiceForClient }: ClientsViewProps) {
         c.city.toLowerCase().includes(q) ||
         c.email.toLowerCase().includes(q)
     );
-  }, [clients, search]);
+  }, [clients, deferredSearch]);
 
   const handleAresLookup = async () => {
     if (!form) return;

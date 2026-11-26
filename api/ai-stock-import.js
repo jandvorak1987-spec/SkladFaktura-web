@@ -1,5 +1,12 @@
 import { GoogleGenAI, Type } from '@google/genai';
 import { fetchCnbRates } from './cnb-rates.js';
+import { lookupAresCompany } from './ares/[ico].js';
+import { extractCandidateSupplierIco } from '../server-lib/ttlCache.js';
+
+// Strictly free-tier Gemini models only (zero paid models, no Google Search grounding)
+const PRIMARY_MODEL = 'gemini-4-hydrogen';
+const FALLBACK_MODEL = 'gemini-3.1-flash-lite';
+const PRIMARY_TIMEOUT_MS = 8000;
 
 function round2(n) {
   return Math.round(n * 100) / 100;
@@ -35,7 +42,6 @@ function normalizeStockInUnit(rawUnit) {
   const trimmed = String(rawUnit || '').trim();
   const clean = trimmed.toLowerCase().replace(/[.,;:()]/g, '');
   if (!clean) return 'ks';
-  // Never stock retail/vape bottles or packaged liquids in milliliters — always pieces (ks)
   if (
     clean === 'ml' ||
     clean === 'mlt' ||
@@ -107,11 +113,21 @@ function findGeminiApiKey() {
   return '';
 }
 
-const PRIMARY_MODEL = 'gemini-4-hydrogen';
-const FALLBACK_MODEL = 'gemini-3.1-flash-lite';
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTimeoutOrAbortError(err) {
+  if (!err) return false;
+  const name = String(err.name || '').toLowerCase();
+  const msg = String(err.message || err).toLowerCase();
+  return (
+    name === 'timeouterror' ||
+    name === 'aborterror' ||
+    msg.includes('timed out') ||
+    msg.includes('timeout') ||
+    msg.includes('aborted')
+  );
 }
 
 function isHighDemandError(err) {
@@ -147,42 +163,36 @@ function isQuotaExceededError(err) {
 async function generateWithFallback(
   ai,
   requestParams,
-  {
-    primaryModel = PRIMARY_MODEL,
-    fallbackModel = FALLBACK_MODEL,
-    maxRetries = 2,
-    retryDelayMs = 2000,
-  } = {}
+  { primaryModel = PRIMARY_MODEL, fallbackModel = FALLBACK_MODEL } = {}
 ) {
   let lastError;
 
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await ai.models.generateContent({
-        ...requestParams,
-        model: primaryModel,
-      });
-    } catch (err) {
-      lastError = err;
-      if (isModelNotFoundError(err) || isQuotaExceededError(err)) {
-        break;
-      }
-      if (!isHighDemandError(err)) {
-        throw err;
-      }
-      if (attempt < maxRetries) {
-        console.warn(
-          `[ai-stock-import] Model ${primaryModel} vrátil 503/high demand (pokus ${attempt + 1}/${maxRetries + 1}), opakuji za ${retryDelayMs} ms…`
-        );
-        await sleep(retryDelayMs);
-      }
+  // Fast-fail primary call with 8s AbortSignal timeout -> immediate failover to lite model
+  try {
+    return await ai.models.generateContent({
+      ...requestParams,
+      model: primaryModel,
+      config: {
+        ...requestParams.config,
+        abortSignal: AbortSignal.timeout(PRIMARY_TIMEOUT_MS),
+      },
+    });
+  } catch (err) {
+    lastError = err;
+    const shouldFailover =
+      isTimeoutOrAbortError(err) ||
+      isHighDemandError(err) ||
+      isModelNotFoundError(err) ||
+      isQuotaExceededError(err);
+    if (!shouldFailover) {
+      throw err;
     }
+    console.warn(
+      `[ai-stock-import] Primary ${primaryModel} failed/timed out (${err?.name || err?.status || 'error'}), failing over immediately to ${fallbackModel}.`
+    );
   }
 
-  console.warn(
-    `[ai-stock-import] Model ${primaryModel} není dostupný (503/429/404), přepínám na ${fallbackModel}.`
-  );
-  const fallbackDelays = [2000, 4000, 6000];
+  const fallbackDelays = [1500, 3000];
   for (let fbAttempt = 0; fbAttempt <= fallbackDelays.length; fbAttempt++) {
     try {
       return await ai.models.generateContent({
@@ -194,7 +204,7 @@ async function generateWithFallback(
       if (isHighDemandError(fallbackErr) && fbAttempt < fallbackDelays.length) {
         const waitMs = fallbackDelays[fbAttempt];
         console.warn(
-          `[ai-stock-import] Záložní model ${fallbackModel} vrátil 503/high demand (pokus ${fbAttempt + 1}/${fallbackDelays.length + 1}), opakuji za ${waitMs} ms…`
+          `[ai-stock-import] Fallback ${fallbackModel} 503/high demand (attempt ${fbAttempt + 1}), retrying in ${waitMs} ms…`
         );
         await sleep(waitMs);
         continue;
@@ -259,6 +269,7 @@ export default async function handler(req, res) {
     const base64Data = String(body.base64Data || '').trim();
     const mimeType = String(body.mimeType || '').trim();
     const fileName = String(body.fileName || 'doklad').trim();
+    const candidateIco = extractCandidateSupplierIco(rawText, body.supplierIco);
 
     if (!rawText && (!base64Data || !mimeType)) {
       res.status(400).json({ error: 'Nahrajte soubor (foto/PDF) nebo vložte text dokladu.' });
@@ -290,45 +301,60 @@ export default async function handler(req, res) {
       });
     }
 
-    const response = await generateWithFallback(ai, {
-      contents: { parts },
-      config: {
-        systemInstruction,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            supplierName: { type: Type.STRING },
-            supplierIco: { type: Type.STRING },
-            documentNumber: { type: Type.STRING },
-            documentType: { type: Type.STRING },
-            currency: { type: Type.STRING },
-            documentExchangeRate: { type: Type.NUMBER },
-            items: {
-              type: Type.ARRAY,
+    // Eliminate waterfall: parse document with Gemini, warm 24h CNB rates, and validate candidate ICO via 7d ARES in parallel
+    const [response, cnbData, preAresResult] = await Promise.all([
+      generateWithFallback(ai, {
+        contents: { parts },
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              supplierName: { type: Type.STRING },
+              supplierIco: { type: Type.STRING },
+              documentNumber: { type: Type.STRING },
+              documentType: { type: Type.STRING },
+              currency: { type: Type.STRING },
+              documentExchangeRate: { type: Type.NUMBER },
               items: {
-                type: Type.OBJECT,
-                properties: {
-                  sku: { type: Type.STRING },
-                  name: { type: Type.STRING },
-                  ean: { type: Type.STRING },
-                  quantity: { type: Type.NUMBER },
-                  unit: { type: Type.STRING },
-                  unitPurchasePrice: { type: Type.NUMBER },
-                  vatRate: { type: Type.INTEGER },
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    sku: { type: Type.STRING },
+                    name: { type: Type.STRING },
+                    ean: { type: Type.STRING },
+                    quantity: { type: Type.NUMBER },
+                    unit: { type: Type.STRING },
+                    unitPurchasePrice: { type: Type.NUMBER },
+                    vatRate: { type: Type.INTEGER },
+                  },
+                  required: ['name', 'quantity'],
                 },
-                required: ['name', 'quantity'],
               },
             },
+            required: ['items'],
           },
-          required: ['items'],
         },
-      },
-    });
+      }),
+      fetchCnbRates(),
+      candidateIco ? lookupAresCompany(candidateIco).catch(() => null) : Promise.resolve(null),
+    ]);
 
     const parsed = JSON.parse((response.text || '{}').trim());
     const currency = normalizeCurrency(parsed.currency);
     const docRate = Number(parsed.documentExchangeRate || 0);
+    const parsedIco = String(parsed.supplierIco || '').replace(/\D/g, '');
+
+    // Use already-fetched ARES result when ICO matches, otherwise validate extracted 8-digit ICO (7d cached)
+    let aresCompany = null;
+    if (preAresResult?.ok && (!parsedIco || parsedIco.padStart(8, '0') === candidateIco)) {
+      aresCompany = preAresResult.data;
+    } else if (parsedIco.length === 8) {
+      const aresRes = await lookupAresCompany(parsedIco).catch(() => null);
+      if (aresRes?.ok) aresCompany = aresRes.data;
+    }
 
     let exchangeRate = 1;
     let exchangeRateSource = 'CZK';
@@ -336,7 +362,6 @@ export default async function handler(req, res) {
     let cnbRate = 1;
 
     if (currency !== 'CZK') {
-      const cnbData = await fetchCnbRates();
       const rateFromCnb = Number(cnbData.rates?.[currency] || 0);
       cnbRate = rateFromCnb > 0 ? round4(rateFromCnb) : 1;
       exchangeRateDate = cnbData.date || '';
@@ -379,9 +404,14 @@ export default async function handler(req, res) {
         };
       });
 
+    const resolvedSupplierName =
+      String(parsed.supplierName || '').trim() || aresCompany?.name || '';
+    const resolvedSupplierIco = parsedIco || aresCompany?.ico || '';
+
     res.status(200).json({
-      supplierName: String(parsed.supplierName || '').trim(),
-      supplierIco: String(parsed.supplierIco || '').replace(/\D/g, ''),
+      supplierName: resolvedSupplierName,
+      supplierIco: resolvedSupplierIco,
+      supplierAresValidated: Boolean(aresCompany),
       documentNumber: String(parsed.documentNumber || '').trim(),
       documentType: String(parsed.documentType || 'Dodací list').trim() || 'Dodací list',
       currency,
@@ -399,10 +429,10 @@ export default async function handler(req, res) {
       });
       return;
     }
-    if (isHighDemandError(err)) {
+    if (isHighDemandError(err) || isTimeoutOrAbortError(err)) {
       res.status(503).json({
         error:
-          'Servery Google Gemini jsou momentálně dočasně přetížené (chyba 503 – high demand) i po automatických opakováních a přepnutí na záložní model. Klikni prosím na „Zkusit znovu“ za 15–30 sekund.',
+          'Servery Google Gemini jsou momentálně dočasně přetížené (chyba 503 – high demand) i po přepnutí na záložní model. Klikni prosím na „Zkusit znovu“ za 15–30 sekund.',
       });
       return;
     }

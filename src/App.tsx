@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { Suspense, lazy, useState } from 'react';
 import {
   BarChart3,
   Bell,
@@ -20,17 +20,45 @@ import {
 import { AppProvider, useApp } from './context/AppContext';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { AuthScreen, EmailVerificationScreen } from './components/AuthScreen';
-import { DashboardView } from './components/DashboardView';
-import { InventoryView } from './components/InventoryView';
-import { SmartStockInView } from './components/SmartStockInView';
-import { InvoicesView } from './components/InvoicesView';
-import { BankMatchingView } from './components/BankMatchingView';
-import { ClientsView } from './components/ClientsView';
-import { AlertsCenterView } from './components/AlertsCenterView';
-import { ReportsVatView } from './components/ReportsVatView';
-import { SettingsExportView } from './components/SettingsExportView';
 import { getCompanyPalette } from './lib/format';
 import type { AppSection, Client } from './types';
+
+const DashboardView = lazy(() =>
+  import('./components/DashboardView').then((m) => ({ default: m.DashboardView }))
+);
+const InventoryView = lazy(() =>
+  import('./components/InventoryView').then((m) => ({ default: m.InventoryView }))
+);
+const SmartStockInView = lazy(() =>
+  import('./components/SmartStockInView').then((m) => ({ default: m.SmartStockInView }))
+);
+const InvoicesView = lazy(() =>
+  import('./components/InvoicesView').then((m) => ({ default: m.InvoicesView }))
+);
+const BankMatchingView = lazy(() =>
+  import('./components/BankMatchingView').then((m) => ({ default: m.BankMatchingView }))
+);
+const ClientsView = lazy(() =>
+  import('./components/ClientsView').then((m) => ({ default: m.ClientsView }))
+);
+const AlertsCenterView = lazy(() =>
+  import('./components/AlertsCenterView').then((m) => ({ default: m.AlertsCenterView }))
+);
+const ReportsVatView = lazy(() =>
+  import('./components/ReportsVatView').then((m) => ({ default: m.ReportsVatView }))
+);
+const SettingsExportView = lazy(() =>
+  import('./components/SettingsExportView').then((m) => ({ default: m.SettingsExportView }))
+);
+
+function SectionFallback() {
+  return (
+    <div className="bg-white border border-slate-200 rounded-xl p-10 flex items-center justify-center gap-3 text-sm text-slate-500">
+      <Loader2 className="w-4 h-4 animate-spin text-slate-600" />
+      Načítám modul…
+    </div>
+  );
+}
 
 interface NavItem {
   id: AppSection;
@@ -340,28 +368,30 @@ function WorkspaceShell() {
 
         {/* Page Content */}
         <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto">
-          {section === 'dashboard' && (
-            <DashboardView
-              onNavigate={navigate}
-              onQuickCreateInvoice={() => openNewInvoice()}
-            />
-          )}
-          {section === 'inventory' && <InventoryView onNavigate={navigate} />}
-          {section === 'smart-stock-in' && <SmartStockInView />}
-          {section === 'invoices' && (
-            <InvoicesView
-              initialCreateTrigger={invoiceCreateTrigger}
-              prefillClient={prefillClient}
-              onClearPrefillClient={() => setPrefillClient(null)}
-            />
-          )}
-          {section === 'reports' && <ReportsVatView />}
-          {section === 'bank-matching' && <BankMatchingView />}
-          {section === 'clients' && (
-            <ClientsView onCreateInvoiceForClient={(c) => openNewInvoice(c)} />
-          )}
-          {section === 'alerts' && <AlertsCenterView onNavigate={navigate} />}
-          {section === 'settings' && <SettingsExportView />}
+          <Suspense fallback={<SectionFallback />}>
+            {section === 'dashboard' && (
+              <DashboardView
+                onNavigate={navigate}
+                onQuickCreateInvoice={() => openNewInvoice()}
+              />
+            )}
+            {section === 'inventory' && <InventoryView onNavigate={navigate} />}
+            {section === 'smart-stock-in' && <SmartStockInView />}
+            {section === 'invoices' && (
+              <InvoicesView
+                initialCreateTrigger={invoiceCreateTrigger}
+                prefillClient={prefillClient}
+                onClearPrefillClient={() => setPrefillClient(null)}
+              />
+            )}
+            {section === 'reports' && <ReportsVatView />}
+            {section === 'bank-matching' && <BankMatchingView />}
+            {section === 'clients' && (
+              <ClientsView onCreateInvoiceForClient={(c) => openNewInvoice(c)} />
+            )}
+            {section === 'alerts' && <AlertsCenterView onNavigate={navigate} />}
+            {section === 'settings' && <SettingsExportView />}
+          </Suspense>
         </main>
       </div>
 

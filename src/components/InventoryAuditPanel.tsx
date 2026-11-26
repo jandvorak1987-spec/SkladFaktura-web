@@ -13,7 +13,6 @@ import {
 import { QtyInput, parseQtyNumber } from './QtyInput';
 import { commitInventoryAudit } from '../lib/firestoreService';
 import { downloadTextFile, formatCzk, formatQty, round2, toIsoDate } from '../lib/format';
-import { downloadPdfBytes, generateInventoryAuditPdfBytes } from '../lib/pdfExport';
 import type { Company, InventoryItem, Warehouse, Workspace } from '../types';
 
 interface InventoryAuditPanelProps {
@@ -327,7 +326,7 @@ export function InventoryAuditPanel({
     onNotify('Inventurní protokol (CSV) byl stažen.');
   };
 
-  const handleExportAuditPdf = () => {
+  const handleExportAuditPdf = async () => {
     const exportRows = (onlyDiffs ? rows : items.map((item) => {
       const counted = getCounted(item);
       const delta = round2(counted - item.quantity);
@@ -350,6 +349,7 @@ export function InventoryAuditPanel({
       valueDelta: r.diffValue,
     }));
 
+    const { downloadPdfBytes, generateInventoryAuditPdfBytes } = await import('../lib/pdfExport');
     const uniqueWhNames = Array.from(new Set(exportRows.map((r) => r.warehouseName)));
     const pdfBytes = generateInventoryAuditPdfBytes({
       company,

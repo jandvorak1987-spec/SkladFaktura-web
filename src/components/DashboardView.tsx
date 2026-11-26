@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React, { Suspense, lazy, useMemo } from 'react';
 import {
   AlertTriangle,
   Archive,
@@ -24,7 +24,10 @@ import {
   round2,
 } from '../lib/format';
 import type { AppSection } from '../types';
-import { PerformanceChart } from './PerformanceChart';
+
+const PerformanceChart = lazy(() =>
+  import('./PerformanceChart').then((m) => ({ default: m.PerformanceChart }))
+);
 
 interface DashboardViewProps {
   onNavigate: (section: AppSection) => void;
@@ -274,12 +277,20 @@ export function DashboardView({ onNavigate, onQuickCreateInvoice }: DashboardVie
       )}
 
       {/* Monthly Cashflow & Realtime Performance Chart */}
-      <PerformanceChart
-        invoices={companyInvoices}
-        movements={companyMovements}
-        accentPrimary={palette.primary}
-        vatPayer={activeCompany?.vatPayer ?? true}
-      />
+      <Suspense
+        fallback={
+          <div className="bg-white border border-slate-200 rounded-xl p-6 h-72 flex items-center justify-center text-xs text-slate-400">
+            Načítám graf cashflow…
+          </div>
+        }
+      >
+        <PerformanceChart
+          invoices={companyInvoices}
+          movements={companyMovements}
+          accentPrimary={palette.primary}
+          vatPayer={activeCompany?.vatPayer ?? true}
+        />
+      </Suspense>
 
       {/* Recent Invoices + Recent Stock Movements */}
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">

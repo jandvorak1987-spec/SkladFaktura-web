@@ -1,5 +1,3 @@
-import * as pdfjsLib from 'pdfjs-dist';
-import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import {
   applyLiveCnbRateToNote,
   parseInvoiceFromTextLines,
@@ -7,7 +5,20 @@ import {
 } from './localInvoiceParser';
 import type { ExtractedDeliveryNote } from '../types';
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+let pdfjsLoaderPromise: Promise<typeof import('pdfjs-dist')> | null = null;
+
+async function getPdfJs() {
+  if (!pdfjsLoaderPromise) {
+    pdfjsLoaderPromise = Promise.all([
+      import('pdfjs-dist'),
+      import('pdfjs-dist/build/pdf.worker.min.mjs?url'),
+    ]).then(([pdfjsLib, workerMod]) => {
+      pdfjsLib.GlobalWorkerOptions.workerSrc = workerMod.default;
+      return pdfjsLib;
+    });
+  }
+  return pdfjsLoaderPromise;
+}
 
 export type LocalExtractionMethod = 'ISDOC_XML' | 'POHODA_XML' | 'PDF_TEXT' | 'LOCAL_OCR' | 'TEXT';
 
@@ -167,7 +178,7 @@ export async function extractFileLocally(
   // 2. PDF (digitální textová vrstva přes PDF.js + automatický lokální OCR fallback pro skeny)
   if (lower.endsWith('.pdf') || file.type === 'application/pdf') {
     onProgress?.('Čtu textovou vrstvu PDF lokálně v prohlížeči…');
-    const arrayBuffer = await file.arrayBuffer();
+    const [arrayBuffer, pdfjsLib] = await Promise.all([file.arrayBuffer(), getPdfJs()]);
     const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
     const allLines: string[] = [];
     const maxPages = Math.min(pdf.numPages, 10);

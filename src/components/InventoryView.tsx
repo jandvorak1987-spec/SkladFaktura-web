@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { Suspense, lazy, useDeferredValue, useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   ArrowDownLeft,
@@ -32,13 +32,25 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { BulkPriceEditorModal } from './BulkPriceEditorModal';
-import { InventoryAuditPanel } from './InventoryAuditPanel';
-import { InventoryBulkModals, type BulkActionModalType } from './InventoryBulkModals';
-import { NerxCategorizeModal } from './NerxCategorizeModal';
+import type { BulkActionModalType } from './InventoryBulkModals';
 import { QtyInput } from './QtyInput';
-import { StockInDocumentModal } from './StockInDocumentModal';
 import { useApp } from '../context/AppContext';
+
+const BulkPriceEditorModal = lazy(() =>
+  import('./BulkPriceEditorModal').then((m) => ({ default: m.BulkPriceEditorModal }))
+);
+const InventoryAuditPanel = lazy(() =>
+  import('./InventoryAuditPanel').then((m) => ({ default: m.InventoryAuditPanel }))
+);
+const InventoryBulkModals = lazy(() =>
+  import('./InventoryBulkModals').then((m) => ({ default: m.InventoryBulkModals }))
+);
+const NerxCategorizeModal = lazy(() =>
+  import('./NerxCategorizeModal').then((m) => ({ default: m.NerxCategorizeModal }))
+);
+const StockInDocumentModal = lazy(() =>
+  import('./StockInDocumentModal').then((m) => ({ default: m.StockInDocumentModal }))
+);
 import { areNamesCompatible } from '../lib/bankParser';
 import {
   composeNotesWithPriceBreakdown,
@@ -112,6 +124,7 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
 
   const [tab, setTab] = useState<InventoryTab>('ITEMS');
   const [search, setSearch] = useState('');
+  const deferredSearch = useDeferredValue(search);
   const [selectedWarehouseId, setSelectedWarehouseId] = useState<string>('ALL');
   const [selectedCategory, setSelectedCategory] = useState<string>('ALL');
   const [groupByCategory, setGroupByCategory] = useState<boolean>(true);
@@ -211,7 +224,7 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
   }, [inventory]);
 
   const filteredItems = useMemo(() => {
-    const q = search.trim();
+    const q = deferredSearch.trim();
     return warehouseScopedItems.filter((item) => {
       const cat = (item.category || '').trim();
       if (selectedCategory === '__NONE__' && cat !== '') return false;
@@ -222,7 +235,7 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
       if (!q) return true;
       return matchesNameQuery(item, q);
     });
-  }, [warehouseScopedItems, selectedCategory, onlyLowStock, search]);
+  }, [warehouseScopedItems, selectedCategory, onlyLowStock, deferredSearch]);
 
   const groupedByCategory = useMemo(() => {
     const map = new Map<string, InventoryItem[]>();
@@ -256,7 +269,7 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
   const filteredMovements = useMemo(() => {
     const allowed = new Set(accessibleWarehouses.map((w) => w.id));
     const knownWhIds = new Set(warehouses.map((w) => w.id));
-    const q = search.trim().toLowerCase();
+    const q = deferredSearch.trim().toLowerCase();
     return movements.filter((m) => {
       if (m.warehouseId && !allowed.has(m.warehouseId) && knownWhIds.has(m.warehouseId)) {
         return false;
@@ -272,7 +285,7 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
         (linked ? linked.name.toLowerCase().includes(q) : false)
       );
     });
-  }, [movements, accessibleWarehouses, warehouses, selectedWarehouseId, search, inventoryById]);
+  }, [movements, accessibleWarehouses, warehouses, selectedWarehouseId, deferredSearch, inventoryById]);
 
   const mislinkedMovementPairs = useMemo(() => {
     const pairs: Array<{ movement: StockMovement; wrongCard: InventoryItem }> = [];
@@ -1331,17 +1344,25 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
           </div>
         </div>
       ) : tab === 'AUDIT' && workspace ? (
-        <InventoryAuditPanel
-          items={filteredItems}
-          warehouses={accessibleWarehouses}
-          workspace={workspace}
-          activeCompanyId={activeCompany?.id || 'company_1'}
-          company={activeCompany}
-          auditorEmail={userEmail}
-          readOnly={isReadOnlyAccountant}
-          accentColor={palette.primary}
-          onNotify={notify}
-        />
+        <Suspense
+          fallback={
+            <div className="bg-white border border-slate-200 rounded-xl p-10 text-center text-xs text-slate-500">
+              Načítám fyzickou inventuru…
+            </div>
+          }
+        >
+          <InventoryAuditPanel
+            items={filteredItems}
+            warehouses={accessibleWarehouses}
+            workspace={workspace}
+            activeCompanyId={activeCompany?.id || 'company_1'}
+            company={activeCompany}
+            auditorEmail={userEmail}
+            readOnly={isReadOnlyAccountant}
+            accentColor={palette.primary}
+            onNotify={notify}
+          />
+        </Suspense>
       ) : (
         <div className="space-y-3">
           {/* Repair banners for mis-linked & orphaned receipts */}
@@ -2013,75 +2034,74 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
         </div>
       )}
 
-      {/* Advanced Bulk Price & Goods+Excise Editor Modal */}
-      {priceEditorOpen && workspace && (
-        <BulkPriceEditorModal
-          allItems={accessibleItems}
-          preselectedItems={selectedItems}
-          warehouses={accessibleWarehouses}
-          existingCategories={allWorkspaceCategories}
-          workspace={workspace}
-          accentColor={palette.primary}
-          initialTab={priceEditorTab}
-          onClose={() => setPriceEditorOpen(false)}
-          onCompleted={(msg, clearSel) => {
-            notify(msg);
-            setPriceEditorOpen(false);
-            if (clearSel) setSelectedIds(new Set());
-          }}
-          onError={(msg) => notify(msg, 'error')}
-        />
-      )}
-      {/* Bulk Action Modals */}
-      {workspace && (
-        <InventoryBulkModals
-          modal={bulkModal}
-          selectedItems={selectedItems}
-          warehouses={accessibleWarehouses}
-          existingCategories={allWorkspaceCategories}
-          workspace={workspace}
-          activeCompanyId={activeCompany?.id || 'company_1'}
-          accentColor={palette.primary}
-          onClose={() => setBulkModal(null)}
-          onCompleted={(msg, clearSel) => {
-            notify(msg);
-            setBulkModal(null);
-            if (clearSel) setSelectedIds(new Set());
-          }}
-          onError={(msg) => notify(msg, 'error')}
-        />
-      )}
-      {/* Nerx.cz Auto-Categorization Modal */}
-      {nerxTargetItems && workspace && (
-        <NerxCategorizeModal
-          items={nerxTargetItems}
-          existingCategories={allWorkspaceCategories}
-          workspace={workspace}
-          accentColor={palette.primary}
-          onClose={() => setNerxTargetItems(null)}
-          onCompleted={(msg) => {
-            notify(msg);
-            setNerxTargetItems(null);
-            setSelectedIds(new Set());
-          }}
-          onError={(msg) => notify(msg, 'error')}
-        />
-      )}
-      {/* Stock-In Document Viewer & Repair Modal */}
-      {viewingDocRef && workspace && (
-        <StockInDocumentModal
-          workspace={workspace}
-          documentRef={viewingDocRef}
-          archivedDoc={archivedByRef.get(viewingDocRef) || null}
-          movements={movements}
-          inventory={inventory}
-          warehouses={warehouses}
-          accentColor={palette.primary}
-          onClose={() => setViewingDocRef(null)}
-          onArchiveChanged={() => setArchiveTick((t) => t + 1)}
-          onNotify={notify}
-        />
-      )}
+      {/* Lazy-loaded Modals */}
+      <Suspense fallback={null}>
+        {priceEditorOpen && workspace && (
+          <BulkPriceEditorModal
+            allItems={accessibleItems}
+            preselectedItems={selectedItems}
+            warehouses={accessibleWarehouses}
+            existingCategories={allWorkspaceCategories}
+            workspace={workspace}
+            accentColor={palette.primary}
+            initialTab={priceEditorTab}
+            onClose={() => setPriceEditorOpen(false)}
+            onCompleted={(msg, clearSel) => {
+              notify(msg);
+              setPriceEditorOpen(false);
+              if (clearSel) setSelectedIds(new Set());
+            }}
+            onError={(msg) => notify(msg, 'error')}
+          />
+        )}
+        {bulkModal && workspace && (
+          <InventoryBulkModals
+            modal={bulkModal}
+            selectedItems={selectedItems}
+            warehouses={accessibleWarehouses}
+            existingCategories={allWorkspaceCategories}
+            workspace={workspace}
+            activeCompanyId={activeCompany?.id || 'company_1'}
+            accentColor={palette.primary}
+            onClose={() => setBulkModal(null)}
+            onCompleted={(msg, clearSel) => {
+              notify(msg);
+              setBulkModal(null);
+              if (clearSel) setSelectedIds(new Set());
+            }}
+            onError={(msg) => notify(msg, 'error')}
+          />
+        )}
+        {nerxTargetItems && workspace && (
+          <NerxCategorizeModal
+            items={nerxTargetItems}
+            existingCategories={allWorkspaceCategories}
+            workspace={workspace}
+            accentColor={palette.primary}
+            onClose={() => setNerxTargetItems(null)}
+            onCompleted={(msg) => {
+              notify(msg);
+              setNerxTargetItems(null);
+              setSelectedIds(new Set());
+            }}
+            onError={(msg) => notify(msg, 'error')}
+          />
+        )}
+        {viewingDocRef && workspace && (
+          <StockInDocumentModal
+            workspace={workspace}
+            documentRef={viewingDocRef}
+            archivedDoc={archivedByRef.get(viewingDocRef) || null}
+            movements={movements}
+            inventory={inventory}
+            warehouses={warehouses}
+            accentColor={palette.primary}
+            onClose={() => setViewingDocRef(null)}
+            onArchiveChanged={() => setArchiveTick((t) => t + 1)}
+            onNotify={notify}
+          />
+        )}
+      </Suspense>
     </div>
   );
 }

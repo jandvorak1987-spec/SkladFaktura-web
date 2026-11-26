@@ -11,11 +11,7 @@ import {
   X,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
-import {
-  buildStatementImportPreview,
-  decodeBankFileBuffer,
-  type StatementImportPreview,
-} from '../lib/bankParser';
+import type { StatementImportPreview } from '../lib/bankParser';
 import {
   autoMatchUnmatchedTransactionsByVs,
   ignoreBankTransaction,
@@ -116,7 +112,10 @@ export function BankMatchingView() {
     e.target.value = '';
 
     try {
-      const buffer = await file.arrayBuffer();
+      const [buffer, { decodeBankFileBuffer, buildStatementImportPreview }] = await Promise.all([
+        file.arrayBuffer(),
+        import('../lib/bankParser'),
+      ]);
       const rawContent = decodeBankFileBuffer(buffer, file.name);
       const result = buildStatementImportPreview({
         rawContent,

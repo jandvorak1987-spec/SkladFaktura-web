@@ -35,10 +35,7 @@ import {
   stripAccountantTag,
   toIsoDate,
 } from '../lib/format';
-import {
-  generateAndDownloadMonthlyAccountantPack,
-  getMonthlyPackPreviewCounts,
-} from '../lib/accountantPack';
+import { getMonthlyPackPreviewCounts } from '../lib/accountantPack';
 import {
   COMPANY_BRAND_PALETTES,
   INVOICE_TEMPLATES,
@@ -337,6 +334,7 @@ export function SettingsExportView() {
     if (!workspace || !activeCompany) return;
     setBuildingPack(true);
     try {
+      const { generateAndDownloadMonthlyAccountantPack } = await import('../lib/accountantPack');
       const result = await generateAndDownloadMonthlyAccountantPack({
         workspaceId: workspace.id,
         company: activeCompany,

@@ -8,16 +8,62 @@ import {
   type GenerateContentParameters,
   type GenerateContentResponse,
 } from '@google/genai';
+import {
+  TTL_ARES_COMPANY_MS,
+  TTL_CNB_RATES_MS,
+  TtlCache,
+  extractCandidateSupplierIco,
+} from './server-lib/ttlCache.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 3000);
-const PRIMARY_GEMINI_MODEL = 'gemini-2.5-flash';
-const FALLBACK_GEMINI_MODEL = 'gemini-2.5-flash-lite';
+// Strictly free-tier Gemini models only (zero paid models, no Google Search grounding)
+const PRIMARY_GEMINI_MODEL = 'gemini-4-hydrogen';
+const FALLBACK_GEMINI_MODEL = 'gemini-3.1-flash-lite';
+const PRIMARY_TIMEOUT_MS = 8000;
+
+interface AresSubjectPayload {
+  ico: string;
+  dic: string;
+  name: string;
+  street: string;
+  city: string;
+  zip: string;
+  legalForm: string;
+}
+
+interface CnbRatesPayload {
+  date: string;
+  rates: Record<string, number>;
+  source: 'CNB' | 'FALLBACK';
+}
+
+const aresCache = new TtlCache({ defaultTtlMs: TTL_ARES_COMPANY_MS, maxEntries: 2000 });
+const cnbCache = new TtlCache({ defaultTtlMs: TTL_CNB_RATES_MS, maxEntries: 4 });
+const inFlightAres = new Map<
+  string,
+  Promise<{ ok: true; status: number; data: AresSubjectPayload } | { ok: false; status: number; error: string }>
+>();
+let inFlightCnb: Promise<CnbRatesPayload> | null = null;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTimeoutOrAbortError(err: unknown): boolean {
+  if (!err) return false;
+  const obj = err as { name?: string; message?: string };
+  const name = String(obj.name || '').toLowerCase();
+  const msg = String(obj.message || err).toLowerCase();
+  return (
+    name === 'timeouterror' ||
+    name === 'aborterror' ||
+    msg.includes('timed out') ||
+    msg.includes('timeout') ||
+    msg.includes('aborted')
+  );
 }
 
 function isHighDemandError(err: unknown): boolean {
@@ -77,44 +123,39 @@ async function generateWithFallback(
   options?: {
     primaryModel?: string;
     fallbackModel?: string;
-    maxRetries?: number;
-    retryDelayMs?: number;
   }
 ): Promise<GenerateContentResponse> {
   const primaryModel = options?.primaryModel || PRIMARY_GEMINI_MODEL;
   const fallbackModel = options?.fallbackModel || FALLBACK_GEMINI_MODEL;
-  const maxRetries = options?.maxRetries ?? 2;
-  const retryDelayMs = options?.retryDelayMs ?? 2000;
 
   let lastError: unknown;
 
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await ai.models.generateContent({
-        ...requestParams,
-        model: primaryModel,
-      });
-    } catch (err) {
-      lastError = err;
-      if (isModelNotFoundError(err) || isQuotaExceededError(err)) {
-        break;
-      }
-      if (!isHighDemandError(err)) {
-        throw err;
-      }
-      if (attempt < maxRetries) {
-        console.warn(
-          `[ai-stock-import] Model ${primaryModel} vrátil 503/high demand (pokus ${attempt + 1}/${maxRetries + 1}), opakuji za ${retryDelayMs} ms…`
-        );
-        await sleep(retryDelayMs);
-      }
+  // Fast 8s AbortSignal timeout on primary model -> instant failover to fallback lite model
+  try {
+    return await ai.models.generateContent({
+      ...requestParams,
+      model: primaryModel,
+      config: {
+        ...requestParams.config,
+        abortSignal: AbortSignal.timeout(PRIMARY_TIMEOUT_MS),
+      },
+    });
+  } catch (err) {
+    lastError = err;
+    const shouldFailover =
+      isTimeoutOrAbortError(err) ||
+      isHighDemandError(err) ||
+      isModelNotFoundError(err) ||
+      isQuotaExceededError(err);
+    if (!shouldFailover) {
+      throw err;
     }
+    console.warn(
+      `[ai-stock-import] Primární model ${primaryModel} selhal nebo překročil 8s timeout, okamžitě přepínám na ${fallbackModel}.`
+    );
   }
 
-  console.warn(
-    `[ai-stock-import] Model ${primaryModel} není dostupný (503/429/404), přepínám na ${fallbackModel}.`
-  );
-  const fallbackDelays = [2000, 4000, 6000];
+  const fallbackDelays = [1500, 3000];
   for (let fbAttempt = 0; fbAttempt <= fallbackDelays.length; fbAttempt++) {
     try {
       return await ai.models.generateContent({
@@ -164,42 +205,46 @@ function extractVsFromMessage(message: string): string {
   return '';
 }
 
-async function startServer() {
-  const app = express();
-  app.use(express.json({ limit: '20mb' }));
+async function lookupAresServer(
+  rawIco: string
+): Promise<{ ok: true; status: number; data: AresSubjectPayload } | { ok: false; status: number; error: string }> {
+  const cleaned = String(rawIco || '').replace(/\D/g, '');
+  if (!cleaned || cleaned.length > 8) {
+    return { ok: false, status: 400, error: 'Zadejte platné 8místné IČO.' };
+  }
+  const normalizedIco = cleaned.padStart(8, '0');
+  const cached = aresCache.get(normalizedIco) as AresSubjectPayload | undefined;
+  if (cached) {
+    return { ok: true, status: 200, data: cached };
+  }
 
-  // =========================================================================
-  // 1. Official Czech Ministry of Finance ARES REST API Proxy
-  // =========================================================================
-  app.get('/api/ares/:ico', async (req, res) => {
-    const cleaned = String(req.params.ico || '').replace(/\D/g, '');
-    if (!cleaned || cleaned.length > 8) {
-      res.status(400).json({ error: 'Zadejte platné 8místné IČO.' });
-      return;
-    }
-    const normalizedIco = cleaned.padStart(8, '0');
+  const existingFlight = inFlightAres.get(normalizedIco);
+  if (existingFlight) return existingFlight;
+
+  const task = (async () => {
     const url = `https://ares.gov.cz/ekonomicke-subjekty-v-be/rest/ekonomicke-subjekty/${normalizedIco}`;
-
     try {
       const response = await fetch(url, {
         headers: {
           Accept: 'application/json',
           'User-Agent': 'SkladFaktura-Web/1.0',
         },
-        signal: AbortSignal.timeout(15000),
+        signal: AbortSignal.timeout(10000),
       });
 
       if (response.status === 404) {
-        res.status(404).json({
+        return {
+          ok: false as const,
+          status: 404,
           error: `Subjekt s IČO ${normalizedIco} nebyl v databázi ARES nalezen.`,
-        });
-        return;
+        };
       }
       if (!response.ok) {
-        res.status(response.status).json({
+        return {
+          ok: false as const,
+          status: response.status,
           error: `ARES vrátil chybu (${response.status}). Zkuste to prosím znovu.`,
-        });
-        return;
+        };
       }
 
       const json = (await response.json()) as Record<string, unknown>;
@@ -229,7 +274,7 @@ async function startServer() {
           .split(',')[0]
           .trim();
 
-      res.json({
+      const data: AresSubjectPayload = {
         ico: String(json.ico || normalizedIco).trim(),
         dic: String(json.dic || '').trim(),
         name: String(json.obchodniJmeno || '').trim() || `Neznámý subjekt (${normalizedIco})`,
@@ -237,13 +282,40 @@ async function startServer() {
         city,
         zip,
         legalForm: String(json.pravniForma || ''),
-      });
+      };
+      aresCache.set(normalizedIco, data, TTL_ARES_COMPANY_MS);
+      return { ok: true as const, status: 200, data };
     } catch (err) {
       const message = err instanceof Error ? err.message : 'chyba sítě';
-      res.status(502).json({
+      return {
+        ok: false as const,
+        status: 502,
         error: `Nepodařilo se spojit s databází ARES: ${message}`,
-      });
+      };
+    } finally {
+      inFlightAres.delete(normalizedIco);
     }
+  })();
+
+  inFlightAres.set(normalizedIco, task);
+  return task;
+}
+
+async function startServer() {
+  const app = express();
+  app.use(express.json({ limit: '20mb' }));
+
+  // =========================================================================
+  // 1. Official Czech Ministry of Finance ARES REST API Proxy (7-day TTL cache)
+  // =========================================================================
+  app.get('/api/ares/:ico', async (req, res) => {
+    const result = await lookupAresServer(String(req.params.ico || ''));
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.setHeader('Cache-Control', 'public, max-age=604800');
+    res.json(result.data);
   });
 
   // =========================================================================
@@ -340,9 +412,7 @@ async function startServer() {
   });
 
   // =========================================================================
-  // 3. Server-Side Gemini AI Smart Stock-In (Delivery Note / Invoice Extraction)
-  // =========================================================================
-  // 2b. ČNB Daily Exchange Rates Proxy
+  // 2b. ČNB Daily Exchange Rates Proxy (24-hour TTL cache)
   // =========================================================================
   const FALLBACK_CNB_RATES: Record<string, number> = {
     CZK: 1,
@@ -358,54 +428,54 @@ async function startServer() {
     CAD: 16.8,
     JPY: 0.155,
   };
-  let cachedCnb: { date: string; rates: Record<string, number>; source: 'CNB' | 'FALLBACK' } | null = null;
-  let cachedCnbAt = 0;
 
-  async function fetchCnbRatesServer(): Promise<{
-    date: string;
-    rates: Record<string, number>;
-    source: 'CNB' | 'FALLBACK';
-  }> {
-    const now = Date.now();
-    if (cachedCnb && now - cachedCnbAt < 3600_000) {
-      return cachedCnb;
-    }
-    try {
-      const response = await fetch(
-        'https://www.cnb.cz/cs/financni-trhy/devizovy-trh/kurzy-devizoveho-trhu/kurzy-devizoveho-trhu/denni_kurz.txt',
-        {
-          headers: { 'User-Agent': 'SkladFaktura-Web/1.0' },
-          signal: AbortSignal.timeout(8000),
+  async function fetchCnbRatesServer(): Promise<CnbRatesPayload> {
+    const cached = cnbCache.get('daily') as CnbRatesPayload | undefined;
+    if (cached) return cached;
+    if (inFlightCnb) return inFlightCnb;
+
+    inFlightCnb = (async (): Promise<CnbRatesPayload> => {
+      try {
+        const response = await fetch(
+          'https://www.cnb.cz/cs/financni-trhy/devizovy-trh/kurzy-devizoveho-trhu/kurzy-devizoveho-trhu/denni_kurz.txt',
+          {
+            headers: { 'User-Agent': 'SkladFaktura-Web/1.0' },
+            signal: AbortSignal.timeout(8000),
+          }
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const text = await response.text();
+        const lines = text
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter(Boolean);
+        const dateMatch = (lines[0] || '').match(/(\d{2}\.\d{2}\.\d{4})/);
+        const date = dateMatch ? dateMatch[1] : '';
+        const rates: Record<string, number> = { CZK: 1 };
+        for (let i = 2; i < lines.length; i++) {
+          const parts = lines[i].split('|');
+          if (parts.length < 5) continue;
+          const amount = Number(parts[2].replace(',', '.'));
+          const code = parts[3].trim().toUpperCase();
+          const rateVal = Number(parts[4].replace(',', '.'));
+          if (code && amount > 0 && rateVal > 0) {
+            rates[code] = Math.round((rateVal / amount) * 10000) / 10000;
+          }
         }
-      );
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const text = await response.text();
-      const lines = text
-        .split(/\r?\n/)
-        .map((l) => l.trim())
-        .filter(Boolean);
-      const dateMatch = (lines[0] || '').match(/(\d{2}\.\d{2}\.\d{4})/);
-      const date = dateMatch ? dateMatch[1] : '';
-      const rates: Record<string, number> = { CZK: 1 };
-      for (let i = 2; i < lines.length; i++) {
-        const parts = lines[i].split('|');
-        if (parts.length < 5) continue;
-        const amount = Number(parts[2].replace(',', '.'));
-        const code = parts[3].trim().toUpperCase();
-        const rateVal = Number(parts[4].replace(',', '.'));
-        if (code && amount > 0 && rateVal > 0) {
-          rates[code] = Math.round((rateVal / amount) * 10000) / 10000;
+        if (Object.keys(rates).length > 3) {
+          const payload: CnbRatesPayload = { date, rates, source: 'CNB' };
+          cnbCache.set('daily', payload, TTL_CNB_RATES_MS);
+          return payload;
         }
+        throw new Error('Neplatná odpověď ČNB');
+      } catch {
+        return { date: '', rates: { ...FALLBACK_CNB_RATES }, source: 'FALLBACK' };
+      } finally {
+        inFlightCnb = null;
       }
-      if (Object.keys(rates).length > 3) {
-        cachedCnb = { date, rates, source: 'CNB' };
-        cachedCnbAt = now;
-        return cachedCnb;
-      }
-      throw new Error('Neplatná odpověď ČNB');
-    } catch {
-      return { date: '', rates: { ...FALLBACK_CNB_RATES }, source: 'FALLBACK' };
-    }
+    })();
+
+    return inFlightCnb;
   }
 
   function normalizeCurrencyCode(raw: unknown): string {
@@ -461,11 +531,12 @@ async function startServer() {
 
   app.get('/api/cnb-rates', async (_req, res) => {
     const data = await fetchCnbRatesServer();
+    res.setHeader('Cache-Control', 'public, max-age=86400');
     res.json(data);
   });
 
   // =========================================================================
-  // 3. AI Smart Stock-In (Delivery Note / Invoice OCR & Extraction via Gemini)
+  // 3. AI Smart Stock-In (Free-tier Gemini + Parallel ARES & CNB via Promise.all)
   // =========================================================================
   app.post('/api/ai-stock-import', async (req, res) => {
     try {
@@ -474,6 +545,7 @@ async function startServer() {
       const base64Data = String(req.body?.base64Data || '').trim();
       const mimeType = String(req.body?.mimeType || '').trim();
       const fileName = String(req.body?.fileName || 'doklad').trim();
+      const candidateIco = extractCandidateSupplierIco(rawText, req.body?.supplierIco);
 
       if (!rawText && (!base64Data || !mimeType)) {
         res.status(400).json({ error: 'Nahrajte soubor (foto/PDF) nebo vložte text dokladu.' });
@@ -505,41 +577,46 @@ async function startServer() {
         });
       }
 
-      const response = await generateWithFallback(ai, {
-        contents: { parts },
-        config: {
-          systemInstruction,
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              supplierName: { type: Type.STRING },
-              supplierIco: { type: Type.STRING },
-              documentNumber: { type: Type.STRING },
-              documentType: { type: Type.STRING },
-              currency: { type: Type.STRING },
-              documentExchangeRate: { type: Type.NUMBER },
-              items: {
-                type: Type.ARRAY,
+      // Run Gemini parsing, 24h-cached CNB rates, and 7d-cached ARES validation concurrently (zero waterfall)
+      const [response, cnbData, preAresResult] = await Promise.all([
+        generateWithFallback(ai, {
+          contents: { parts },
+          config: {
+            systemInstruction,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                supplierName: { type: Type.STRING },
+                supplierIco: { type: Type.STRING },
+                documentNumber: { type: Type.STRING },
+                documentType: { type: Type.STRING },
+                currency: { type: Type.STRING },
+                documentExchangeRate: { type: Type.NUMBER },
                 items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    sku: { type: Type.STRING },
-                    name: { type: Type.STRING },
-                    ean: { type: Type.STRING },
-                    quantity: { type: Type.NUMBER },
-                    unit: { type: Type.STRING },
-                    unitPurchasePrice: { type: Type.NUMBER },
-                    vatRate: { type: Type.INTEGER },
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      sku: { type: Type.STRING },
+                      name: { type: Type.STRING },
+                      ean: { type: Type.STRING },
+                      quantity: { type: Type.NUMBER },
+                      unit: { type: Type.STRING },
+                      unitPurchasePrice: { type: Type.NUMBER },
+                      vatRate: { type: Type.INTEGER },
+                    },
+                    required: ['name', 'quantity'],
                   },
-                  required: ['name', 'quantity'],
                 },
               },
+              required: ['items'],
             },
-            required: ['items'],
           },
-        },
-      });
+        }),
+        fetchCnbRatesServer(),
+        candidateIco ? lookupAresServer(candidateIco).catch(() => null) : Promise.resolve(null),
+      ]);
 
       const parsed = JSON.parse((response.text || '{}').trim()) as {
         supplierName?: string;
@@ -561,13 +638,22 @@ async function startServer() {
 
       const currency = normalizeCurrencyCode(parsed.currency);
       const docRate = Number(parsed.documentExchangeRate || 0);
+      const parsedIco = String(parsed.supplierIco || '').replace(/\D/g, '');
+
+      let aresCompany: AresSubjectPayload | null = null;
+      if (preAresResult?.ok && (!parsedIco || parsedIco.padStart(8, '0') === candidateIco)) {
+        aresCompany = preAresResult.data;
+      } else if (parsedIco.length === 8) {
+        const aresRes = await lookupAresServer(parsedIco).catch(() => null);
+        if (aresRes?.ok) aresCompany = aresRes.data;
+      }
+
       let exchangeRate = 1;
       let exchangeRateSource: 'CZK' | 'CNB' | 'DOKLAD' | 'MANUAL' = 'CZK';
       let exchangeRateDate = '';
       let cnbRate = 1;
 
       if (currency !== 'CZK') {
-        const cnbData = await fetchCnbRatesServer();
         const rateFromCnb = Number(cnbData.rates[currency] || 0);
         cnbRate = rateFromCnb > 0 ? Math.round(rateFromCnb * 10000) / 10000 : 1;
         exchangeRateDate = cnbData.date || '';
@@ -611,8 +697,9 @@ async function startServer() {
         });
 
       res.json({
-        supplierName: String(parsed.supplierName || '').trim(),
-        supplierIco: String(parsed.supplierIco || '').replace(/\D/g, ''),
+        supplierName: String(parsed.supplierName || '').trim() || aresCompany?.name || '',
+        supplierIco: parsedIco || aresCompany?.ico || '',
+        supplierAresValidated: Boolean(aresCompany),
         documentNumber: String(parsed.documentNumber || '').trim(),
         documentType: String(parsed.documentType || 'Dodací list').trim() || 'Dodací list',
         currency,
@@ -630,10 +717,10 @@ async function startServer() {
         });
         return;
       }
-      if (isHighDemandError(err)) {
+      if (isHighDemandError(err) || isTimeoutOrAbortError(err)) {
         res.status(503).json({
           error:
-            'Servery Google Gemini jsou momentálně dočasně přetížené (chyba 503 – high demand) i po automatických opakováních a přepnutí na záložní model. Klikni prosím na „Zkusit znovu“ za 15–30 sekund.',
+            'Servery Google Gemini jsou momentálně dočasně přetížené (chyba 503 – high demand) i po přepnutí na záložní model. Klikni prosím na „Zkusit znovu“ za 15–30 sekund.',
         });
         return;
       }
@@ -643,7 +730,7 @@ async function startServer() {
   });
 
   // =========================================================================
-  // 4. Live Product Categorization via Nerx.cz (reuses Vercel handler)
+  // 4. Live Product Categorization via Nerx.cz (30d TTL cache + Promise.allSettled concurrency 5)
   // =========================================================================
   app.post('/api/nerx-categorize', async (req, res) => {
     try {

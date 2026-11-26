@@ -13,7 +13,6 @@ import {
   Users,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
-import { generateAndDownloadMonthlyAccountantPack } from '../lib/accountantPack';
 import {
   calculateInvoiceTotals,
   computeInvoiceProfitStats,
@@ -373,6 +372,7 @@ export function ReportsVatView() {
     if (!workspace || !activeCompany) return;
     setBuildingZip(true);
     try {
+      const { generateAndDownloadMonthlyAccountantPack } = await import('../lib/accountantPack');
       const res = await generateAndDownloadMonthlyAccountantPack({
         workspaceId: workspace.id,
         company: activeCompany,

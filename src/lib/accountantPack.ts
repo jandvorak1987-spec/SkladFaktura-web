@@ -8,13 +8,9 @@ import {
   timestampToMs,
   toIsoDate,
 } from './format';
-import {
-  generateCashbookPdfBytes,
-  generateInvoicePdfBytes,
-  type CashbookEntry,
-} from './pdfExport';
+import type { CashbookEntry } from './pdfExport';
 import { listArchivedStockInDocuments } from './stockInArchive';
-import { buildZipBlob, downloadBlob, type ZipEntryInput } from './zipBuilder';
+import type { ZipEntryInput } from './zipBuilder';
 
 export interface MonthlyAccountantPackSummary {
   monthKey: string;
@@ -102,6 +98,8 @@ export async function generateAndDownloadMonthlyAccountantPack(params: {
   warehouses: Warehouse[];
 }): Promise<MonthlyAccountantPackSummary> {
   const { workspaceId, company, monthKey, invoices, movements, inventory, warehouses } = params;
+  const [{ generateCashbookPdfBytes, generateInvoicePdfBytes }, { buildZipBlob, downloadBlob }] =
+    await Promise.all([import('./pdfExport'), import('./zipBuilder')]);
   const entries: ZipEntryInput[] = [];
 
   const monthInvoices = invoices

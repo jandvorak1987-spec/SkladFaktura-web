@@ -1,5 +1,8 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { QRCodeSVG } from 'qrcode.react';
+import React, { Suspense, lazy, useDeferredValue, useEffect, useMemo, useState } from 'react';
+
+const LazyQRCodeSVG = lazy(() =>
+  import('qrcode.react').then((m) => ({ default: m.QRCodeSVG }))
+);
 import {
   AlertTriangle,
   ArrowLeft,
@@ -61,7 +64,6 @@ import {
   round2,
   toIsoDate,
 } from '../lib/format';
-import { downloadPdfBytes, generateInvoicePdfBytes } from '../lib/pdfExport';
 import {
   INVOICE_TEMPLATES,
   type Client,
@@ -520,7 +522,13 @@ function InvoiceDocumentPreview({
 
           {spdPayload ? (
             <div className="flex items-center gap-3 bg-white p-2.5 rounded-lg border border-slate-200 self-start sm:self-auto shrink-0">
-              <QRCodeSVG value={spdPayload} size={92} level="M" />
+              <Suspense
+                fallback={
+                  <div className="w-[92px] h-[92px] bg-slate-100 rounded animate-pulse shrink-0" />
+                }
+              >
+                <LazyQRCodeSVG value={spdPayload} size={92} level="M" />
+              </Suspense>
               <div className="text-[11px] text-slate-600 leading-tight">
                 <p className="font-semibold text-slate-900">QR Platba</p>
                 <p className="mt-0.5">Naskenujte v</p>
@@ -767,6 +775,7 @@ export function InvoicesView({
   const [deliveryNoteMode, setDeliveryNoteMode] = useState(false);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('ALL');
   const [search, setSearch] = useState('');
+  const deferredSearch = useDeferredValue(search);
 
   // Create form state
   const [documentType, setDocumentType] = useState<InvoiceDocumentType>('INVOICE');
@@ -1126,7 +1135,7 @@ export function InvoicesView({
   }, [initialCreateTrigger]);
 
   const filteredInvoices = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = deferredSearch.trim().toLowerCase();
     return companyInvoices.filter((inv) => {
       if (statusFilter === 'OVERDUE' && !isInvoiceOverdue(inv)) return false;
       if (
@@ -1164,7 +1173,7 @@ export function InvoicesView({
         inv.clientIco.toLowerCase().includes(q)
       );
     });
-  }, [companyInvoices, statusFilter, search]);
+  }, [companyInvoices, statusFilter, deferredSearch]);
 
   const effectiveDraftVatPayer = (activeCompany?.vatPayer ?? true) && !reverseCharge;
   const draftTotals = useMemo(
@@ -1698,7 +1707,10 @@ export function InvoicesView({
             {!deliveryNoteMode && (
               <button
                 type="button"
-                onClick={() => {
+                onClick={async () => {
+                  const { downloadPdfBytes, generateInvoicePdfBytes } = await import(
+                    '../lib/pdfExport'
+                  );
                   const pdf = generateInvoicePdfBytes(selectedInvoice, activeCompany, palette);
                   downloadPdfBytes(pdf, `${selectedInvoice.invoiceNumber}.pdf`);
                   notify(`PDF dokladu ${selectedInvoice.invoiceNumber} bylo staženo.`);
@@ -2969,7 +2981,10 @@ export function InvoicesView({
                         <div className="inline-flex items-center gap-1">
                           <button
                             type="button"
-                            onClick={() => {
+                            onClick={async () => {
+                              const { downloadPdfBytes, generateInvoicePdfBytes } = await import(
+                                '../lib/pdfExport'
+                              );
                               const pdf = generateInvoicePdfBytes(inv, activeCompany, palette);
                               downloadPdfBytes(pdf, `${inv.invoiceNumber}.pdf`);
                               notify(`PDF dokladu ${inv.invoiceNumber} bylo staženo.`);

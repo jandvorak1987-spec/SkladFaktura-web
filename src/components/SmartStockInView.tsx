@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { Suspense, lazy, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Archive,
@@ -21,13 +21,12 @@ import {
   X,
 } from 'lucide-react';
 import { QtyInput, parseQtyNumber } from './QtyInput';
-import { StockInDocumentModal } from './StockInDocumentModal';
 import { useApp } from '../context/AppContext';
 import {
   areNamesCompatible,
-  findMatchingInventoryItem,
+  buildInventoryLookupIndex,
+  findMatchingInventoryItemInIndex,
   matchExtractedToInventory,
-  parseQuickStockCsv,
 } from '../lib/bankParser';
 import { commitBulkStockIn } from '../lib/firestoreService';
 import {
@@ -38,12 +37,12 @@ import {
   round2,
   timestampToMs,
 } from '../lib/format';
-import {
-  extractFileLocally,
-  extractTextLocally,
-  type LocalExtractionMethod,
-} from '../lib/localDocumentReader';
+import type { LocalExtractionMethod } from '../lib/localDocumentReader';
 import { categorizeItemsViaNerx } from '../lib/nerxCategorizer';
+
+const StockInDocumentModal = lazy(() =>
+  import('./StockInDocumentModal').then((m) => ({ default: m.StockInDocumentModal }))
+);
 import {
   listArchivedStockInDocuments,
   mapLinesToArchivedItems,
@@ -121,6 +120,7 @@ export function SmartStockInView() {
   const [archivedDocs, setArchivedDocs] = useState<ArchivedStockInDocument[]>([]);
   const [archiveTick, setArchiveTick] = useState(0);
   const [archiveSearch, setArchiveSearch] = useState('');
+  const deferredArchiveSearch = useDeferredValue(archiveSearch);
   const [viewingDocRef, setViewingDocRef] = useState<string | null>(null);
 
   useEffect(() => {
@@ -177,6 +177,19 @@ export function SmartStockInView() {
         .sort((a, b) => a.name.localeCompare(b.name, 'cs')),
     [inventory, effectiveWarehouseId]
   );
+
+  const { targetWhIndex, otherWhIndex } = useMemo(() => {
+    const whItems: InventoryItem[] = [];
+    const otherItems: InventoryItem[] = [];
+    for (const item of inventory) {
+      if (item.warehouseId === effectiveWarehouseId) whItems.push(item);
+      else otherItems.push(item);
+    }
+    return {
+      targetWhIndex: buildInventoryLookupIndex(whItems),
+      otherWhIndex: buildInventoryLookupIndex(otherItems),
+    };
+  }, [inventory, effectiveWarehouseId]);
 
   const existingCategories = useMemo(() => {
     const set = new Set<string>();
@@ -368,7 +381,10 @@ export function SmartStockInView() {
     const lower = file.name.toLowerCase();
 
     if (lower.endsWith('.csv') || lower.endsWith('.tsv')) {
-      const text = await file.text();
+      const [text, { parseQuickStockCsv }] = await Promise.all([
+        file.text(),
+        import('../lib/bankParser'),
+      ]);
       const parsed = parseQuickStockCsv(text);
       if (parsed.items.length === 0) {
         notify(`${file.name}: CSV soubor neobsahuje rozpoznatelné řádky položek.`, 'error');
@@ -387,7 +403,10 @@ export function SmartStockInView() {
     }
 
     if (lower.endsWith('.txt')) {
-      const text = await file.text();
+      const [text, { extractTextLocally }] = await Promise.all([
+        file.text(),
+        import('../lib/localDocumentReader'),
+      ]);
       const result = await extractTextLocally(text, { ownCompanyIco: activeCompany?.ico });
       return {
         id: `q_${Date.now()}_${index}_${Math.random().toString(36).slice(2, 6)}`,
@@ -405,6 +424,7 @@ export function SmartStockInView() {
 
     if (engine === 'LOCAL' || isXmlFile) {
       setProgressText(`${prefix}Zpracovávám doklad lokálně bez AI…`);
+      const { extractFileLocally } = await import('../lib/localDocumentReader');
       const result = await extractFileLocally(file, {
         ownCompanyIco: activeCompany?.ico,
         onProgress: (label) => setProgressText(`${prefix}${label}`),
@@ -595,6 +615,7 @@ export function SmartStockInView() {
     setLastExtractError(null);
     try {
       if (engine === 'LOCAL') {
+        const { extractTextLocally } = await import('../lib/localDocumentReader');
         const result = await extractTextLocally(rawText.trim(), {
           ownCompanyIco: activeCompany?.ico,
         });
@@ -643,11 +664,12 @@ export function SmartStockInView() {
     }
   };
 
-  const handleParseCsv = () => {
+  const handleParseCsv = async () => {
     if (!csvText.trim()) {
       notify('Vložte CSV nebo TSV řádky (SKU;Název;Množství;MJ;Nákupní cena;DPH).', 'error');
       return;
     }
+    const { parseQuickStockCsv } = await import('../lib/bankParser');
     const parsed = parseQuickStockCsv(csvText);
     if (parsed.items.length === 0) {
       notify('Nepodařilo se načíst žádné položky. Zkontrolujte oddělovač (středník/tabulátor).', 'error');
@@ -674,9 +696,6 @@ export function SmartStockInView() {
     const shouldRematch =
       (patch.sku !== undefined || patch.name !== undefined || patch.ean !== undefined) &&
       patch.matchedInventoryId === undefined;
-    const otherWhInventory = shouldRematch
-      ? inventory.filter((i) => i.warehouseId !== effectiveWarehouseId)
-      : [];
 
     setNote({
       ...note,
@@ -684,7 +703,7 @@ export function SmartStockInView() {
         if (line.id !== id) return line;
         const updated = { ...line, ...patch };
         if (shouldRematch && !updated.manualMatchLock) {
-          const matched = findMatchingInventoryItem(updated, targetWhInventory);
+          const matched = findMatchingInventoryItemInIndex(updated, targetWhIndex);
           if (matched) {
             return {
               ...updated,
@@ -693,7 +712,7 @@ export function SmartStockInView() {
               matchedOtherWarehouseId: null,
             };
           }
-          const otherMatch = findMatchingInventoryItem(updated, otherWhInventory);
+          const otherMatch = findMatchingInventoryItemInIndex(updated, otherWhIndex);
           return {
             ...updated,
             matchedInventoryId: null,
@@ -708,9 +727,7 @@ export function SmartStockInView() {
 
   const handleManualMatchChange = (lineId: string, selectedInventoryId: string) => {
     if (!note) return;
-    const chosen = selectedInventoryId
-      ? inventory.find((i) => i.id === selectedInventoryId) || null
-      : null;
+    const chosen = selectedInventoryId ? inventoryById.get(selectedInventoryId) || null : null;
     updateLine(lineId, {
       matchedInventoryId: chosen?.id || null,
       matchedItemName: chosen?.name || null,
@@ -1001,7 +1018,7 @@ export function SmartStockInView() {
       }
     }
 
-    const q = archiveSearch.trim().toLowerCase();
+    const q = deferredArchiveSearch.trim().toLowerCase();
     return Array.from(byRef.values())
       .filter((entry) => {
         if (!q) return true;
@@ -1012,7 +1029,7 @@ export function SmartStockInView() {
         );
       })
       .sort((a, b) => b.latestMs - a.latestMs);
-  }, [archivedDocs, movements, inventoryById, archiveSearch]);
+  }, [archivedDocs, movements, inventoryById, deferredArchiveSearch]);
 
   const docCurrency = (note?.currency || 'CZK').toUpperCase();
   const isForeignCurrency = docCurrency !== 'CZK';
@@ -1914,20 +1931,22 @@ export function SmartStockInView() {
 
       {/* Document Archive Viewer Modal */}
       {viewingDocRef && workspace && (
-        <StockInDocumentModal
-          workspace={workspace}
-          documentRef={viewingDocRef}
-          archivedDoc={
-            mergedArchiveEntries.find((e) => e.documentRef === viewingDocRef)?.archivedDoc || null
-          }
-          movements={movements}
-          inventory={inventory}
-          warehouses={warehouses}
-          accentColor={palette.primary}
-          onClose={() => setViewingDocRef(null)}
-          onArchiveChanged={() => setArchiveTick((t) => t + 1)}
-          onNotify={notify}
-        />
+        <Suspense fallback={null}>
+          <StockInDocumentModal
+            workspace={workspace}
+            documentRef={viewingDocRef}
+            archivedDoc={
+              mergedArchiveEntries.find((e) => e.documentRef === viewingDocRef)?.archivedDoc || null
+            }
+            movements={movements}
+            inventory={inventory}
+            warehouses={warehouses}
+            accentColor={palette.primary}
+            onClose={() => setViewingDocRef(null)}
+            onArchiveChanged={() => setArchiveTick((t) => t + 1)}
+            onNotify={notify}
+          />
+        </Suspense>
       )}
     </div>
   );

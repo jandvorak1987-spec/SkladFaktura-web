@@ -1,5 +1,7 @@
-// Vercel Serverless Function: Live product categorization against Nerx.cz (Shoptet)
-// with smart fallback rules — zero AI quota, zero 503 errors.
+// Vercel Serverless Function & Express handler: Live product categorization against Nerx.cz (Shoptet)
+// with 30-day in-memory TTL cache and Promise.allSettled parallel batching (concurrency limit 5).
+
+import { TTL_NERX_CATEGORY_MS, TtlCache } from '../server-lib/ttlCache.js';
 
 const COLOR_AND_NOISE_WORDS = new Set([
   'black', 'white', 'red', 'blue', 'green', 'pink', 'purple', 'brown', 'grey', 'gray',
@@ -9,6 +11,11 @@ const COLOR_AND_NOISE_WORDS = new Set([
   'cerna', 'bila', 'cervena', 'modra', 'zelena', 'ruzova', 'fialova', 'hneda', 'seda',
   'stribrna', 'zlata', 'oranzova', 'zluta', 'svetle', 'tmave', 'ks', 'pcs', 'bal',
 ]);
+
+// Persistent server-level 30-day TTL caches
+const productCategoryCache = new TtlCache({ defaultTtlMs: TTL_NERX_CATEGORY_MS, maxEntries: 5000 });
+const searchQueryCache = new TtlCache({ defaultTtlMs: TTL_NERX_CATEGORY_MS, maxEntries: 3000 });
+const productPageCache = new TtlCache({ defaultTtlMs: TTL_NERX_CATEGORY_MS, maxEntries: 3000 });
 
 function decodeHtmlEntities(str) {
   return String(str || '')
@@ -39,6 +46,12 @@ function buildCoreQuery(name) {
   return tokens.slice(0, 5).join(' ').trim();
 }
 
+function buildProductCacheKey(name, ean) {
+  const normName = normalizeTokens(name).join(' ');
+  const cleanEan = String(ean || '').replace(/\D/g, '');
+  return cleanEan.length >= 8 ? `${cleanEan}|${normName}` : normName;
+}
+
 function scoreTitleMatch(queryName, candidateTitle) {
   const qTokens = normalizeTokens(queryName);
   const cTokens = normalizeTokens(candidateTitle);
@@ -49,15 +62,15 @@ function scoreTitleMatch(queryName, candidateTitle) {
 
   for (const qt of qTokens) {
     if (cSet.has(qt)) {
-      // Variant tokens (numbers, lite, pro, go2, se, sq, max, mini, salt, cartridge) weigh extra
-      const isVariant = /\d/.test(qt) || ['lite', 'pro', 'se', 'sq', 'max', 'mini', 'plus', 'ultra', 'cartridge', 'pod', 'salt', 'coil', 'hlava'].includes(qt);
+      const isVariant =
+        /\d/.test(qt) ||
+        ['lite', 'pro', 'se', 'sq', 'max', 'mini', 'plus', 'ultra', 'cartridge', 'pod', 'salt', 'coil', 'hlava'].includes(qt);
       score += isVariant ? 3 : 2;
     } else if (!COLOR_AND_NOISE_WORDS.has(qt)) {
       score -= 1;
     }
   }
 
-  // Slight penalty for extra non-color words in candidate
   const qSet = new Set(qTokens);
   for (const ct of cTokens) {
     if (!qSet.has(ct) && !COLOR_AND_NOISE_WORDS.has(ct)) {
@@ -103,7 +116,7 @@ async function fetchText(url) {
       'User-Agent': 'Mozilla/5.0 (compatible; SkladFaktura/1.0)',
       'Accept-Language': 'cs-CZ,cs;q=0.9',
     },
-    signal: AbortSignal.timeout(9000),
+    signal: AbortSignal.timeout(8000),
   });
   if (!res.ok) return '';
   return await res.text();
@@ -112,8 +125,8 @@ async function fetchText(url) {
 function extractSearchCandidates(html) {
   const results = [];
   const seen = new Set();
-  // Match Shoptet product links (<a href="/.../" class="name" ...>Title</a>)
-  const re = /<a\b[^>]*href="(\/[^"#?]+)"[^>]*class="[^"]*\bname\b[^"]*"[^>]*>([\s\S]*?)<\/a>|<a\b[^>]*class="[^"]*\bname\b[^"]*"[^>]*href="(\/[^"#?]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  const re =
+    /<a\b[^>]*href="(\/[^"#?]+)"[^>]*class="[^"]*\bname\b[^"]*"[^>]*>([\s\S]*?)<\/a>|<a\b[^>]*class="[^"]*\bname\b[^"]*"[^>]*href="(\/[^"#?]+)"[^>]*>([\s\S]*?)<\/a>/gi;
   let m;
   while ((m = re.exec(html)) !== null && results.length < 16) {
     const href = m[1] || m[3] || '';
@@ -127,13 +140,11 @@ function extractSearchCandidates(html) {
 }
 
 function extractCategoryFromProductHtml(html) {
-  // 1. Schema.org BreadcrumbList (most reliable on Shoptet / Nerx.cz)
   const bcBlock = html.match(/itemtype="https?:\/\/schema\.org\/BreadcrumbList"[\s\S]{0,3500}<\/div>/i);
   if (bcBlock) {
     const crumbs = [...bcBlock[0].matchAll(/itemprop="name"[^>]*>([\s\S]*?)<\/span>/gi)]
       .map((m) => decodeHtmlEntities(m[1].replace(/<[^>]+>/g, ' ')))
       .filter((c) => c && c.toLowerCase() !== 'domů' && c.toLowerCase() !== 'home');
-    // Breadcrumbs typically are: [Category, (Subcategory...), Product Name]
     if (crumbs.length >= 2) {
       const catParts = crumbs.slice(0, -1).filter(Boolean);
       if (catParts.length > 0) {
@@ -142,7 +153,6 @@ function extractCategoryFromProductHtml(html) {
     }
   }
 
-  // 2. Shoptet dataLayer "category": "..."
   const dlMatch = html.match(/"category"\s*:\s*"([^"]{2,100})"/i);
   if (dlMatch) {
     const cat = decodeHtmlEntities(dlMatch[1]);
@@ -152,11 +162,8 @@ function extractCategoryFromProductHtml(html) {
   return '';
 }
 
-async function lookupOnNerx(item, queryCache, pageCache) {
-  const name = String(item.name || '').trim();
-  const ean = String(item.ean || '').replace(/\D/g, '');
+async function lookupOnNerxUncached(name, ean) {
   const coreQuery = buildCoreQuery(name);
-
   const queriesToTry = [];
   if (ean.length >= 8) queriesToTry.push(ean);
   if (name.length >= 2) queriesToTry.push(name);
@@ -164,45 +171,51 @@ async function lookupOnNerx(item, queryCache, pageCache) {
     queriesToTry.push(coreQuery);
   }
 
-  let bestCandidate = null;
-  for (const q of queriesToTry) {
-    const cacheKey = q.toLowerCase();
-    let candidates = queryCache.get(cacheKey);
-    if (!candidates) {
-      const searchUrl = `https://www.nerx.cz/vyhledavani/?string=${encodeURIComponent(q)}`;
-      const html = await fetchText(searchUrl).catch(() => '');
-      candidates = html ? extractSearchCandidates(html) : [];
-      queryCache.set(cacheKey, candidates);
-    }
+  // Run search queries concurrently when multiple queries are needed, then pick highest-priority hit
+  const searchResults = await Promise.allSettled(
+    queriesToTry.map(async (q) => {
+      const qKey = q.toLowerCase();
+      let candidates = searchQueryCache.get(qKey);
+      if (candidates === undefined) {
+        const searchUrl = `https://www.nerx.cz/vyhledavani/?string=${encodeURIComponent(q)}`;
+        const html = await fetchText(searchUrl).catch(() => '');
+        candidates = html ? extractSearchCandidates(html) : [];
+        searchQueryCache.set(qKey, candidates);
+      }
+      return { q, candidates };
+    })
+  );
 
-    if (candidates.length > 0) {
-      let best = candidates[0];
-      let bestScore = scoreTitleMatch(name, best.title);
-      for (let i = 1; i < candidates.length; i++) {
-        const s = scoreTitleMatch(name, candidates[i].title);
-        if (s > bestScore) {
-          bestScore = s;
-          best = candidates[i];
-        }
+  let bestCandidate = null;
+  for (const settled of searchResults) {
+    if (settled.status !== 'fulfilled') continue;
+    const { q, candidates } = settled.value;
+    if (candidates.length === 0) continue;
+
+    let best = candidates[0];
+    let bestScore = scoreTitleMatch(name, best.title);
+    for (let i = 1; i < candidates.length; i++) {
+      const s = scoreTitleMatch(name, candidates[i].title);
+      if (s > bestScore) {
+        bestScore = s;
+        best = candidates[i];
       }
-      // Require at least minimal token relevance unless searched by exact EAN
-      if (q === ean || bestScore >= 1.5) {
-        bestCandidate = best;
-        break;
-      }
+    }
+    if (q === ean || bestScore >= 1.5) {
+      bestCandidate = best;
+      break;
     }
   }
 
   if (bestCandidate) {
-    let category = pageCache.get(bestCandidate.href);
+    let category = productPageCache.get(bestCandidate.href);
     if (category === undefined) {
       const prodHtml = await fetchText(`https://www.nerx.cz${bestCandidate.href}`).catch(() => '');
       category = prodHtml ? extractCategoryFromProductHtml(prodHtml) : '';
-      pageCache.set(bestCandidate.href, category);
+      productPageCache.set(bestCandidate.href, category);
     }
     if (category) {
       return {
-        id: item.id,
         category,
         source: 'NERX',
         matchedTitle: bestCandidate.title,
@@ -213,12 +226,108 @@ async function lookupOnNerx(item, queryCache, pageCache) {
 
   const ruleCat = fallbackRuleCategory(name);
   return {
-    id: item.id,
     category: ruleCat,
     source: ruleCat ? 'RULE' : 'NONE',
     matchedTitle: '',
     matchedUrl: '',
   };
+}
+
+/**
+ * Processes items in parallel batches of size `concurrency` using Promise.allSettled.
+ */
+async function mapBatchesAllSettled(items, concurrency, fn) {
+  const out = new Array(items.length);
+  for (let start = 0; start < items.length; start += concurrency) {
+    const slice = items.slice(start, start + concurrency);
+    const settled = await Promise.allSettled(slice.map((item, offset) => fn(item, start + offset)));
+    for (let j = 0; j < settled.length; j++) {
+      out[start + j] = settled[j];
+    }
+  }
+  return out;
+}
+
+export async function categorizeItemsViaNerxServer(rawItems) {
+  const items = (Array.isArray(rawItems) ? rawItems : [])
+    .filter((i) => i && typeof i.name === 'string' && i.name.trim().length > 0)
+    .slice(0, 60);
+
+  if (items.length === 0) return [];
+
+  const results = new Array(items.length);
+  // Group cache misses by deduplicated product cache key so identical names are fetched only once
+  const unknownByKey = new Map();
+
+  for (let idx = 0; idx < items.length; idx++) {
+    const item = items[idx];
+    const name = String(item.name || '').trim();
+    const ean = String(item.ean || '').replace(/\D/g, '');
+    const cacheKey = buildProductCacheKey(name, ean);
+
+    const cached = productCategoryCache.get(cacheKey);
+    if (cached) {
+      results[idx] = {
+        id: item.id,
+        category: cached.category,
+        source: cached.source,
+        matchedTitle: cached.matchedTitle,
+        matchedUrl: cached.matchedUrl,
+      };
+      continue;
+    }
+
+    const existingGroup = unknownByKey.get(cacheKey);
+    if (existingGroup) {
+      existingGroup.targets.push({ idx, id: item.id });
+    } else {
+      unknownByKey.set(cacheKey, {
+        cacheKey,
+        name,
+        ean,
+        targets: [{ idx, id: item.id }],
+      });
+    }
+  }
+
+  const unknownList = Array.from(unknownByKey.values());
+  if (unknownList.length > 0) {
+    const settledBatches = await mapBatchesAllSettled(unknownList, 5, async (entry) => {
+      const resolved = await lookupOnNerxUncached(entry.name, entry.ean);
+      productCategoryCache.set(entry.cacheKey, resolved, TTL_NERX_CATEGORY_MS);
+      return { entry, resolved };
+    });
+
+    for (let i = 0; i < settledBatches.length; i++) {
+      const settled = settledBatches[i];
+      const entry = unknownList[i];
+      if (settled.status === 'fulfilled') {
+        const { resolved } = settled.value;
+        for (const t of entry.targets) {
+          results[t.idx] = {
+            id: t.id,
+            category: resolved.category,
+            source: resolved.source,
+            matchedTitle: resolved.matchedTitle,
+            matchedUrl: resolved.matchedUrl,
+          };
+        }
+      } else {
+        const ruleCat = fallbackRuleCategory(entry.name);
+        for (const t of entry.targets) {
+          results[t.idx] = {
+            id: t.id,
+            category: ruleCat,
+            source: ruleCat ? 'RULE' : 'NONE',
+            matchedTitle: '',
+            matchedUrl: '',
+          };
+        }
+      }
+    }
+  }
+
+  return results;
 }
 
 export default async function handler(req, res) {
@@ -228,30 +337,10 @@ export default async function handler(req, res) {
 
   try {
     const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
-    const items = rawItems
-      .filter((i) => i && typeof i.name === 'string' && i.name.trim().length > 0)
-      .slice(0, 60);
-
-    if (items.length === 0) {
+    const results = await categorizeItemsViaNerxServer(rawItems);
+    if (results.length === 0) {
       return res.status(400).json({ error: 'Nebyla předána žádná položka ke kategorizaci.' });
     }
-
-    const queryCache = new Map();
-    const pageCache = new Map();
-    const results = new Array(items.length);
-
-    // Polite concurrency = 4
-    let cursor = 0;
-    const workerCount = Math.min(4, items.length);
-    await Promise.all(
-      Array.from({ length: workerCount }, async () => {
-        while (cursor < items.length) {
-          const idx = cursor++;
-          results[idx] = await lookupOnNerx(items[idx], queryCache, pageCache);
-        }
-      })
-    );
-
     return res.status(200).json({ results });
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'neznámá chyba';
