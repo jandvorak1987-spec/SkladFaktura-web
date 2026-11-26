@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Download,
+  Edit3,
   FileText,
   GitBranch,
   Loader2,
@@ -10,8 +11,10 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
+import { DeleteMovementModal, EditMovementModal } from './StockMovementModals';
 import { areNamesCompatible } from '../lib/bankParser';
 import {
+  bulkRestoreOrphanMovements,
   restoreOrphanMovementToInventory,
   splitMislinkedMovements,
 } from '../lib/firestoreService';
@@ -31,6 +34,7 @@ interface StockInDocumentModalProps {
   inventory: InventoryItem[];
   warehouses: Warehouse[];
   accentColor: string;
+  readOnly?: boolean;
   onClose: () => void;
   onArchiveChanged: () => void;
   onNotify: (msg: string, tone?: 'success' | 'error' | 'info') => void;
@@ -44,6 +48,7 @@ export function StockInDocumentModal({
   inventory,
   warehouses,
   accentColor,
+  readOnly = false,
   onClose,
   onArchiveChanged,
   onNotify,
@@ -54,6 +59,11 @@ export function StockInDocumentModal({
   const [textPreview, setTextPreview] = useState<string>('');
   const [busyId, setBusyId] = useState<string | null>(null);
   const [attaching, setAttaching] = useState(false);
+  const [editingMovement, setEditingMovement] = useState<StockMovement | null>(null);
+  const [deletingMovements, setDeletingMovements] = useState<{
+    movements: StockMovement[];
+    title?: string;
+  } | null>(null);
 
   useEffect(() => {
     setLocalDoc(archivedDoc || null);
@@ -115,6 +125,11 @@ export function StockInDocumentModal({
     }
     return out;
   }, [docMovements, inventoryById]);
+
+  const orphanDocMovements = useMemo(
+    () => docMovements.filter((mov) => !(mov.itemId && inventoryById.has(mov.itemId))),
+    [docMovements, inventoryById]
+  );
 
   const totalValue = useMemo(
     () =>
@@ -230,14 +245,42 @@ export function StockInDocumentModal({
   const handleRestoreOrphan = async (mov: StockMovement) => {
     setBusyId(mov.id);
     try {
-      await restoreOrphanMovementToInventory({
+      const count = await restoreOrphanMovementToInventory({
         workspace,
         movement: mov,
         existingInventory: inventory,
       });
-      onNotify(`Karta „${mov.itemName}“ (+${formatQty(mov.quantityDelta)} ${mov.unit}) zapsána na sklad.`);
+      if (count === 0) {
+        onNotify('Recyklační poplatek se na sklad nepřidává — můžete tento pohyb odstranit.', 'info');
+      } else {
+        onNotify(`Karta „${mov.itemName}“ (+${formatQty(mov.quantityDelta)} ${mov.unit}) zapsána na sklad.`);
+      }
     } catch (err) {
       onNotify(err instanceof Error ? err.message : 'Zápis na sklad selhal.', 'error');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleRestoreAllOrphansInDoc = async () => {
+    if (orphanDocMovements.length === 0) return;
+    setBusyId('ALL_ORPHAN');
+    try {
+      const count = await bulkRestoreOrphanMovements({
+        workspace,
+        movements: orphanDocMovements,
+        existingInventory: inventory,
+      });
+      if (count === 0) {
+        onNotify(
+          'Chybějící položky jsou pouze recyklační poplatky — ty se na sklad nepřidávají (můžete je odstranit).',
+          'info'
+        );
+      } else {
+        onNotify(`Zapsáno ${count} chybějících položek z dokladu na sklad.`);
+      }
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Hromadný zápis na sklad selhal.', 'error');
     } finally {
       setBusyId(null);
     }
@@ -380,17 +423,65 @@ export function StockInDocumentModal({
                   </p>
                 </div>
               </div>
-              <button
-                type="button"
-                disabled={busyId === 'ALL_SPLIT'}
-                onClick={handleSplitAllInDoc}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-amber-700 hover:bg-amber-800 rounded-lg shrink-0 disabled:opacity-60"
-              >
-                <GitBranch className="w-3.5 h-3.5" />
-                {busyId === 'ALL_SPLIT'
-                  ? 'Odděluji…'
-                  : `Oddělit vše na vlastní karty (${mislinkedPairs.length})`}
-              </button>
+              {!readOnly && (
+                <button
+                  type="button"
+                  disabled={busyId === 'ALL_SPLIT'}
+                  onClick={handleSplitAllInDoc}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-amber-700 hover:bg-amber-800 rounded-lg shrink-0 disabled:opacity-60"
+                >
+                  <GitBranch className="w-3.5 h-3.5" />
+                  {busyId === 'ALL_SPLIT'
+                    ? 'Odděluji…'
+                    : `Oddělit vše na vlastní karty (${mislinkedPairs.length})`}
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Orphan warning inside document */}
+          {orphanDocMovements.length > 0 && (
+            <div className="bg-red-50 border border-red-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5">
+                <AlertTriangle className="w-4 h-4 text-red-700 mt-0.5 shrink-0" />
+                <div className="text-xs text-red-950">
+                  <p className="font-semibold">
+                    U tohoto dokladu chybí {orphanDocMovements.length} položek ve skladu
+                  </p>
+                  <p className="mt-0.5 text-red-800">
+                    Můžete je zapsat na sklad, ručně upravit nebo odstranit z deníku pohybů.
+                  </p>
+                </div>
+              </div>
+              {!readOnly && (
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    disabled={busyId === 'ALL_ORPHAN'}
+                    onClick={() =>
+                      setDeletingMovements({
+                        movements: orphanDocMovements,
+                        title: `Odstranit ${orphanDocMovements.length} chybějících pohybů z dokladu?`,
+                      })
+                    }
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-red-800 bg-white border border-red-300 hover:bg-red-100 rounded-lg disabled:opacity-60"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    Odstranit chybějící ({orphanDocMovements.length})
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busyId === 'ALL_ORPHAN'}
+                    onClick={handleRestoreAllOrphansInDoc}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg disabled:opacity-60"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    {busyId === 'ALL_ORPHAN'
+                      ? 'Zapisuji…'
+                      : `Zapsat vše na sklad (${orphanDocMovements.length})`}
+                  </button>
+                </div>
+              )}
             </div>
           )}
 
@@ -466,29 +557,55 @@ export function StockInDocumentModal({
                             {formatCzk(mov.unitPrice || 0)}
                           </td>
                           <td className="py-2.5 px-3 text-right whitespace-nowrap">
-                            {isMislinked && card ? (
-                              <button
-                                type="button"
-                                disabled={busyId === mov.id}
-                                onClick={() => handleSplitSingle(mov, card)}
-                                className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium text-amber-900 bg-amber-100 hover:bg-amber-200 border border-amber-300 rounded-md disabled:opacity-50"
-                              >
-                                <GitBranch className="w-3 h-3" />
-                                {busyId === mov.id ? 'Odděluji…' : 'Oddělit na vlastní kartu'}
-                              </button>
-                            ) : !card ? (
-                              <button
-                                type="button"
-                                disabled={busyId === mov.id}
-                                onClick={() => handleRestoreOrphan(mov)}
-                                className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-md disabled:opacity-50"
-                              >
-                                <RotateCcw className="w-3 h-3" />
-                                {busyId === mov.id ? 'Zapisuji…' : 'Zapsat na sklad'}
-                              </button>
-                            ) : (
-                              <span className="text-[11px] text-emerald-700 font-medium">V pořádku</span>
-                            )}
+                            <div className="inline-flex items-center justify-end gap-1.5">
+                              {!readOnly && isMislinked && card ? (
+                                <button
+                                  type="button"
+                                  disabled={busyId === mov.id}
+                                  onClick={() => handleSplitSingle(mov, card)}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium text-amber-900 bg-amber-100 hover:bg-amber-200 border border-amber-300 rounded-md disabled:opacity-50"
+                                >
+                                  <GitBranch className="w-3 h-3" />
+                                  {busyId === mov.id ? 'Odděluji…' : 'Oddělit'}
+                                </button>
+                              ) : !readOnly && !card ? (
+                                <button
+                                  type="button"
+                                  disabled={busyId === mov.id}
+                                  onClick={() => handleRestoreOrphan(mov)}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-md disabled:opacity-50"
+                                >
+                                  <RotateCcw className="w-3 h-3" />
+                                  {busyId === mov.id ? 'Zapisuji…' : 'Zapsat na sklad'}
+                                </button>
+                              ) : (
+                                <span className="text-[11px] text-emerald-700 font-medium mr-1">
+                                  V pořádku
+                                </span>
+                              )}
+                              {!readOnly && (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={() => setEditingMovement(mov)}
+                                    className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 rounded-md"
+                                    title="Ručně upravit pohyb"
+                                  >
+                                    <Edit3 className="w-3 h-3" />
+                                    Upravit
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setDeletingMovements({ movements: [mov] })}
+                                    className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-red-700 bg-white hover:bg-red-50 border border-red-200 rounded-md"
+                                    title="Odstranit pohyb"
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                    Odstranit
+                                  </button>
+                                </>
+                              )}
+                            </div>
                           </td>
                         </tr>
                       );
@@ -500,6 +617,36 @@ export function StockInDocumentModal({
           </div>
         </div>
       </div>
+
+      {editingMovement && (
+        <EditMovementModal
+          workspace={workspace}
+          movement={editingMovement}
+          inventory={inventory}
+          warehouses={warehouses}
+          accentColor={accentColor}
+          onClose={() => setEditingMovement(null)}
+          onSaved={(msg) => {
+            onNotify(msg);
+            setEditingMovement(null);
+          }}
+          onError={(msg) => onNotify(msg, 'error')}
+        />
+      )}
+      {deletingMovements && (
+        <DeleteMovementModal
+          workspace={workspace}
+          movements={deletingMovements.movements}
+          inventory={inventory}
+          title={deletingMovements.title}
+          onClose={() => setDeletingMovements(null)}
+          onDeleted={(msg) => {
+            onNotify(msg);
+            setDeletingMovements(null);
+          }}
+          onError={(msg) => onNotify(msg, 'error')}
+        />
+      )}
     </div>
   );
 }

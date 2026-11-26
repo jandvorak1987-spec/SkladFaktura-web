@@ -330,6 +330,57 @@ export function buildStatementImportPreview(params: {
 }
 
 /**
+ * Returns true if a line represents a statutory recycling fee / PHE contribution
+ * (elektrozařízení, baterie, zpětný odběr, WEEE) that must NEVER be added to stock.
+ */
+export function isNonStockRecyclingFee(name: string, sku = ''): boolean {
+  const normName = String(name || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (normName) {
+    if (
+      /recyklacni\s*(poplatek|prispevek|priplatek|popl\.?|prisp\.?)/.test(normName) ||
+      /\brec\.?\s*(poplatek|prispevek|popl\.?|prisp\.?)\b/.test(normName) ||
+      /\b(poplatek|prispevek|priplatek)\s+(za|na|k)\s+recyklac/.test(normName) ||
+      /^\s*recyklac(e|ni)\b/.test(normName) ||
+      /\brecyklac(e|ni)\s+(elektro|bater|zariz|odpad)/.test(normName) ||
+      /\b(recycling|weee)\s*(fee|charge|contribution|levy)\b/.test(normName) ||
+      /\b(eko|eco)\s*[- ]?(poplatek|prispevek)\b/.test(normName) ||
+      /\b(elektroodpad|zpetny\s+odber|historick\w*\s+elektrozariz)/.test(normName) ||
+      /^\s*phe(\s*[-–:/(].*)?$/.test(normName) ||
+      /\bphe\b.*\b(poplatek|prispevek|recykl|elektro|bater)/.test(normName) ||
+      /\b(poplatek|prispevek)\b.*\bphe\b/.test(normName) ||
+      /\b(asekol|elektrowin|retela|ecobat|rema\s+system)\b/.test(normName)
+    ) {
+      return true;
+    }
+  }
+
+  const normSku = String(sku || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+
+  if (
+    normSku === 'phe' ||
+    normSku === 'weee' ||
+    normSku === 'recyklace' ||
+    normSku.startsWith('recyklacnipopl') ||
+    normSku.startsWith('recpopl') ||
+    normSku.startsWith('ekopopl')
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
  * Local CSV/TSV parser for Smart Stock-In (mirrors AiStockImportService.parseCsvQuickly).
  */
 export function parseQuickStockCsv(rawCsv: string): ExtractedDeliveryNote {
@@ -349,6 +400,9 @@ export function parseQuickStockCsv(rawCsv: string): ExtractedDeliveryNote {
     if (cols.length >= 2) {
       const sku = (cols[0] || `IMP-${idx + 1}`).slice(0, 64);
       const name = (cols[1] || sku).slice(0, 200);
+      if (isNonStockRecyclingFee(name, sku)) {
+        return;
+      }
       const quantity = Math.max(0.01, Number((cols[2] || '1').replace(',', '.')) || 1);
       const unit = (cols[3] || 'ks').slice(0, 20);
       const purchasePrice = Math.max(0, round2(Number((cols[4] || '0').replace(',', '.')) || 0));

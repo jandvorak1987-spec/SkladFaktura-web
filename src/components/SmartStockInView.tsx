@@ -26,6 +26,7 @@ import {
   areNamesCompatible,
   buildInventoryLookupIndex,
   findMatchingInventoryItemInIndex,
+  isNonStockRecyclingFee,
   matchExtractedToInventory,
 } from '../lib/bankParser';
 import { commitBulkStockIn } from '../lib/firestoreService';
@@ -238,14 +239,16 @@ export function SmartStockInView() {
       currency,
       exchangeRate,
       exchangeRateSource: raw.exchangeRateSource || (currency === 'CZK' ? 'CZK' : 'MANUAL'),
-      items: raw.items.map((item) => ({
-        ...item,
-        unit: sanitizeExtractedUnit(item.unit),
-        originalPurchasePrice:
-          item.originalPurchasePrice !== undefined
-            ? item.originalPurchasePrice
-            : item.purchasePrice,
-      })),
+      items: raw.items
+        .filter((item) => !isNonStockRecyclingFee(item.name, item.sku))
+        .map((item) => ({
+          ...item,
+          unit: sanitizeExtractedUnit(item.unit),
+          originalPurchasePrice:
+            item.originalPurchasePrice !== undefined
+              ? item.originalPurchasePrice
+              : item.purchasePrice,
+        })),
     };
     const matched = matchExtractedToInventory(normalized, inventory, whId);
     return {
@@ -831,11 +834,17 @@ export function SmartStockInView() {
 
   const handleCommitActive = async () => {
     if (!workspace || !activeDoc) return;
-    const selected = activeDoc.note.items.filter(
+    const rawSelected = activeDoc.note.items.filter(
       (i) => i.selected && i.name.trim() && i.quantity > 0
     );
+    const selected = rawSelected.filter((i) => !isNonStockRecyclingFee(i.name, i.sku));
     if (selected.length === 0) {
-      notify('Vyberte alespoň jednu platnou položku k naskladnění.', 'error');
+      notify(
+        rawSelected.length > 0
+          ? 'Recyklační poplatek se na sklad nepřidává. Vyberte prosím skladové zboží.'
+          : 'Vyberte alespoň jednu platnou položku k naskladnění.',
+        'error'
+      );
       return;
     }
     setCommitting(true);
@@ -869,10 +878,12 @@ export function SmartStockInView() {
   const handleCommitAllQueued = async () => {
     if (!workspace || queuedDocs.length === 0) return;
     const validDocs = queuedDocs.filter((d) =>
-      d.note.items.some((i) => i.selected && i.name.trim() && i.quantity > 0)
+      d.note.items.some(
+        (i) => i.selected && i.name.trim() && i.quantity > 0 && !isNonStockRecyclingFee(i.name, i.sku)
+      )
     );
     if (validDocs.length === 0) {
-      notify('Žádný z nahraných dokladů neobsahuje platné položky k naskladnění.', 'error');
+      notify('Žádný z nahraných dokladů neobsahuje platné skladové položky k naskladnění.', 'error');
       return;
     }
 

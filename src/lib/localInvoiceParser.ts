@@ -1,3 +1,4 @@
+import { isNonStockRecyclingFee } from './bankParser';
 import { round2 } from './format';
 import type { ExtractedDeliveryNote, ExtractedLineItem } from '../types';
 
@@ -384,6 +385,7 @@ function isSkippableLine(line: string): boolean {
   for (const re of SKIP_LINE_PATTERNS) {
     if (re.test(trimmed)) return true;
   }
+  if (isNonStockRecyclingFee(trimmed)) return true;
   // Pure date lines like "12.05.2026" or "2026-05-12"
   if (/^\d{1,2}\.\s*\d{1,2}\.\s*\d{4}$/.test(trimmed)) return true;
   return false;
@@ -666,7 +668,9 @@ export function parseInvoiceFromTextLines(
   }
 
   const now = Date.now();
-  const items: ExtractedLineItem[] = candidates.map((c, idx) => ({
+  const items: ExtractedLineItem[] = candidates
+    .filter((c) => !isNonStockRecyclingFee(c.name, c.sku))
+    .map((c, idx) => ({
     id: `loc_${now}_${idx}`,
     sku: (c.sku || `SKU-${String(idx + 1).padStart(3, '0')}`).slice(0, 64),
     name: c.name.slice(0, 200),
@@ -798,7 +802,7 @@ export function parseXmlInvoice(
           selected: true,
         };
       })
-      .filter((i) => i.name.trim().length > 0);
+      .filter((i) => i.name.trim().length > 0 && !isNonStockRecyclingFee(i.name, i.sku));
 
     return {
       format: 'ISDOC_XML',
@@ -877,7 +881,7 @@ export function parseXmlInvoice(
           selected: true,
         };
       })
-      .filter((i) => i.name.trim().length > 0);
+      .filter((i) => i.name.trim().length > 0 && !isNonStockRecyclingFee(i.name, i.sku));
 
     return {
       format: 'POHODA_XML',

@@ -51,6 +51,12 @@ const NerxCategorizeModal = lazy(() =>
 const StockInDocumentModal = lazy(() =>
   import('./StockInDocumentModal').then((m) => ({ default: m.StockInDocumentModal }))
 );
+const EditMovementModal = lazy(() =>
+  import('./StockMovementModals').then((m) => ({ default: m.EditMovementModal }))
+);
+const DeleteMovementModal = lazy(() =>
+  import('./StockMovementModals').then((m) => ({ default: m.DeleteMovementModal }))
+);
 import { areNamesCompatible } from '../lib/bankParser';
 import {
   composeNotesWithPriceBreakdown,
@@ -158,6 +164,11 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
   const [priceEditorOpen, setPriceEditorOpen] = useState(false);
   const [priceEditorTab, setPriceEditorTab] = useState<'BUILDER' | 'AI_COMMAND'>('BUILDER');
   const [nerxTargetItems, setNerxTargetItems] = useState<InventoryItem[] | null>(null);
+  const [editingMovement, setEditingMovement] = useState<StockMovement | null>(null);
+  const [deletingMovements, setDeletingMovements] = useState<{
+    movements: StockMovement[];
+    title?: string;
+  } | null>(null);
 
   useEffect(() => {
     if (!workspace?.id) return;
@@ -591,14 +602,18 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
     if (!workspace) return;
     setRestoringMovId(mov.id);
     try {
-      await restoreOrphanMovementToInventory({
+      const count = await restoreOrphanMovementToInventory({
         workspace,
         movement: mov,
         existingInventory: inventory,
       });
-      notify(
-        `Karta „${mov.itemName}“ (+${formatQty(mov.quantityDelta)} ${mov.unit}) byla zapsána na sklad.`
-      );
+      if (count === 0) {
+        notify('Recyklační poplatek se na sklad nepřidává — můžete tento pohyb odstranit.', 'info');
+      } else {
+        notify(
+          `Karta „${mov.itemName}“ (+${formatQty(mov.quantityDelta)} ${mov.unit}) byla zapsána na sklad.`
+        );
+      }
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Obnovení karty na sklad selhalo.', 'error');
     } finally {
@@ -615,7 +630,14 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
         movements: orphanReceiptMovements,
         existingInventory: inventory,
       });
-      notify(`Zapsáno ${count} chybějících příjmů zpět na sklad (synchronizováno s Androidem).`);
+      if (count === 0) {
+        notify(
+          'Chybějící položky jsou pouze recyklační poplatky — ty se na sklad nepřidávají (můžete je odstranit).',
+          'info'
+        );
+      } else {
+        notify(`Zapsáno ${count} chybějících příjmů zpět na sklad (synchronizováno s Androidem).`);
+      }
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Hromadné zapsání na sklad selhalo.', 'error');
     } finally {
@@ -1387,17 +1409,19 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                 >
                   Zobrazit ({mislinkedMovementPairs.length})
                 </button>
-                <button
-                  type="button"
-                  disabled={bulkRepairing === 'MISLINKED'}
-                  onClick={handleBulkSplitMislinked}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-amber-700 hover:bg-amber-800 rounded-lg whitespace-nowrap disabled:opacity-60"
-                >
-                  <GitBranch className="w-3.5 h-3.5" />
-                  {bulkRepairing === 'MISLINKED'
-                    ? 'Odděluji…'
-                    : `Oddělit vše na vlastní karty (${mislinkedMovementPairs.length})`}
-                </button>
+                {!isReadOnlyAccountant && (
+                  <button
+                    type="button"
+                    disabled={bulkRepairing === 'MISLINKED'}
+                    onClick={handleBulkSplitMislinked}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-amber-700 hover:bg-amber-800 rounded-lg whitespace-nowrap disabled:opacity-60"
+                  >
+                    <GitBranch className="w-3.5 h-3.5" />
+                    {bulkRepairing === 'MISLINKED'
+                      ? 'Odděluji…'
+                      : `Oddělit vše na vlastní karty (${mislinkedMovementPairs.length})`}
+                  </button>
+                )}
               </div>
             </div>
           )}
@@ -1411,7 +1435,7 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                     Nalezeno {orphanReceiptMovements.length} příjmů bez skladové karty
                   </p>
                   <p className="mt-0.5 text-red-800">
-                    Pohyb je v deníku, ale odpovídající skladová karta neexistuje. Jedním kliknutím je zapíšete zpět na sklad.
+                    Pohyb je v deníku, ale odpovídající skladová karta neexistuje. Můžete je zkontrolovat, ručně upravit, odstranit nebo zapsat zpět na sklad.
                   </p>
                 </div>
               </div>
@@ -1423,17 +1447,35 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                 >
                   Zobrazit ({orphanReceiptMovements.length})
                 </button>
-                <button
-                  type="button"
-                  disabled={bulkRepairing === 'ORPHAN'}
-                  onClick={handleBulkRestoreOrphans}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg whitespace-nowrap disabled:opacity-60"
-                >
-                  <RotateCcw className="w-3.5 h-3.5" />
-                  {bulkRepairing === 'ORPHAN'
-                    ? 'Zapisuji…'
-                    : `Zapsat vše na sklad (${orphanReceiptMovements.length})`}
-                </button>
+                {!isReadOnlyAccountant && (
+                  <>
+                    <button
+                      type="button"
+                      disabled={bulkRepairing === 'ORPHAN'}
+                      onClick={() =>
+                        setDeletingMovements({
+                          movements: orphanReceiptMovements,
+                          title: `Odstranit všech ${orphanReceiptMovements.length} pohybů bez skladové karty?`,
+                        })
+                      }
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-red-800 bg-white border border-red-300 hover:bg-red-100 rounded-lg whitespace-nowrap disabled:opacity-60"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      Odstranit vše ({orphanReceiptMovements.length})
+                    </button>
+                    <button
+                      type="button"
+                      disabled={bulkRepairing === 'ORPHAN'}
+                      onClick={handleBulkRestoreOrphans}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg whitespace-nowrap disabled:opacity-60"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      {bulkRepairing === 'ORPHAN'
+                        ? 'Zapisuji…'
+                        : `Zapsat vše na sklad (${orphanReceiptMovements.length})`}
+                    </button>
+                  </>
+                )}
               </div>
             </div>
           )}
@@ -1495,6 +1537,7 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                       <th className="py-3 px-4">Sklad & Doklad</th>
                       <th className="py-3 px-4 text-right">Množství</th>
                       <th className="py-3 px-4 text-right">Hodnota</th>
+                      {!isReadOnlyAccountant && <th className="py-3 px-4 text-right">Akce</th>}
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 text-sm">
@@ -1548,17 +1591,19 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                                     Připojeno k jiné kartě: <strong>{linkedItem.name}</strong> (
                                     {formatQty(linkedItem.quantity)} {linkedItem.unit})
                                   </span>
-                                  <button
-                                    type="button"
-                                    disabled={splittingMovId === mov.id}
-                                    onClick={() => handleSplitMislinkedSingle(mov, linkedItem)}
-                                    className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium text-amber-950 bg-amber-100 hover:bg-amber-200 border border-amber-300 rounded transition-colors disabled:opacity-50"
-                                  >
-                                    <GitBranch className="w-3 h-3" />
-                                    {splittingMovId === mov.id
-                                      ? 'Odděluji…'
-                                      : 'Oddělit na vlastní kartu'}
-                                  </button>
+                                  {!isReadOnlyAccountant && (
+                                    <button
+                                      type="button"
+                                      disabled={splittingMovId === mov.id}
+                                      onClick={() => handleSplitMislinkedSingle(mov, linkedItem)}
+                                      className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium text-amber-950 bg-amber-100 hover:bg-amber-200 border border-amber-300 rounded transition-colors disabled:opacity-50"
+                                    >
+                                      <GitBranch className="w-3 h-3" />
+                                      {splittingMovId === mov.id
+                                        ? 'Odděluji…'
+                                        : 'Oddělit na vlastní kartu'}
+                                    </button>
+                                  )}
                                 </div>
                               ) : (
                                 <p className="text-[11px] text-slate-500 mt-0.5 tabular-nums">
@@ -1576,7 +1621,7 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                                   <AlertTriangle className="w-3 h-3" />
                                   Karta ve skladu neexistuje
                                 </span>
-                                {isReceipt && (
+                                {isReceipt && !isReadOnlyAccountant && (
                                   <button
                                     type="button"
                                     disabled={restoringMovId === mov.id}
@@ -1631,6 +1676,30 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
                           <td className="py-3 px-4 text-right text-slate-700 tabular-nums whitespace-nowrap">
                             {formatCzk(Math.abs(mov.quantityDelta) * (mov.unitPrice || 0))}
                           </td>
+                          {!isReadOnlyAccountant && (
+                            <td className="py-3 px-4 text-right whitespace-nowrap">
+                              <div className="inline-flex items-center justify-end gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() => setEditingMovement(mov)}
+                                  className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 rounded-md transition-colors"
+                                  title="Ručně upravit pohyb nebo změnit připojenou kartu"
+                                >
+                                  <Edit3 className="w-3 h-3" />
+                                  Upravit
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setDeletingMovements({ movements: [mov] })}
+                                  className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-red-700 bg-white hover:bg-red-50 border border-red-200 rounded-md transition-colors"
+                                  title="Odstranit tento pohyb z deníku"
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                  Odstranit
+                                </button>
+                              </div>
+                            </td>
+                          )}
                         </tr>
                       );
                     })}
@@ -2096,9 +2165,39 @@ export function InventoryView({ onNavigate }: InventoryViewProps) {
             inventory={inventory}
             warehouses={warehouses}
             accentColor={palette.primary}
+            readOnly={isReadOnlyAccountant}
             onClose={() => setViewingDocRef(null)}
             onArchiveChanged={() => setArchiveTick((t) => t + 1)}
             onNotify={notify}
+          />
+        )}
+        {editingMovement && workspace && (
+          <EditMovementModal
+            workspace={workspace}
+            movement={editingMovement}
+            inventory={inventory}
+            warehouses={warehouses}
+            accentColor={palette.primary}
+            onClose={() => setEditingMovement(null)}
+            onSaved={(msg) => {
+              notify(msg);
+              setEditingMovement(null);
+            }}
+            onError={(msg) => notify(msg, 'error')}
+          />
+        )}
+        {deletingMovements && workspace && (
+          <DeleteMovementModal
+            workspace={workspace}
+            movements={deletingMovements.movements}
+            inventory={inventory}
+            title={deletingMovements.title}
+            onClose={() => setDeletingMovements(null)}
+            onDeleted={(msg) => {
+              notify(msg);
+              setDeletingMovements(null);
+            }}
+            onError={(msg) => notify(msg, 'error')}
           />
         )}
       </Suspense>

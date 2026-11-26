@@ -22,9 +22,11 @@ import type {
   InvoiceDocumentType,
   InvoiceLineItem,
   InvoiceTemplateId,
+  MovementType,
   ParsedBankTx,
   PaymentMethod,
   RecurringInterval,
+  StockMovement,
   TeamMember,
   TeamRole,
   Workspace,
@@ -44,6 +46,7 @@ import {
   areNamesCompatible,
   findBestMatchingInvoice,
   generateUniqueSku,
+  isNonStockRecyclingFee,
   isSyntheticSku,
   normalizeSkuKey,
 } from './bankParser';
@@ -1262,7 +1265,9 @@ export async function commitBulkStockIn(params: {
     existingInventory,
     onCardMutated,
   } = params;
-  const selected = items.filter((i) => i.selected && i.name.trim() && i.quantity > 0);
+  const selected = items.filter(
+    (i) => i.selected && i.name.trim() && i.quantity > 0 && !isNonStockRecyclingFee(i.name, i.sku)
+  );
   if (selected.length === 0) return 0;
 
   const invMap = new Map(existingInventory.map((i) => [i.id, i]));
@@ -1482,9 +1487,9 @@ export async function restoreOrphanMovementToInventory(params: {
   };
   existingInventory?: InventoryItem[];
   category?: string;
-}): Promise<void> {
+}): Promise<number> {
   const { workspace, movement, existingInventory = [], category = '' } = params;
-  await bulkRestoreOrphanMovements({
+  return bulkRestoreOrphanMovements({
     workspace,
     movements: [movement],
     existingInventory,
@@ -1509,7 +1514,9 @@ export async function bulkRestoreOrphanMovements(params: {
   category?: string;
 }): Promise<number> {
   const { workspace, movements, existingInventory, category = '' } = params;
-  const receipts = movements.filter((m) => Number(m.quantityDelta || 0) > 0);
+  const receipts = movements.filter(
+    (m) => Number(m.quantityDelta || 0) > 0 && !isNonStockRecyclingFee(m.itemName, m.itemSku)
+  );
   if (receipts.length === 0) return 0;
 
   const root = wsRoot(workspace.id);
@@ -1757,6 +1764,142 @@ export async function splitMislinkedMovements(params: {
   }
 
   return valid.length;
+}
+
+/**
+ * Manually updates a stock movement record and optionally reconciles linked inventory card(s)
+ * atomically in a single Firestore writeBatch.
+ */
+export async function updateStockMovement(params: {
+  workspace: Workspace;
+  movement: StockMovement;
+  existingInventory: InventoryItem[];
+  patch: {
+    itemName: string;
+    itemSku: string;
+    warehouseId: string;
+    movementType: MovementType;
+    quantityDelta: number;
+    unit: string;
+    unitPrice: number;
+    documentRef: string;
+    note: string;
+    targetItemId: string;
+  };
+  adjustLinkedStock: boolean;
+}): Promise<void> {
+  const { workspace, movement, existingInventory, patch, adjustLinkedStock } = params;
+  const root = wsRoot(workspace.id);
+  const invMap = new Map(existingInventory.map((i) => [i.id, i]));
+
+  const oldCard = movement.itemId ? invMap.get(movement.itemId) : undefined;
+  const newCard = patch.targetItemId ? invMap.get(patch.targetItemId) : undefined;
+  const oldDelta = round2(Number(movement.quantityDelta || 0));
+  const newDelta = round2(Number(patch.quantityDelta || 0));
+
+  const batch = writeBatch(db);
+
+  batch.update(doc(root, 'stockMovements', movement.id), {
+    itemId: newCard ? newCard.id : patch.targetItemId ? patch.targetItemId.trim().slice(0, 128) : '',
+    itemName: patch.itemName.trim().slice(0, 200) || movement.itemName,
+    itemSku: patch.itemSku.trim().slice(0, 64),
+    warehouseId: (patch.warehouseId || movement.warehouseId || 'shared_main').trim().slice(0, 64),
+    movementType: patch.movementType,
+    quantityDelta: newDelta,
+    unit: (patch.unit || 'ks').trim().slice(0, 20) || 'ks',
+    unitPrice: Math.max(0, round2(Number(patch.unitPrice || 0))),
+    documentRef: patch.documentRef.trim().slice(0, 100),
+    note: patch.note.trim().slice(0, 300),
+  });
+
+  if (adjustLinkedStock) {
+    if (oldCard && newCard && oldCard.id === newCard.id) {
+      const diff = round2(newDelta - oldDelta);
+      if (diff !== 0) {
+        const nextQty = Math.max(0, round2(Number(oldCard.quantity || 0) + diff));
+        batch.update(doc(root, 'inventory', oldCard.id), {
+          quantity: nextQty,
+          updatedAt: serverTimestamp(),
+        });
+      }
+    } else {
+      if (oldCard && oldDelta !== 0) {
+        const revertedQty = Math.max(0, round2(Number(oldCard.quantity || 0) - oldDelta));
+        batch.update(doc(root, 'inventory', oldCard.id), {
+          quantity: revertedQty,
+          updatedAt: serverTimestamp(),
+        });
+      }
+      if (newCard && newDelta !== 0) {
+        const appliedQty = Math.max(0, round2(Number(newCard.quantity || 0) + newDelta));
+        batch.update(doc(root, 'inventory', newCard.id), {
+          quantity: appliedQty,
+          updatedAt: serverTimestamp(),
+        });
+      }
+    }
+  }
+
+  try {
+    await batch.commit();
+  } catch (error) {
+    handleFirestoreError(
+      error,
+      OperationType.UPDATE,
+      `workspaces/${workspace.id}/stockMovements/${movement.id}`
+    );
+  }
+}
+
+/**
+ * Deletes one or more stock movement records and optionally reverts their quantity effect
+ * on linked inventory cards atomically.
+ */
+export async function deleteStockMovements(params: {
+  workspace: Workspace;
+  movements: StockMovement[];
+  existingInventory: InventoryItem[];
+  revertStock: boolean;
+}): Promise<number> {
+  const { workspace, movements, existingInventory, revertStock } = params;
+  if (movements.length === 0) return 0;
+
+  const root = wsRoot(workspace.id);
+  const invMap = new Map(existingInventory.map((i) => [i.id, i]));
+  const runningCardQty = new Map<string, number>();
+
+  for (let i = 0; i < movements.length; i += 180) {
+    const chunk = movements.slice(i, i + 180);
+    const batch = writeBatch(db);
+
+    for (const mov of chunk) {
+      batch.delete(doc(root, 'stockMovements', mov.id));
+
+      if (revertStock && mov.itemId) {
+        const card = invMap.get(mov.itemId);
+        const delta = round2(Number(mov.quantityDelta || 0));
+        if (card && delta !== 0) {
+          const base = runningCardQty.has(card.id)
+            ? runningCardQty.get(card.id)!
+            : Number(card.quantity || 0);
+          const nextQty = Math.max(0, round2(base - delta));
+          runningCardQty.set(card.id, nextQty);
+          batch.update(doc(root, 'inventory', card.id), {
+            quantity: nextQty,
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
+    }
+
+    try {
+      await batch.commit();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, `workspaces/${workspace.id}/stockMovements`);
+    }
+  }
+
+  return movements.length;
 }
 
 // =============================================================================

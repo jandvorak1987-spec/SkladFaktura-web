@@ -67,3 +67,55 @@ export function extractCandidateSupplierIco(rawText, explicitIco = '') {
 
   return '';
 }
+
+/**
+ * Returns true if an invoice/delivery-note line represents a statutory recycling fee / PHE
+ * contribution (elektrozařízení, baterie, zpětný odběr, WEEE) that must NEVER be added to stock.
+ */
+export function isNonStockRecyclingFee(name, sku = '') {
+  const normName = String(name || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (normName) {
+    if (
+      /recyklacni\s*(poplatek|prispevek|priplatek|popl\.?|prisp\.?)/.test(normName) ||
+      /\brec\.?\s*(poplatek|prispevek|popl\.?|prisp\.?)\b/.test(normName) ||
+      /\b(poplatek|prispevek|priplatek)\s+(za|na|k)\s+recyklac/.test(normName) ||
+      /^\s*recyklac(e|ni)\b/.test(normName) ||
+      /\brecyklac(e|ni)\s+(elektro|bater|zariz|odpad)/.test(normName) ||
+      /\b(recycling|weee)\s*(fee|charge|contribution|levy)\b/.test(normName) ||
+      /\b(eko|eco)\s*[- ]?(poplatek|prispevek)\b/.test(normName) ||
+      /\b(elektroodpad|zpetny\s+odber|historick\w*\s+elektrozariz)/.test(normName) ||
+      /^\s*phe(\s*[-–:/(].*)?$/.test(normName) ||
+      /\bphe\b.*\b(poplatek|prispevek|recykl|elektro|bater)/.test(normName) ||
+      /\b(poplatek|prispevek)\b.*\bphe\b/.test(normName) ||
+      /\b(asekol|elektrowin|retela|ecobat|rema\s+system)\b/.test(normName)
+    ) {
+      return true;
+    }
+  }
+
+  const normSku = String(sku || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+
+  if (
+    normSku === 'phe' ||
+    normSku === 'weee' ||
+    normSku === 'recyklace' ||
+    normSku.startsWith('recyklacnipopl') ||
+    normSku.startsWith('recpopl') ||
+    normSku.startsWith('ekopopl')
+  ) {
+    return true;
+  }
+
+  return false;
+}
+

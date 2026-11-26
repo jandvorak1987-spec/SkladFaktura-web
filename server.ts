@@ -13,6 +13,7 @@ import {
   TTL_CNB_RATES_MS,
   TtlCache,
   extractCandidateSupplierIco,
+  isNonStockRecyclingFee,
 } from './server-lib/ttlCache.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -559,6 +560,7 @@ async function startServer() {
         'Zboží v lahvičkách, kapslích, cartridgích, podech, e-liquidech, aromatech, příchutích či jiných baleních (např. „10ml“, „20ml“, „2ml“, „60ml“, „10 ml“) se VŽDY naskladňuje po kusech ("ks") — NIKDY jako "ml"! ' +
         'Údaj v ml (např. 10ml, 20 ml) nebo mg v názvu produktu či ve sloupci objemu/spotřební daně je pouze objem/síla jednoho kusu (ponech jej v názvu produktu), nikoli měrná jednotka ani počet kusů. ' +
         'Do pole quantity uveď skutečný počet kusů/lahviček/balení ze sloupce množství (nikdy ne objem v ml) a do pole unit nastav "ks" (případně "bal", "kart", "sada" jen pokud je to výslovná jednotka počtu balení). ' +
+        'DŮLEŽITÉ – CO NEEXTRAHOVAT NA SKLAD: NIKDY neextrahuj jako položku recyklační poplatek / recyklační příspěvek (PHE, příspěvek na historická elektrozařízení, zpětný odběr elektrozařízení nebo baterií, elektroodpad, EKO poplatek, ASEKOL, REMA, ELEKTROWIN, ECOBAT, RETELA, recycling/WEEE fee) — recyklační poplatek se na sklad nepřidává! ' +
         'DŮLEŽITÉ PRO MĚNU: Pole currency uveď jako 3písmenný ISO kód měny z dokladu (např. CZK, EUR, USD, PLN, GBP). ' +
         'Pole unitPurchasePrice uveď jako jednotkovou cenu bez DPH za 1 kus (MJ) v PŮVODNÍ MĚNĚ DOKLADU — sám ji nepřepočítávej odhadem na CZK (přepočet proběhne přesným kurzem ČNB na serveru). ' +
         'Pokud je na faktuře jen cena s DPH, přepočítej ji bez DPH ve stejné měně. ' +
@@ -671,7 +673,11 @@ async function startServer() {
       }
 
       const items = (parsed.items || [])
-        .filter((it) => String(it.name || '').trim().length > 0)
+        .filter(
+          (it) =>
+            String(it.name || '').trim().length > 0 &&
+            !isNonStockRecyclingFee(it.name, it.sku)
+        )
         .map((it, idx) => {
           const originalPurchasePrice = Math.max(0, round2(Number(it.unitPurchasePrice || 0)));
           const purchasePrice =
