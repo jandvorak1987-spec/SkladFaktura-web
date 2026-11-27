@@ -3,9 +3,9 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Global Safety Net (Default Deny)
+    // Global Safety Net (Default Deny for everyone except verified Admin)
     match /{document=**} {
-      allow read, write: if false;
+      allow read, write: if isAdmin();
     }
 
     // =========================================================================
@@ -28,7 +28,9 @@ service cloud.firestore {
     }
 
     function isAdmin() {
-      return isVerified() && request.auth.token.email == 'jan.dvorak1987@gmail.com';
+      return isVerified()
+        && request.auth.token.email is string
+        && request.auth.token.email.lower() == 'jan.dvorak1987@gmail.com';
     }
 
     function isOwner(userId) {
@@ -263,38 +265,36 @@ service cloud.firestore {
     // 1. Private User Profiles (/users/{userId}) - Strict PII Isolation
     // =========================================================================
     match /users/{userId} {
-      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
-      allow list: if false;
+      allow get: if isAdmin() || (isValidId(userId) && isOwner(userId));
+      allow list: if isAdmin();
 
-      allow create: if isVerified()
+      allow create: if isAdmin() || (isVerified()
         && isValidId(userId)
         && isOwner(userId)
         && isValidUserProfile(incoming(), userId)
         && incoming().createdAt == request.time
-        && incoming().updatedAt == request.time;
+        && incoming().updatedAt == request.time);
 
-      allow update: if isVerified()
+      allow update: if isAdmin() || (isVerified()
         && isValidId(userId)
         && isValidUserProfile(incoming(), userId)
         && incoming().uid == existing().uid
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
-        && (
-          isAdmin() ||
-          (isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'email', 'activeWorkspaceId', 'workspaceIds', 'updatedAt']))
-        );
+        && isOwner(userId)
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'email', 'activeWorkspaceId', 'workspaceIds', 'updatedAt']));
 
-      allow delete: if false;
+      allow delete: if isAdmin();
     }
 
     // =========================================================================
     // 2. Invite Codes (/inviteCodes/{code}) - Single-Document Lookup Only
     // =========================================================================
     match /inviteCodes/{code} {
-      allow get: if isVerified() && isValidInviteCodeStr(code);
-      allow list: if false;
+      allow get: if isAdmin() || (isVerified() && isValidInviteCodeStr(code));
+      allow list: if isAdmin();
 
-      allow create: if isVerified()
+      allow create: if isAdmin() || (isVerified()
         && isValidInviteCodeStr(code)
         && isValidInviteCode(incoming(), code)
         && incoming().createdBy == request.auth.uid
@@ -302,46 +302,43 @@ service cloud.firestore {
         && (
           isWorkspaceOwner(incoming().workspaceId) ||
           getAfter(/databases/$(database)/documents/workspaces/$(incoming().workspaceId)).data.ownerId == request.auth.uid
-        );
+        ));
 
-      allow update: if isVerified()
+      allow update: if isAdmin() || (isVerified()
         && isValidInviteCodeStr(code)
         && isValidInviteCode(incoming(), code)
         && incoming().code == existing().code
         && incoming().workspaceId == existing().workspaceId
         && incoming().createdBy == existing().createdBy
         && incoming().createdAt == existing().createdAt
-        && (
-          isAdmin() ||
-          (isWorkspaceOwner(existing().workspaceId) && incoming().diff(existing()).affectedKeys().hasOnly(['active', 'workspaceName']))
-        );
+        && isWorkspaceOwner(existing().workspaceId)
+        && incoming().diff(existing()).affectedKeys().hasOnly(['active', 'workspaceName']));
 
-      allow delete: if isVerified() && isValidInviteCodeStr(code) && (isWorkspaceOwner(existing().workspaceId) || isAdmin());
+      allow delete: if isAdmin() || (isVerified() && isValidInviteCodeStr(code) && isWorkspaceOwner(existing().workspaceId));
     }
 
     // =========================================================================
     // 3. Shared Workspaces (/workspaces/{workspaceId})
     // =========================================================================
     match /workspaces/{workspaceId} {
-      allow get: if isValidId(workspaceId) && (isWorkspaceMember(workspaceId) || isAdmin());
-      allow list: if false;
+      allow get: if isAdmin() || (isValidId(workspaceId) && isWorkspaceMember(workspaceId));
+      allow list: if isAdmin();
 
-      allow create: if isVerified()
+      allow create: if isAdmin() || (isVerified()
         && isValidId(workspaceId)
         && isValidWorkspace(incoming())
         && incoming().ownerId == request.auth.uid
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time
-        && existsAfter(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid));
+        && existsAfter(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)));
 
-      allow update: if isVerified()
+      allow update: if isAdmin() || (isVerified()
         && isValidId(workspaceId)
         && isValidWorkspace(incoming())
         && incoming().ownerId == existing().ownerId
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (
-          isAdmin() ||
           // Action 1: Owner updates full company settings & invite code
           (isWorkspaceOwner(workspaceId) && incoming().diff(existing()).affectedKeys().hasOnly([
             'name', 'ico', 'dic', 'isVatPayer', 'address', 'city', 'zip', 'email', 'phone',
@@ -352,18 +349,18 @@ service cloud.firestore {
           (isWorkspaceMember(workspaceId)
             && incoming().nextInvoiceNumber == existing().nextInvoiceNumber + 1
             && incoming().diff(existing()).affectedKeys().hasOnly(['nextInvoiceNumber', 'updatedAt']))
-        );
+        ));
 
-      allow delete: if isVerified() && isValidId(workspaceId) && (isWorkspaceOwner(workspaceId) || isAdmin());
+      allow delete: if isAdmin() || (isVerified() && isValidId(workspaceId) && isWorkspaceOwner(workspaceId));
 
       // -----------------------------------------------------------------------
       // 3a. Team Members (/workspaces/{workspaceId}/members/{memberId})
       // -----------------------------------------------------------------------
       match /members/{memberId} {
-        allow get: if isValidId(workspaceId) && isValidId(memberId) && (isWorkspaceMember(workspaceId) || isAdmin());
-        allow list: if isValidId(workspaceId) && resource.data.workspaceId == workspaceId && (isWorkspaceMember(workspaceId) || isAdmin());
+        allow get: if isAdmin() || (isValidId(workspaceId) && isValidId(memberId) && isWorkspaceMember(workspaceId));
+        allow list: if isAdmin() || (isValidId(workspaceId) && resource.data.workspaceId == workspaceId && isWorkspaceMember(workspaceId));
 
-        allow create: if isVerified()
+        allow create: if isAdmin() || (isVerified()
           && isValidId(workspaceId)
           && isValidId(memberId)
           && isValidMember(incoming(), workspaceId, memberId)
@@ -377,12 +374,10 @@ service cloud.firestore {
             (memberId == request.auth.uid
               && incoming().role == 'warehouse'
               && isValidInviteCodeStr(incoming().inviteCodeUsed)
-              && get(/databases/$(database)/documents/workspaces/$(workspaceId)).data.inviteCode == incoming().inviteCodeUsed) ||
-            // Branch 3: Admin override
-            isAdmin()
-          );
+              && get(/databases/$(database)/documents/workspaces/$(workspaceId)).data.inviteCode == incoming().inviteCodeUsed)
+          ));
 
-        allow update: if isVerified()
+        allow update: if isAdmin() || (isVerified()
           && isValidId(workspaceId)
           && isValidId(memberId)
           && isValidMember(incoming(), workspaceId, memberId)
@@ -391,7 +386,6 @@ service cloud.firestore {
           && incoming().joinedAt == existing().joinedAt
           && incoming().inviteCodeUsed == existing().inviteCodeUsed
           && (
-            isAdmin() ||
             // Owner updates a colleague's role (cannot demote self from owner)
             (isWorkspaceOwner(workspaceId)
               && memberId != request.auth.uid
@@ -401,35 +395,34 @@ service cloud.firestore {
             (memberId == request.auth.uid
               && isWorkspaceMember(workspaceId)
               && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'email']))
-          );
+          ));
 
-        allow delete: if isVerified()
+        allow delete: if isAdmin() || (isVerified()
           && isValidId(workspaceId)
           && isValidId(memberId)
           && (
-            isAdmin() ||
             (isWorkspaceOwner(workspaceId) && memberId != request.auth.uid) ||
             (memberId == request.auth.uid && existing().role != 'owner')
-          );
+          ));
       }
 
       // -----------------------------------------------------------------------
       // 3b. Products (/workspaces/{workspaceId}/products/{productId})
       // -----------------------------------------------------------------------
       match /products/{productId} {
-        allow get: if isValidId(workspaceId) && isValidId(productId) && (isWorkspaceMember(workspaceId) || isAdmin());
-        allow list: if isValidId(workspaceId) && resource.data.workspaceId == workspaceId && (isWorkspaceMember(workspaceId) || isAdmin());
+        allow get: if isAdmin() || (isValidId(workspaceId) && isValidId(productId) && isWorkspaceMember(workspaceId));
+        allow list: if isAdmin() || (isValidId(workspaceId) && resource.data.workspaceId == workspaceId && isWorkspaceMember(workspaceId));
 
-        allow create: if isVerified()
+        allow create: if isAdmin() || (isVerified()
           && isValidId(workspaceId)
           && isValidId(productId)
           && isValidProduct(incoming(), workspaceId)
           && incoming().createdBy == request.auth.uid
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
-          && (isWorkspaceMember(workspaceId) || isAdmin());
+          && isWorkspaceMember(workspaceId));
 
-        allow update: if isVerified()
+        allow update: if isAdmin() || (isVerified()
           && isValidId(workspaceId)
           && isValidId(productId)
           && isValidProduct(incoming(), workspaceId)
@@ -438,7 +431,6 @@ service cloud.firestore {
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
           && (
-            isAdmin() ||
             // Tier 1: Owner / Manager edits full product catalog fields
             (isWorkspaceManagerOrOwner(workspaceId) && incoming().diff(existing()).affectedKeys().hasOnly([
               'sku', 'ean', 'name', 'category', 'unit', 'quantity', 'minStock',
@@ -448,30 +440,30 @@ service cloud.firestore {
             (isWorkspaceMember(workspaceId) && incoming().diff(existing()).affectedKeys().hasOnly([
               'quantity', 'location', 'note', 'updatedBy', 'updatedAt'
             ]))
-          );
+          ));
 
-        allow delete: if isVerified()
+        allow delete: if isAdmin() || (isVerified()
           && isValidId(workspaceId)
           && isValidId(productId)
-          && (isWorkspaceManagerOrOwner(workspaceId) || isAdmin());
+          && isWorkspaceManagerOrOwner(workspaceId));
       }
 
       // -----------------------------------------------------------------------
       // 3c. Stock Movements (/workspaces/{workspaceId}/movements/{movementId})
       // -----------------------------------------------------------------------
       match /movements/{movementId} {
-        allow get: if isValidId(workspaceId) && isValidId(movementId) && (isWorkspaceMember(workspaceId) || isAdmin());
-        allow list: if isValidId(workspaceId) && resource.data.workspaceId == workspaceId && (isWorkspaceMember(workspaceId) || isAdmin());
+        allow get: if isAdmin() || (isValidId(workspaceId) && isValidId(movementId) && isWorkspaceMember(workspaceId));
+        allow list: if isAdmin() || (isValidId(workspaceId) && resource.data.workspaceId == workspaceId && isWorkspaceMember(workspaceId));
 
-        allow create: if isVerified()
+        allow create: if isAdmin() || (isVerified()
           && isValidId(workspaceId)
           && isValidId(movementId)
           && isValidMovement(incoming(), workspaceId)
           && incoming().createdAt == request.time
           && existsAfter(/databases/$(database)/documents/workspaces/$(workspaceId)/products/$(incoming().productId))
-          && (isWorkspaceMember(workspaceId) || isAdmin());
+          && isWorkspaceMember(workspaceId));
 
-        allow update: if false;
+        allow update: if isAdmin();
         allow delete: if isAdmin();
       }
 
@@ -479,19 +471,19 @@ service cloud.firestore {
       // 3d. Customers (/workspaces/{workspaceId}/customers/{customerId})
       // -----------------------------------------------------------------------
       match /customers/{customerId} {
-        allow get: if isValidId(workspaceId) && isValidId(customerId) && (isWorkspaceMember(workspaceId) || isAdmin());
-        allow list: if isValidId(workspaceId) && resource.data.workspaceId == workspaceId && (isWorkspaceMember(workspaceId) || isAdmin());
+        allow get: if isAdmin() || (isValidId(workspaceId) && isValidId(customerId) && isWorkspaceMember(workspaceId));
+        allow list: if isAdmin() || (isValidId(workspaceId) && resource.data.workspaceId == workspaceId && isWorkspaceMember(workspaceId));
 
-        allow create: if isVerified()
+        allow create: if isAdmin() || (isVerified()
           && isValidId(workspaceId)
           && isValidId(customerId)
           && isValidCustomer(incoming(), workspaceId)
           && incoming().createdBy == request.auth.uid
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
-          && (isWorkspaceMember(workspaceId) || isAdmin());
+          && isWorkspaceMember(workspaceId));
 
-        allow update: if isVerified()
+        allow update: if isAdmin() || (isVerified()
           && isValidId(workspaceId)
           && isValidId(customerId)
           && isValidCustomer(incoming(), workspaceId)
@@ -499,36 +491,34 @@ service cloud.firestore {
           && incoming().createdBy == existing().createdBy
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
-          && (
-            isAdmin() ||
-            (isWorkspaceMember(workspaceId) && incoming().diff(existing()).affectedKeys().hasOnly([
-              'name', 'type', 'ico', 'dic', 'address', 'city', 'zip', 'email', 'phone', 'note', 'updatedAt'
-            ]))
-          );
+          && isWorkspaceMember(workspaceId)
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'name', 'type', 'ico', 'dic', 'address', 'city', 'zip', 'email', 'phone', 'note', 'updatedAt'
+          ]));
 
-        allow delete: if isVerified()
+        allow delete: if isAdmin() || (isVerified()
           && isValidId(workspaceId)
           && isValidId(customerId)
-          && (isWorkspaceManagerOrOwner(workspaceId) || isAdmin());
+          && isWorkspaceManagerOrOwner(workspaceId));
       }
 
       // -----------------------------------------------------------------------
       // 3e. Invoices (/workspaces/{workspaceId}/invoices/{invoiceId})
       // -----------------------------------------------------------------------
       match /invoices/{invoiceId} {
-        allow get: if isValidId(workspaceId) && isValidId(invoiceId) && (isWorkspaceMember(workspaceId) || isAdmin());
-        allow list: if isValidId(workspaceId) && resource.data.workspaceId == workspaceId && (isWorkspaceMember(workspaceId) || isAdmin());
+        allow get: if isAdmin() || (isValidId(workspaceId) && isValidId(invoiceId) && isWorkspaceMember(workspaceId));
+        allow list: if isAdmin() || (isValidId(workspaceId) && resource.data.workspaceId == workspaceId && isWorkspaceMember(workspaceId));
 
-        allow create: if isVerified()
+        allow create: if isAdmin() || (isVerified()
           && isValidId(workspaceId)
           && isValidId(invoiceId)
           && isValidInvoice(incoming(), workspaceId)
           && incoming().createdBy == request.auth.uid
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
-          && (isWorkspaceMember(workspaceId) || isAdmin());
+          && isWorkspaceMember(workspaceId));
 
-        allow update: if isVerified()
+        allow update: if isAdmin() || (isVerified()
           && isValidId(workspaceId)
           && isValidId(invoiceId)
           && isValidInvoice(incoming(), workspaceId)
@@ -536,30 +526,59 @@ service cloud.firestore {
           && incoming().createdBy == existing().createdBy
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
+          && existing().status != 'cancelled'
           && (
-            isAdmin() ||
-            // Terminal State Lock: Cancelled invoices cannot be modified by standard members
-            (existing().status != 'cancelled' && (
-              // Action 1: Mark issued invoice as paid or cancel it
-              (isWorkspaceMember(workspaceId)
-                && incoming().status in ['paid', 'cancelled', 'issued']
-                && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'paidAt', 'updatedAt'])) ||
-              // Action 2: Edit draft invoice fields before issuing
-              (isWorkspaceMember(workspaceId)
-                && existing().status == 'draft'
-                && incoming().diff(existing()).affectedKeys().hasOnly([
-                  'number', 'variableSymbol', 'customerId', 'customerName', 'customerIco',
-                  'customerDic', 'customerAddress', 'issueDate', 'taxableDate', 'dueDate',
-                  'paymentMethod', 'status', 'stockDeducted', 'items', 'subtotal',
-                  'vatTotal', 'total', 'note', 'paidAt', 'updatedAt'
-                ]))
-            ))
-          );
+            // Action 1: Mark issued invoice as paid or cancel it
+            (isWorkspaceMember(workspaceId)
+              && incoming().status in ['paid', 'cancelled', 'issued']
+              && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'paidAt', 'updatedAt'])) ||
+            // Action 2: Edit draft invoice fields before issuing
+            (isWorkspaceMember(workspaceId)
+              && existing().status == 'draft'
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'number', 'variableSymbol', 'customerId', 'customerName', 'customerIco',
+                'customerDic', 'customerAddress', 'issueDate', 'taxableDate', 'dueDate',
+                'paymentMethod', 'status', 'stockDeducted', 'items', 'subtotal',
+                'vatTotal', 'total', 'note', 'paidAt', 'updatedAt'
+              ]))
+          ));
 
-        allow delete: if isVerified()
+        allow delete: if isAdmin() || (isVerified()
           && isValidId(workspaceId)
           && isValidId(invoiceId)
-          && (isAdmin() || (isWorkspaceOwner(workspaceId) && existing().status == 'draft'));
+          && isWorkspaceOwner(workspaceId)
+          && existing().status == 'draft');
+      }
+
+      // -----------------------------------------------------------------------
+      // 3f. SkladFaktura Synced Subcollections (Admin full read/write)
+      // -----------------------------------------------------------------------
+      match /teamMembers/{memberId} {
+        allow read, write: if isAdmin();
+      }
+
+      match /companies/{companyId} {
+        allow read, write: if isAdmin();
+      }
+
+      match /warehouses/{warehouseId} {
+        allow read, write: if isAdmin();
+      }
+
+      match /inventory/{itemId} {
+        allow read, write: if isAdmin();
+      }
+
+      match /stockMovements/{movementId} {
+        allow read, write: if isAdmin();
+      }
+
+      match /clients/{clientId} {
+        allow read, write: if isAdmin();
+      }
+
+      match /bankTransactions/{txId} {
+        allow read, write: if isAdmin();
       }
     }
   }
