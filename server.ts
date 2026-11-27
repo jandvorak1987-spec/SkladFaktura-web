@@ -749,6 +749,19 @@ async function startServer() {
   });
 
   // =========================================================================
+  // 5. Nerx B2B Webhook API (Orders, Invoices, Payments, Cancellations & Stock Movements)
+  // =========================================================================
+  app.all('/api/b2b-webhook', async (req, res) => {
+    try {
+      const mod = await import('./server-lib/b2bWebhook.js');
+      await mod.handleB2bWebhookRequest(req, res);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'neznámá chyba';
+      res.status(500).json({ error: `B2B webhook selhal: ${message}` });
+    }
+  });
+
+  // =========================================================================
   // Static / Vite Dev Middleware
   // =========================================================================
   if (process.env.NODE_ENV !== 'production') {

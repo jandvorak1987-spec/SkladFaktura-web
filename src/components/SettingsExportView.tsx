@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { Suspense, lazy, useEffect, useMemo, useState } from 'react';
 import {
   Archive,
   Building2,
@@ -6,6 +6,7 @@ import {
   Download,
   Eye,
   FileCode2,
+  Link2,
   Loader2,
   Plus,
   Shield,
@@ -45,7 +46,11 @@ import {
   type TeamRole,
 } from '../types';
 
-type SettingsTab = 'COMPANY' | 'WAREHOUSES' | 'TEAM' | 'POHODA';
+const B2bWebhookPanel = lazy(() =>
+  import('./B2bWebhookPanel').then((m) => ({ default: m.B2bWebhookPanel }))
+);
+
+type SettingsTab = 'COMPANY' | 'WAREHOUSES' | 'TEAM' | 'POHODA' | 'B2B';
 
 export function SettingsExportView() {
   const {
@@ -426,6 +431,13 @@ export function SettingsExportView() {
             ['WAREHOUSES', `Sklady (${warehouses.length})`, WarehouseIcon],
             ['TEAM', `Tým (${teamMembers.length}/6)`, Users],
             ['POHODA', 'Balíček pro účetní & POHODA', Archive],
+            ...(!isReadOnlyAccountant
+              ? ([['B2B', 'Nerx B2B API', Link2]] as [
+                  SettingsTab,
+                  string,
+                  React.ComponentType<{ className?: string }>,
+                ][])
+              : []),
           ] as [SettingsTab, string, React.ComponentType<{ className?: string }>][]
         ).map(([id, label, Icon]) => (
           <button
@@ -1306,6 +1318,26 @@ export function SettingsExportView() {
             </button>
           </div>
         </div>
+      )}
+
+      {/* TAB 5: NERX B2B WEBHOOK / API */}
+      {tab === 'B2B' && !isReadOnlyAccountant && (
+        <Suspense
+          fallback={
+            <div className="bg-white border border-slate-200 rounded-xl p-8 flex items-center justify-center gap-2 text-xs text-slate-500">
+              <Loader2 className="w-4 h-4 animate-spin" />
+              Načítám nastavení Nerx B2B API…
+            </div>
+          }
+        >
+          <B2bWebhookPanel
+            workspace={workspace}
+            activeCompany={activeCompany}
+            warehouses={warehouses}
+            accentColor={getCompanyPalette(activeCompany?.accentIndex).primary}
+            onNotify={notify}
+          />
+        </Suspense>
       )}
 
       {/* MODAL: ADD NEW COMPANY */}
