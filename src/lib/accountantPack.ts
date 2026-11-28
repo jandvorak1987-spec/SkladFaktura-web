@@ -136,7 +136,7 @@ export async function generateAndDownloadMonthlyAccountantPack(params: {
     }
     usedPdfNames.add(fileName);
 
-    const pdfBytes = generateInvoicePdfBytes(inv, company);
+    const pdfBytes = await generateInvoicePdfBytes(inv, company);
     entries.push({
       name: `01_Vydane_faktury_PDF/${fileName}`,
       data: pdfBytes,

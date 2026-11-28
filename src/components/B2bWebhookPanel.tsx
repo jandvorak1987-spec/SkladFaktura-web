@@ -424,8 +424,13 @@ export function B2bWebhookPanel({
             </h3>
             <p className="text-xs text-slate-500 mt-0.5">
               Hlavička: <span className="font-mono">Authorization: Bearer &lt;B2B_WEBHOOK_TOKEN&gt;</span> ·
-              Pro načtení aktuálního skladu do B2B použijte{' '}
-              <span className="font-mono">GET /api/b2b-webhook?action=inventory</span>.
+              Sklad: <span className="font-mono">GET /api/b2b-webhook?action=inventory</span> ·
+              Originál PDF faktury:{' '}
+              <span className="font-mono">GET /api/b2b-webhook?action=invoice-pdf&amp;invoiceId=…</span>{' '}
+              (také <span className="font-mono">orderId</span> nebo <span className="font-mono">invoiceNumber</span>).
+              Odpověď <span className="font-mono">order.created</span> obsahuje{' '}
+              <span className="font-mono">invoicePdfUrl</span>, <span className="font-mono">supplierIban</span> a{' '}
+              <span className="font-mono">supplierAccount</span>.
             </p>
           </div>
           <div className="inline-flex items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200 text-xs">
