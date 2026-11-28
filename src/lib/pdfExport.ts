@@ -1,20 +1,15 @@
 /**
- * Browser-native A4 PDF generator (PDF 1.4 with JPEG XObject pages rendered via HTML5 Canvas).
- * Produces crisp Czech diacritics (ěščřžýáíéůúňťď) with zero external dependencies,
- * suitable for downloading individual PDFs or bundling directly into a monthly accountant ZIP.
+ * Browser PDF helpers.
+ * Invoices use shared/invoicePdf.js (vector PDF, embedded Noto Sans) so the
+ * download button and the B2B webhook emit the same file.
+ * Inventory audits and the cashbook stay on the canvas JPEG renderer.
  */
 
+import regularFontUrl from '../../shared/fonts/NotoSans-Regular.subset.ttf';
+import boldFontUrl from '../../shared/fonts/NotoSans-Bold.subset.ttf';
+import { generateInvoicePdfBytes as generateSharedInvoicePdfBytes } from '../../shared/invoicePdf.js';
 import type { Company, CompanyBrandPalette, Invoice } from '../types';
-import {
-  calculateInvoiceTotals,
-  formatCompanyAddress,
-  formatCzk,
-  formatDateCz,
-  formatQty,
-  getCompanyPalette,
-  getDocumentTypeTitle,
-  lineTotalWithoutVat,
-} from './format';
+import { formatCzk, formatDateCz, formatQty, getCompanyPalette } from './format';
 
 // A4 at 150 DPI → 1240 x 1754 px (clean, sharp, compact ~85 KB/page JPEG)
 const PAGE_W_PX = 1240;
@@ -166,312 +161,41 @@ function drawRight(ctx: CanvasRenderingContext2D, text: string, rightX: number, 
   ctx.fillText(text, rightX - w, y);
 }
 
-function paymentLabel(method: string): string {
-  if (method === 'CASH') return 'Hotově';
-  if (method === 'CARD') return 'Platební kartou';
-  return 'Bankovní převod';
+let invoiceFontPromise: Promise<{ regular: Uint8Array; bold: Uint8Array }> | null = null;
+
+function loadBrowserInvoiceFonts(): Promise<{ regular: Uint8Array; bold: Uint8Array }> {
+  if (!invoiceFontPromise) {
+    invoiceFontPromise = Promise.all([
+      fetch(regularFontUrl).then((response) => {
+        if (!response.ok) throw new Error('Nepodařilo se načíst písmo faktury.');
+        return response.arrayBuffer();
+      }),
+      fetch(boldFontUrl).then((response) => {
+        if (!response.ok) throw new Error('Nepodařilo se načíst tučné písmo faktury.');
+        return response.arrayBuffer();
+      }),
+    ]).then(([regular, bold]) => ({
+      regular: new Uint8Array(regular),
+      bold: new Uint8Array(bold),
+    }));
+  }
+  return invoiceFontPromise;
 }
 
 /**
- * Generates a real A4 PDF file (Uint8Array) for any issued invoice, credit note,
- * proforma, quote, or simplified tax receipt (prodejka).
+ * A4 invoice PDF. Same generator as GET /api/b2b-webhook?action=invoice-pdf
+ * (supplier, account, IBAN, QR Platba, lines, VAT). Returns a tight Uint8Array.
  */
-export function generateInvoicePdfBytes(
+export async function generateInvoicePdfBytes(
   invoice: Invoice,
   company: Company | null,
   paletteOverride?: CompanyBrandPalette
-): Uint8Array {
-  const palette = paletteOverride || getCompanyPalette(company?.accentIndex);
-  const vatPayer = Boolean(company?.vatPayer ?? invoice.companyDic);
-  const effectiveVat = vatPayer && !invoice.reverseCharge;
-  const totals = calculateInvoiceTotals(invoice.items || [], effectiveVat);
-  const isSimplified = invoice.documentType === 'SIMPLIFIED';
-  const cur = invoice.currency || 'CZK';
-  const title = getDocumentTypeTitle(invoice.documentType, vatPayer);
-
-  const pages: Uint8Array[] = [];
-  let { canvas, ctx } = createPageCanvas();
-  const M = 76;
-  const W = PAGE_W_PX - M * 2;
-  let y = 0;
-
-  const drawHeader = (isContPage: boolean) => {
-    // Accent bar
-    ctx.fillStyle = palette.primary;
-    ctx.fillRect(0, 0, PAGE_W_PX, 18);
-
-    y = 56;
-    ctx.fillStyle = palette.primary;
-    ctx.font = 'bold 26px system-ui, -apple-system, Segoe UI, sans-serif';
-    ctx.fillText(title + (isContPage ? ' (pokračování)' : ''), M, y);
-
-    ctx.fillStyle = '#0F172A';
-    ctx.font = 'bold 28px system-ui, -apple-system, Segoe UI, sans-serif';
-    drawRight(ctx, `č. ${invoice.invoiceNumber}`, PAGE_W_PX - M, y - 2);
-    y += 44;
-
-    ctx.strokeStyle = '#CBD5E1';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(M, y);
-    ctx.lineTo(PAGE_W_PX - M, y);
-    ctx.stroke();
-    y += 24;
-  };
-
-  drawHeader(false);
-
-  // Supplier & Client boxes
-  const colGap = 36;
-  const colW = (W - colGap) / 2;
-  const boxTop = y;
-
-  // Supplier (left)
-  ctx.fillStyle = '#64748B';
-  ctx.font = 'bold 16px system-ui, sans-serif';
-  ctx.fillText('DODAVATEL', M, y);
-  let ly = y + 26;
-  ctx.fillStyle = '#0F172A';
-  ctx.font = 'bold 22px system-ui, sans-serif';
-  for (const line of wrapText(ctx, invoice.companyName || company?.name || '', colW)) {
-    ctx.fillText(line, M, ly);
-    ly += 28;
-  }
-  ctx.fillStyle = '#334155';
-  ctx.font = '18px system-ui, sans-serif';
-  const supAddr = invoice.companyAddress || (company ? formatCompanyAddress(company) : '');
-  if (supAddr) {
-    for (const line of wrapText(ctx, supAddr, colW)) {
-      ctx.fillText(line, M, ly);
-      ly += 24;
-    }
-  }
-  if (invoice.companyIco) {
-    ctx.fillText(`IČO: ${invoice.companyIco}`, M, ly);
-    ly += 24;
-  }
-  if (invoice.companyDic) {
-    ctx.fillText(`DIČ: ${invoice.companyDic}`, M, ly);
-    ly += 24;
-  } else {
-    ctx.fillText('Neplátce DPH', M, ly);
-    ly += 24;
-  }
-  if (invoice.companyBankAccount && !isSimplified) {
-    ctx.fillText(`Účet: ${invoice.companyBankAccount}`, M, ly);
-    ly += 24;
-  }
-
-  // Client (right)
-  const rx = M + colW + colGap;
-  ctx.fillStyle = '#64748B';
-  ctx.font = 'bold 16px system-ui, sans-serif';
-  ctx.fillText(isSimplified ? 'ODBĚRATEL (ZJEDNODUŠENÝ DOKLAD)' : 'ODBĚRATEL', rx, boxTop);
-  let ry = boxTop + 26;
-  ctx.fillStyle = '#0F172A';
-  ctx.font = 'bold 22px system-ui, sans-serif';
-  const clientName = invoice.clientName || 'Konečný zákazník (Prodejka)';
-  for (const line of wrapText(ctx, clientName, colW)) {
-    ctx.fillText(line, rx, ry);
-    ry += 28;
-  }
-  ctx.fillStyle = '#334155';
-  ctx.font = '18px system-ui, sans-serif';
-  const clientAddr = [invoice.clientStreet, [invoice.clientZip, invoice.clientCity].filter(Boolean).join(' ')]
-    .filter(Boolean)
-    .join(', ');
-  if (clientAddr) {
-    for (const line of wrapText(ctx, clientAddr, colW)) {
-      ctx.fillText(line, rx, ry);
-      ry += 24;
-    }
-  }
-  if (invoice.clientIco) {
-    ctx.fillText(`IČO: ${invoice.clientIco}`, rx, ry);
-    ry += 24;
-  }
-  if (invoice.clientDic) {
-    ctx.fillText(`DIČ: ${invoice.clientDic}`, rx, ry);
-    ry += 24;
-  }
-  if (isSimplified) {
-    ctx.fillStyle = '#64748B';
-    ctx.font = '16px system-ui, sans-serif';
-    ctx.fillText('Vystaveno dle § 30a zákona č. 235/2004 Sb. (do 10 000 Kč s DPH).', rx, ry + 4);
-    ry += 26;
-  }
-
-  y = Math.max(ly, ry) + 22;
-
-  // Metadata strip
-  ctx.fillStyle = '#F8FAFC';
-  ctx.fillRect(M, y, W, 84);
-  ctx.strokeStyle = '#E2E8F0';
-  ctx.lineWidth = 1.5;
-  ctx.strokeRect(M, y, W, 84);
-
-  const metaCols = [
-    ['Datum vystavení', formatDateCz(invoice.issueDate)],
-    ['DUZP', formatDateCz(invoice.taxDate || invoice.issueDate)],
-    ['Splatnost', formatDateCz(invoice.dueDate || invoice.issueDate)],
-    ['Způsob úhrady', paymentLabel(invoice.paymentMethod)],
-    ['Variabilní symbol', invoice.variableSymbol || invoice.invoiceNumber],
-  ];
-  const metaW = W / metaCols.length;
-  metaCols.forEach(([lbl, val], i) => {
-    const mx = M + i * metaW + 14;
-    ctx.fillStyle = '#64748B';
-    ctx.font = '15px system-ui, sans-serif';
-    ctx.fillText(lbl, mx, y + 16);
-    ctx.fillStyle = '#0F172A';
-    ctx.font = 'bold 18px system-ui, sans-serif';
-    ctx.fillText(val, mx, y + 42);
-  });
-  y += 108;
-
-  // Items table header
-  const drawTableHeader = () => {
-    ctx.fillStyle = palette.primary;
-    ctx.fillRect(M, y, W, 42);
-    ctx.fillStyle = '#FFFFFF';
-    ctx.font = 'bold 16px system-ui, sans-serif';
-    ctx.fillText('Položka', M + 12, y + 12);
-    drawRight(ctx, 'Množství', M + W - 440, y + 12);
-    drawRight(ctx, 'Cena/MJ', M + W - 300, y + 12);
-    drawRight(ctx, 'DPH', M + W - 210, y + 12);
-    drawRight(ctx, 'Bez DPH', M + W - 115, y + 12);
-    drawRight(ctx, 'Celkem', M + W - 12, y + 12);
-    y += 46;
-  };
-  drawTableHeader();
-
-  // Table rows
-  (invoice.items || []).forEach((item, idx) => {
-    ctx.font = '17px system-ui, sans-serif';
-    const nameLines = wrapText(ctx, item.name || 'Položka', W - 540);
-    const rowH = Math.max(36, nameLines.length * 22 + 14);
-
-    if (y + rowH > PAGE_H_PX - 280) {
-      pages.push(canvasToJpegBytes(canvas));
-      ({ canvas, ctx } = createPageCanvas());
-      drawHeader(true);
-      drawTableHeader();
-    }
-
-    if (idx % 2 === 1) {
-      ctx.fillStyle = '#F8FAFC';
-      ctx.fillRect(M, y, W, rowH);
-    }
-
-    ctx.fillStyle = '#0F172A';
-    ctx.font = '17px system-ui, sans-serif';
-    nameLines.forEach((nl, li) => {
-      ctx.fillText(nl, M + 12, y + 9 + li * 22);
-    });
-
-    const net = lineTotalWithoutVat(item);
-    const rate = effectiveVat ? item.vatRate || 0 : 0;
-    const gross = net + (net * rate) / 100;
-
-    ctx.fillStyle = '#334155';
-    drawRight(ctx, `${formatQty(item.quantity)} ${item.unit}`, M + W - 440, y + 9);
-    drawRight(ctx, formatCzk(item.unitPrice, cur), M + W - 300, y + 9);
-    drawRight(ctx, effectiveVat ? `${rate} %` : '0 %', M + W - 210, y + 9);
-    drawRight(ctx, formatCzk(net, cur), M + W - 115, y + 9);
-    ctx.fillStyle = '#0F172A';
-    ctx.font = 'bold 17px system-ui, sans-serif';
-    drawRight(ctx, formatCzk(gross, cur), M + W - 12, y + 9);
-
-    ctx.strokeStyle = '#E2E8F0';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(M, y + rowH);
-    ctx.lineTo(M + W, y + rowH);
-    ctx.stroke();
-
-    y += rowH;
-  });
-
-  y += 28;
-  if (y > PAGE_H_PX - 340) {
-    pages.push(canvasToJpegBytes(canvas));
-    ({ canvas, ctx } = createPageCanvas());
-    drawHeader(true);
-  }
-
-  // VAT breakdown & grand total box (right side)
-  const sumW = 460;
-  const sumX = M + W - sumW;
-  let sy = y;
-
-  ctx.fillStyle = '#F8FAFC';
-  ctx.fillRect(sumX, sy, sumW, 38 + totals.breakdown.length * 28 + 64);
-  ctx.strokeStyle = '#CBD5E1';
-  ctx.lineWidth = 1.5;
-  ctx.strokeRect(sumX, sy, sumW, 38 + totals.breakdown.length * 28 + 64);
-
-  ctx.fillStyle = '#475569';
-  ctx.font = 'bold 15px system-ui, sans-serif';
-  ctx.fillText('Rekapitulace DPH (§ 37 ZDPH)', sumX + 14, sy + 12);
-  sy += 38;
-
-  ctx.font = '16px system-ui, sans-serif';
-  for (const row of totals.breakdown) {
-    ctx.fillStyle = '#334155';
-    ctx.fillText(`Sazba ${row.rate} %`, sumX + 14, sy);
-    drawRight(ctx, `Základ: ${formatCzk(row.base, cur)}`, sumX + sumW - 165, sy);
-    drawRight(ctx, `DPH: ${formatCzk(row.vat, cur)}`, sumX + sumW - 14, sy);
-    sy += 28;
-  }
-
-  ctx.fillStyle = palette.primary;
-  ctx.fillRect(sumX, sy + 8, sumW, 52);
-  ctx.fillStyle = '#FFFFFF';
-  ctx.font = 'bold 20px system-ui, sans-serif';
-  ctx.fillText(invoice.status === 'PAID' ? 'UHRAZENO CELKEM' : 'CELKEM K ÚHRADĚ', sumX + 14, sy + 22);
-  ctx.font = 'bold 24px system-ui, sans-serif';
-  drawRight(ctx, formatCzk(totals.totalWithVat, cur), sumX + sumW - 14, sy + 20);
-
-  // Legal notice & notes (left side)
-  const noteMaxW = W - sumW - 32;
-  let ny = y;
-  if (invoice.legalNotice) {
-    ctx.fillStyle = '#0F172A';
-    ctx.font = 'bold 16px system-ui, sans-serif';
-    ctx.fillText('Zákonná upozornění a doložky:', M, ny);
-    ny += 24;
-    ctx.fillStyle = '#334155';
-    ctx.font = '15px system-ui, sans-serif';
-    for (const line of wrapText(ctx, invoice.legalNotice, noteMaxW)) {
-      ctx.fillText(line, M, ny);
-      ny += 21;
-    }
-    ny += 12;
-  }
-  if (invoice.note) {
-    ctx.fillStyle = '#475569';
-    ctx.font = 'bold 15px system-ui, sans-serif';
-    ctx.fillText('Poznámka:', M, ny);
-    ny += 22;
-    ctx.font = '15px system-ui, sans-serif';
-    for (const line of wrapText(ctx, invoice.note, noteMaxW)) {
-      ctx.fillText(line, M, ny);
-      ny += 20;
-    }
-  }
-
-  // Footer
-  ctx.fillStyle = '#94A3B8';
-  ctx.font = '14px system-ui, sans-serif';
-  ctx.fillText(
-    `Vygenerováno systémem SkladFaktura · ${invoice.companyName} · Strana ${pages.length + 1}`,
-    M,
-    PAGE_H_PX - 54
-  );
-
-  pages.push(canvasToJpegBytes(canvas));
-  return buildPdfFromJpegPages(pages);
+): Promise<Uint8Array> {
+  const fonts = await loadBrowserInvoiceFonts();
+  const bytes = await generateSharedInvoicePdfBytes(invoice, company, paletteOverride, fonts);
+  return new Uint8Array(bytes);
 }
+
 
 export interface InventoryAuditPdfRow {
   sku: string;

@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { resolveSupplierPayment } from '../shared/czechPayment.js';
 import { isNonStockRecyclingFee } from './ttlCache.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -611,11 +612,74 @@ function extractPayloadEntity(body) {
   return body;
 }
 
+function safePublicHost(req) {
+  const forwarded = getHeader(req, 'x-forwarded-host');
+  const hostRaw = (forwarded || getHeader(req, 'host') || '').split(',')[0].trim();
+  if (!hostRaw || /[\s/\\@]/.test(hostRaw)) return '';
+  return /^[A-Za-z0-9.:[\]-]+$/.test(hostRaw) ? hostRaw : '';
+}
+
+/** Absolute https URL of the original invoice PDF on this host. The download still requires the B2B token. */
+export function buildInvoicePdfUrl(req, invoiceId) {
+  const host = safePublicHost(req) || 'sklad-faktura-web.vercel.app';
+  const id = encodeURIComponent(String(invoiceId || ''));
+  return `https://${host}/api/b2b-webhook?action=invoice-pdf&invoiceId=${id}`;
+}
+
+export function invoiceDownloadFields(req, invoiceId, invoice, company) {
+  const payment = resolveSupplierPayment(invoice, company);
+  return {
+    invoicePdfUrl: buildInvoicePdfUrl(req, invoiceId),
+    supplierIban: payment.supplierIban,
+    supplierAccount: payment.supplierAccount,
+  };
+}
+
+function pdfContentDisposition(invoiceNumber) {
+  const raw = String(invoiceNumber || 'faktura').replace(/[\r\n"]/g, '').trim() || 'faktura';
+  const ascii = raw.replace(/[^\x20-\x7E]/g, '_').replace(/\\/g, '_');
+  const encoded = encodeURIComponent(raw).replace(/[!'()*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `inline; filename="${ascii}.pdf"; filename*=UTF-8''${encoded}.pdf`;
+}
+
+/**
+ * Invoice must belong to the auto-detected workspace (already the only rows in ctx)
+ * and to the auto-detected company. orderId is the external B2B id stored as [B2B:…].
+ */
+function findInvoiceForPdf(ctx, { invoiceId, orderId, invoiceNumber }) {
+  const companyId = ctx.company && ctx.company.id ? String(ctx.company.id) : '';
+  const invoices = (ctx.invoices || []).filter((inv) => {
+    if (!companyId || !inv || !inv.companyId) return Boolean(inv);
+    return String(inv.companyId) === companyId;
+  });
+  const id = String(invoiceId || '').trim();
+  const order = String(orderId || '').trim();
+  const num = String(invoiceNumber || '').trim();
+  if (id) return invoices.find((inv) => String(inv.id) === id) || null;
+  if (order) {
+    const tag = `[B2B:${order}]`;
+    return invoices.find((inv) => String(inv.note || '').includes(tag)) || null;
+  }
+  if (num) {
+    return invoices.find((inv) => String(inv.invoiceNumber || '').trim() === num) || null;
+  }
+  return null;
+}
+
+async function defaultRenderInvoicePdf(invoice, company) {
+  const [{ generateInvoicePdfBytes }, { loadNodeInvoiceFonts }] = await Promise.all([
+    import('../shared/invoicePdf.js'),
+    import('../shared/loadNodeFonts.js'),
+  ]);
+  return generateInvoicePdfBytes(invoice, company, null, loadNodeInvoiceFonts());
+}
+
 // =============================================================================
 // Event Handlers
 // =============================================================================
 
-async function handleOrderOrInvoice(ctx, idToken, rawBody) {
+async function handleOrderOrInvoice(ctx, idToken, rawBody, req, runtime = {}) {
+  const commitWrites = (runtime && runtime.commitWrites) || fsCommitWrites;
   const data = extractPayloadEntity(rawBody);
   const { workspace, company, warehouse, inventory, clients, invoices } = ctx;
   const wsRel = `workspaces/${workspace.id}`;
@@ -660,7 +724,7 @@ async function handleOrderOrInvoice(ctx, idToken, rawBody) {
     // If order transitioned to PAID, update status idempotently
     if (isPaidIncoming && existingInvoice.status !== 'PAID' && existingInvoice.status !== 'CANCELLED') {
       const paidDate = String(data.paidDate || toIsoDate()).slice(0, 20);
-      await fsCommitWrites(idToken, [
+      await commitWrites(idToken, [
         makePatchWrite(`${wsRel}/invoices/${existingInvoice.id}`, {
           status: 'PAID',
           paidAmount: round2(existingInvoice.totalWithVat || 0),
@@ -675,6 +739,7 @@ async function handleOrderOrInvoice(ctx, idToken, rawBody) {
           updatedStatus: 'PAID',
           invoiceId: existingInvoice.id,
           invoiceNumber: existingInvoice.invoiceNumber,
+          ...invoiceDownloadFields(req, existingInvoice.id, existingInvoice, company),
         },
       };
     }
@@ -686,6 +751,7 @@ async function handleOrderOrInvoice(ctx, idToken, rawBody) {
         duplicate: true,
         invoiceId: existingInvoice.id,
         invoiceNumber: existingInvoice.invoiceNumber,
+        ...invoiceDownloadFields(req, existingInvoice.id, existingInvoice, company),
       },
     };
   }
@@ -880,6 +946,9 @@ async function handleOrderOrInvoice(ctx, idToken, rawBody) {
   const deductFromStock =
     data.deductFromStock !== false && docType !== 'QUOTE' && docType !== 'PROFORMA';
 
+  const companyBankAccount = String(company.bankAccount || '').slice(0, 40);
+  const companyIban = String(company.iban || '').replace(/\s+/g, '').toUpperCase().slice(0, 40);
+
   const invId = generateFirestoreId('inv');
   writes.push(
     makeSetWrite(`${wsRel}/invoices/${invId}`, {
@@ -890,8 +959,8 @@ async function handleOrderOrInvoice(ctx, idToken, rawBody) {
       companyIco: String(company.ico || '').slice(0, 20),
       companyDic: String(company.dic || '').slice(0, 25),
       companyAddress: formatCompanyAddress(company).slice(0, 260),
-      companyBankAccount: String(company.bankAccount || '').slice(0, 40),
-      companyIban: String(company.iban || '').replace(/\s+/g, '').toUpperCase().slice(0, 40),
+      companyBankAccount,
+      companyIban,
       invoiceNumber,
       variableSymbol,
       documentType: docType,
@@ -979,7 +1048,7 @@ async function handleOrderOrInvoice(ctx, idToken, rawBody) {
     }
   }
 
-  await fsCommitWrites(idToken, writes);
+  await commitWrites(idToken, writes);
 
   return {
     status: 201,
@@ -989,6 +1058,7 @@ async function handleOrderOrInvoice(ctx, idToken, rawBody) {
       invoiceId: invId,
       invoiceNumber,
       variableSymbol,
+      ...invoiceDownloadFields(req, invId, { companyBankAccount, companyIban }, company),
       clientId,
       clientCreated: !matchedClient,
       status: isPaidIncoming ? 'PAID' : 'ISSUED',
@@ -1267,7 +1337,10 @@ async function handleStockMovements(ctx, idToken, rawBody) {
 // Unified Express / Vercel HTTP Handler
 // =============================================================================
 
-export async function handleB2bWebhookRequest(req, res) {
+export async function handleB2bWebhookRequest(req, res, runtime = {}) {
+  const getToken = (runtime && runtime.getFirebaseIdToken) || getFirebaseIdToken;
+  const resolveCtx = (runtime && runtime.resolveWorkspaceContext) || resolveWorkspaceContext;
+  const renderInvoicePdf = (runtime && runtime.generateInvoicePdfBytes) || defaultRenderInvoicePdf;
   // Never emit wildcard CORS on an authenticated webhook endpoint
   res.setHeader('Cache-Control', 'no-store');
 
@@ -1295,7 +1368,7 @@ export async function handleB2bWebhookRequest(req, res) {
   }
 
   try {
-    const { idToken, email } = await getFirebaseIdToken();
+    const { idToken, email } = await getToken();
     const body = req.method === 'POST' ? parseBody(req.body) : {};
     const overrides = {
       workspaceId: body.workspaceId || getQueryParam(req, 'workspaceId'),
@@ -1303,7 +1376,7 @@ export async function handleB2bWebhookRequest(req, res) {
       warehouseId: body.warehouseId || getQueryParam(req, 'warehouseId'),
     };
 
-    const ctx = await resolveWorkspaceContext(idToken, email, overrides);
+    const ctx = await resolveCtx(idToken, email, overrides);
 
     if (req.method === 'GET') {
       const action = getQueryParam(req, 'action').toLowerCase();
@@ -1329,6 +1402,32 @@ export async function handleB2bWebhookRequest(req, res) {
           count: items.length,
           items,
         });
+        return;
+      }
+
+      if (action === 'invoice-pdf') {
+        const invoiceId = getQueryParam(req, 'invoiceId').trim();
+        const orderId = getQueryParam(req, 'orderId').trim();
+        const invoiceNumber = getQueryParam(req, 'invoiceNumber').trim();
+        if (!invoiceId && !orderId && !invoiceNumber) {
+          res.status(400).json({
+            error: 'Chybí identifikátor faktury (invoiceId, orderId nebo invoiceNumber).',
+          });
+          return;
+        }
+        const invoice = findInvoiceForPdf(ctx, { invoiceId, orderId, invoiceNumber });
+        if (!invoice) {
+          res.status(404).json({
+            error: 'Faktura nebyla nalezena v tomto pracovním prostoru.',
+          });
+          return;
+        }
+        const bytes = await renderInvoicePdf(invoice, ctx.company);
+        const body = Buffer.from(bytes);
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', pdfContentDisposition(invoice.invoiceNumber || invoice.id));
+        res.setHeader('Content-Length', String(body.length));
+        res.status(200).send(body);
         return;
       }
 
@@ -1368,7 +1467,7 @@ export async function handleB2bWebhookRequest(req, res) {
     } else if (eventType === 'ORDER_CANCELLED') {
       result = await handleOrderCancelled(ctx, idToken, body);
     } else {
-      result = await handleOrderOrInvoice(ctx, idToken, body);
+      result = await handleOrderOrInvoice(ctx, idToken, body, req, runtime);
     }
 
     res.status(result.status).json(result.payload);

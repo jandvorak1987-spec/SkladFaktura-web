@@ -1711,7 +1711,7 @@ export function InvoicesView({
                   const { downloadPdfBytes, generateInvoicePdfBytes } = await import(
                     '../lib/pdfExport'
                   );
-                  const pdf = generateInvoicePdfBytes(selectedInvoice, activeCompany, palette);
+                  const pdf = await generateInvoicePdfBytes(selectedInvoice, activeCompany, palette);
                   downloadPdfBytes(pdf, `${selectedInvoice.invoiceNumber}.pdf`);
                   notify(`PDF dokladu ${selectedInvoice.invoiceNumber} bylo staženo.`);
                 }}
@@ -2985,7 +2985,7 @@ export function InvoicesView({
                               const { downloadPdfBytes, generateInvoicePdfBytes } = await import(
                                 '../lib/pdfExport'
                               );
-                              const pdf = generateInvoicePdfBytes(inv, activeCompany, palette);
+                              const pdf = await generateInvoicePdfBytes(inv, activeCompany, palette);
                               downloadPdfBytes(pdf, `${inv.invoiceNumber}.pdf`);
                               notify(`PDF dokladu ${inv.invoiceNumber} bylo staženo.`);
                             }}
